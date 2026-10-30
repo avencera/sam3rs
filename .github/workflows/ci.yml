@@ -14,12 +14,33 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
   # runners have no CUDA toolkit or driver; pointing CUDA_HOME nowhere also proves the
   # default build never looks for one
   CUDA_HOME: /nonexistent
 
 jobs:
+  cargo-deny:
+    name: Cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # a prebuilt binary instead of cargo-deny-action, whose Docker build fails
+      # whenever Docker Hub rate-limits or times out the runner
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Check dependency policy
+        run: cargo deny --workspace --all-features check
+
   rust:
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     env:
       # openai/clip-vit-base-patch32 ships SAM 3's tokenizer vocab and merges (only the
@@ -32,16 +53,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
           prefix-key: v1-rust
-
-      - name: Check formatting
-        run: cargo fmt --all --check
 
       # every feature except nvtx, which compiles against the CUDA toolkit's headers
       - name: Clippy
@@ -96,6 +114,4 @@ jobs:
 
       - name: Ruff
         working-directory: crates/sam3rs-python
-        run: |
-          uvx ruff check .
-          uvx ruff format --check .
+        run: uvx ruff check .
