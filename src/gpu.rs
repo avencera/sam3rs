@@ -229,8 +229,9 @@ pub enum Precision {
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default
     Tf32,
-    /// BF16 tensor-core GEMMs (FP32 accumulation) in the vision backbone and necks.
-    /// Every other GEMM stays FP32, but unmasked attention with head dim 32 or 64 runs
+    /// BF16 tensor-core GEMMs (FP32 accumulation) everywhere. The vision backbone and
+    /// necks keep BF16 activations; every other layer keeps FP32 activations and cuBLAS
+    /// rounds its GEMM inputs to BF16. Unmasked attention with head dim 32 or 64 runs
     /// the fused kernel everywhere, which rounds q, k and v to BF16
     Bf16,
 }
@@ -290,8 +291,8 @@ impl Gpu {
             check_blas(blas::cublasCreate_v2(&mut handle))?;
             check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
         }
-        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and plain FP32
-        // compute for the GEMMs BF16 mode keeps in FP32
+        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and BF16
+        // tensor cores for the FP32-input GEMMs of BF16 mode
         let (math, fp32_compute) = match precision {
             Precision::Fp32 => {
                 (blas::cublasMath_t::CUBLAS_PEDANTIC_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC)
@@ -299,7 +300,11 @@ impl Gpu {
             Precision::Tf32 => {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32)
             }
-            Precision::Bf16 => (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F),
+            // strict FP32 compute here cost a third of a detect call with no parity gain,
+            // and BF16 kept more score headroom than TF32 on the parity set
+            Precision::Bf16 => {
+                (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF)
+            }
         };
         unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
 

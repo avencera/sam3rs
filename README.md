@@ -23,8 +23,8 @@ There is also a Python package with numpy in and out; see
 - `bf16` (default): BF16 tensor-core GEMMs with FP32 accumulation for the backbone,
   necks and convs, bias and GELU fused into cuBLASLt epilogues, and a fused
   flash-attention kernel. Everything else (text encoder, fusion encoder, detector and
-  point decoder) keeps FP32 activations and runs FP32 GEMMs with no TF32 or BF16
-  inputs. Its unmasked attention also runs the fused kernel, which rounds q, k and v
+  point decoder) keeps FP32 activations, and cuBLAS rounds the inputs of its GEMMs
+  to BF16. Its unmasked attention also runs the fused kernel, which rounds q, k and v
   to BF16.
 - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
   ONNX Runtime's CUDA provider runs FP32 models by default. FP32 weights and
@@ -193,8 +193,8 @@ boxes, mask logits) for one fixture.
   GPUs load passes parity on the 5090 but hasn't run on another architecture.
 - Timings use one image and one prompt of each kind. Scaling with many box exemplars
   or long text prompts hasn't been measured.
-- Parity covers four images and 13 prompts. BF16 mode keeps the detector and fusion
-  layers on FP32 because moving them to BF16 pushed score deltas to 0.009, near the gate.
+- Parity covers four images and 13 prompts, and the BF16 worst score delta is within
+  about 0.003 of the 0.01 gate.
 
 ## License
 
