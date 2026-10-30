@@ -1,5 +1,8 @@
 # sam3rs
 
+<!-- generated from the crate docs in src/lib.rs by cargo-rdme: edit those, then run `cargo rdme` -->
+<!-- cargo-rdme start -->
+
 A native Rust/CUDA runtime for [Meta SAM 3](https://github.com/facebookresearch/sam3)
 image inference. It loads the official Hugging Face `model.safetensors` checkpoint and
 runs the whole image path on one CUDA stream without ONNX Runtime or PyTorch:
@@ -16,7 +19,7 @@ CUDA C++ in `kernels/sam3.cu`, shipped as prebuilt PTX in `kernels/ptx` that the
 compiles when the model loads, so building needs no CUDA toolkit.
 
 There is also a Python package with numpy in and out; see
-[crates/sam3rs-python](crates/sam3rs-python/README.md).
+[crates/sam3rs-python](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python).
 
 ## Precision modes
 
@@ -195,6 +198,8 @@ boxes, mask logits) for one fixture.
   or long text prompts hasn't been measured.
 - Parity covers four images and 13 prompts. BF16 mode keeps the detector and fusion
   layers on FP32 because moving them to BF16 pushed score deltas to 0.009, near the gate.
+
+<!-- cargo-rdme end -->
 
 ## License
 
