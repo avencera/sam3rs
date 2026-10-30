@@ -23,8 +23,12 @@ use crate::blaslt::{BlasLt, Epilogue};
 
 /// Kernels from `kernels/sam3.cu` as PTX for compute capability 8.0, the first with the
 /// BF16 `mma.sync` the attention kernel uses. The driver JIT-compiles it for the GPU it
-/// runs on; `scripts/build-ptx.sh` regenerates it
-static PTX: &str = concat!(include_str!("../kernels/ptx/sam3.sm80.ptx"), "\0");
+/// runs on; `scripts/build-ptx.sh` regenerates both tiers
+static PTX_SM80: &str = concat!(include_str!("../kernels/ptx/sam3.sm80.ptx"), "\0");
+
+/// The same kernels as compute_120 PTX for RTX 50 series and newer. On an RTX 5090 it
+/// encodes about 3% faster than JIT-compiling the compute_80 tier
+static PTX_SM120: &str = concat!(include_str!("../kernels/ptx/sam3.sm120.ptx"), "\0");
 
 /// Oldest driver API the PTX (ISA 9.0) and cuBLAS 13 run on, as `cuDriverGetVersion` reports it
 const MIN_DRIVER: i32 = 13000;
@@ -271,7 +275,9 @@ impl Gpu {
         let stream = ctx.new_stream()?;
         let device = Arc::new(Device { pool: create_pool(&ctx)?, stream });
 
-        let module = unsafe { cur::module::load_data(PTX.as_ptr().cast()) }
+        // PTX JIT-compiles forward to any newer GPU, never back to an older one
+        let ptx = if major >= 12 { PTX_SM120 } else { PTX_SM80 };
+        let module = unsafe { cur::module::load_data(ptx.as_ptr().cast()) }
             .wrap_err("JIT-compile the sam3rs kernels (PTX ISA 9.0 needs NVIDIA driver r580 or newer)")?;
 
         let mut handle = std::ptr::null_mut();

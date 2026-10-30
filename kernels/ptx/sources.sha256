@@ -1,3 +1,4 @@
 846cc1d7fe5ad07b0c379eee0e8db4ee28aea82bc6e1702857134077ddef0672  kernels/sam3.cu
-a4fc5476d66b978fe7c366bee5af2ac883f4b31ca55e41321282f64e84da9e89  scripts/build-ptx.sh
+a7daa33109e332f4bc869b88c79f773ee771885dcfe45d21dec5ac931ad777f4  scripts/build-ptx.sh
+e073c7ea875e006af900c6bfa074503ea02ac14b42114547a84bd0f1c699cc89  kernels/ptx/sam3.sm120.ptx
 48a7d562cd7a2d98a5e081f0533d1bcf3cb4882eac829517d20a1d808e83913a  kernels/ptx/sam3.sm80.ptx
