@@ -68,7 +68,7 @@ impl Tokenizer {
 
     fn bpe(&self, token: &str) -> Vec<String> {
         let chars: Vec<char> = token.chars().collect();
-        let mut word: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+        let mut word: Vec<String> = chars.iter().map(ToString::to_string).collect();
         if let Some(last) = word.last_mut() {
             last.push_str("</w>");
         }

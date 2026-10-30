@@ -27,7 +27,10 @@ pub enum Epilogue {
 
 impl Epilogue {
     fn raw(self) -> lt::cublasLtEpilogue_t {
-        use lt::cublasLtEpilogue_t::*;
+        use lt::cublasLtEpilogue_t::{
+            CUBLASLT_EPILOGUE_BIAS, CUBLASLT_EPILOGUE_DEFAULT, CUBLASLT_EPILOGUE_GELU, CUBLASLT_EPILOGUE_GELU_BIAS,
+            CUBLASLT_EPILOGUE_RELU, CUBLASLT_EPILOGUE_RELU_BIAS,
+        };
         match self {
             Self::None => CUBLASLT_EPILOGUE_DEFAULT,
             Self::Bias => CUBLASLT_EPILOGUE_BIAS,
@@ -147,7 +150,10 @@ impl BlasLt {
             ))?;
             let set =
                 |attr, value: *const c_void, size| check(lt::cublasLtMatmulDescSetAttribute(desc, attr, value, size));
-            use lt::cublasLtMatmulDescAttributes_t::*;
+            use lt::cublasLtMatmulDescAttributes_t::{
+                CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_MATMUL_DESC_TRANSA,
+                CUBLASLT_MATMUL_DESC_TRANSB,
+            };
             let (trans, no_trans) = (1i32, 0i32); // CUBLAS_OP_T, CUBLAS_OP_N
             set(CUBLASLT_MATMUL_DESC_TRANSA, (&trans as *const i32).cast(), 4)?;
             set(CUBLASLT_MATMUL_DESC_TRANSB, (&no_trans as *const i32).cast(), 4)?;

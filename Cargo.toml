@@ -11,6 +11,13 @@ license = "Apache-2.0"
 repository = "https://github.com/avencera/sam3rs"
 authors = ["Praveen Perera"]
 
+# house style beyond clippy's defaults: named imports and no redundant closures. CI denies
+# warnings, so these fail the build
+[workspace.lints.clippy]
+enum_glob_use = "warn"
+wildcard_imports = "warn"
+redundant_closure_for_method_calls = "warn"
+
 [package]
 name = "sam3rs"
 version.workspace = true
@@ -24,6 +31,9 @@ readme = "README.md"
 keywords = ["sam3", "segmentation", "cuda", "vision", "inference"]
 categories = ["computer-vision", "science"]
 include = ["/src/**", "/kernels/**", "/csrc/**", "/examples/**", "/build.rs", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+[lints]
+workspace = true
 
 [features]
 default = ["online"]
