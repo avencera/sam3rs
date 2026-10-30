@@ -45,7 +45,7 @@ fn numbers(v: &Value) -> Vec<f32> {
 }
 
 #[test]
-fn matches_pytorch_fp32() -> Result<()> {
+fn matches_pytorch() -> Result<()> {
     let model_dir = Path::new("models/sam3");
     if !model_dir.join("model.safetensors").exists() {
         return Err(eyre!("missing weights, run scripts/fetch-models.sh"));
