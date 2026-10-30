@@ -25,6 +25,15 @@ pub struct BoxPrompt {
     pub positive: bool,
 }
 
+impl BoxPrompt {
+    /// A box from pixel corners `[x0, y0, x1, y1]` in a `width` x `height` image
+    pub fn from_xyxy(xyxy: [f32; 4], width: usize, height: usize, positive: bool) -> Self {
+        let (w, h) = (width as f32, height as f32);
+        let [x0, y0, x1, y1] = xyxy;
+        Self { cxcywh: [(x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h, (x1 - x0) / w, (y1 - y0) / h], positive }
+    }
+}
+
 /// Image features the detector reads, computed once per image
 pub struct DetectorImage {
     /// fpn levels `[288^2, 256]`, `[144^2, 256]`, `[72^2, 256]`
