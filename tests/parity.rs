@@ -40,6 +40,17 @@ fn iou(got: &[u8], want: &[f32]) -> Result<f64> {
     Ok(if union == 0 { 1.0 } else { inter as f64 / union as f64 })
 }
 
+/// The larger of two errors, NaN if either is: `f32::max` drops NaN, which would
+/// let a NaN output score zero error and pass
+fn worse(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() { f32::NAN } else { a.max(b) }
+}
+
+/// Largest absolute difference between two coordinate lists, NaN if any side is NaN
+fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
+    got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0, worse)
+}
+
 fn numbers(v: &Value) -> Vec<f32> {
     v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
 }
@@ -121,7 +132,7 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
                 let mask_iou = iou(&got.mask, &want_mask[best * hw..][..hw])?;
                 let dscore = (got.score - want_iou[best]).abs();
                 worst.checks += 1;
-                worst.score = worst.score.max(dscore);
+                worst.score = worse(worst.score, dscore);
                 worst.iou = worst.iou.min(mask_iou);
                 check(
                     mask_iou >= MIN_IOU && dscore <= SCORE_TOL,
@@ -159,11 +170,10 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
             for (i, d) in got.iter().enumerate() {
                 let mask_iou = iou(&d.mask, &want_masks[i * hw..][..hw])?;
                 let dscore = (d.score - want_scores[i]).abs();
-                let dbox =
-                    d.bbox.iter().zip(&want_boxes[i * 4..][..4]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let dbox = max_abs_diff(&d.bbox, &want_boxes[i * 4..][..4]);
                 worst.checks += 1;
-                worst.score = worst.score.max(dscore);
-                worst.box_px = worst.box_px.max(dbox);
+                worst.score = worse(worst.score, dscore);
+                worst.box_px = worse(worst.box_px, dbox);
                 worst.iou = worst.iou.min(mask_iou);
                 check(
                     mask_iou >= MIN_IOU && dscore <= SCORE_TOL && dbox <= box_tol,
@@ -176,4 +186,12 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
         }
     }
     Ok(worst)
+}
+
+#[test]
+fn nan_errors_fail_the_gate() {
+    let dbox = max_abs_diff(&[1.0, f32::NAN, 3.0, 4.0], &[1.0, 2.0, 3.0, 4.0]);
+    assert!(dbox.is_nan(), "a NaN box coordinate must not score zero error");
+    assert!(worse(0.0, f32::NAN).is_nan() && worse(f32::NAN, 0.0).is_nan());
+    assert_eq!(max_abs_diff(&[1.0, 2.5], &[1.0, 2.0]), 0.5);
 }
