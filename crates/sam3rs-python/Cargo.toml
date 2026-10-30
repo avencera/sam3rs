@@ -1,0 +1,24 @@
+[package]
+name = "sam3rs-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Python bindings for sam3rs"
+publish = false
+
+[lib]
+name = "sam3rs_native"
+crate-type = ["cdylib"]
+# the extension is tested through pytest; a Rust test harness would have to link libpython
+test = false
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+pyo3 = { version = "0.30.1", features = ["abi3-py311"] }
+eyre = "0.6"
+sam3rs = { path = "../..", default-features = false, features = ["online"] }

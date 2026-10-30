@@ -49,9 +49,12 @@ fn bytes_to_unicode() -> [char; 256] {
 impl Tokenizer {
     /// Loads Hugging Face `vocab.json` and `merges.txt` from `dir`
     pub fn open(dir: &Path) -> Result<Self> {
-        let vocab = std::fs::read_to_string(dir.join("vocab.json")).wrap_err("read vocab.json")?;
-        let encoder: HashMap<String, u32> = serde_json::from_str(&vocab)?;
-        let merges = std::fs::read_to_string(dir.join("merges.txt")).wrap_err("read merges.txt")?;
+        let read = |name: &str| {
+            let path = dir.join(name);
+            std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))
+        };
+        let encoder: HashMap<String, u32> = serde_json::from_str(&read("vocab.json")?)?;
+        let merges = read("merges.txt")?;
         let ranks = merges
             .lines()
             .filter(|l| !l.starts_with("#version") && !l.is_empty())

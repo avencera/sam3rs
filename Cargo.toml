@@ -1,5 +1,5 @@
 [workspace]
-members = []
+members = ["crates/sam3rs-python"]
 
 [workspace.package]
 version = "0.1.0"

@@ -93,9 +93,23 @@ impl Sam3 {
     /// Fails without a usable NVIDIA driver, GPU or cuBLAS 13, and when the checkpoint
     /// doesn't match the SAM 3 weight schema
     pub fn load(dir: &Path, device: usize, precision: Precision) -> Result<Self> {
+        Self::load_onto(Gpu::new(device, precision)?, dir)
+    }
+
+    /// Downloads facebook/sam3 from Hugging Face (see [`crate::download_model`]), then
+    /// loads it like [`Sam3::load`]
+    ///
+    /// Opens the GPU first, so a machine that can't run the model fails before the
+    /// 3.4 GB download
+    #[cfg(feature = "online")]
+    pub fn from_pretrained(device: usize, precision: Precision) -> Result<Self> {
+        let gpu = Gpu::new(device, precision)?;
+        Self::load_onto(gpu, &crate::download_model()?)
+    }
+
+    fn load_onto(gpu: Gpu, dir: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::open(dir)?;
         let wts = Weights::open(&dir.join("model.safetensors"))?;
-        let gpu = Gpu::new(device, precision)?;
         let model = Self {
             id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             tokenizer,
@@ -109,13 +123,6 @@ impl Sam3 {
         };
         model.gpu.synchronize()?;
         Ok(model)
-    }
-
-    /// Downloads facebook/sam3 from Hugging Face (see [`crate::download_model`]), then
-    /// loads it like [`Sam3::load`]
-    #[cfg(feature = "online")]
-    pub fn from_pretrained(device: usize, precision: Precision) -> Result<Self> {
-        Self::load(&crate::download_model()?, device, precision)
     }
 
     /// Numeric mode the model was loaded with

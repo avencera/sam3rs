@@ -1,0 +1,82 @@
+# sam3rs
+
+SAM 3 image segmentation on NVIDIA GPUs, from Python. Encode an image once, then find
+objects by noun phrase, box exemplars or clicks. The model runs in a native Rust/CUDA
+runtime ([sam3rs](https://github.com/avencera/sam3rs)) with no PyTorch dependency.
+
+## Install
+
+```sh
+pip install "sam3rs[cuda]"
+```
+
+Linux x86_64 only. You need:
+
+- an NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
+- NVIDIA driver r580 or newer
+- cuBLAS 13, which the `cuda` extra installs from the `nvidia-cublas` wheel. Leave the
+  extra out if a CUDA 13 toolkit is already on the library path.
+
+The package imports on any machine. Loading a model without a usable GPU, driver or
+cuBLAS raises `sam3rs.Sam3rsError` that says what is missing.
+
+## Weights
+
+The weights come from the gated [facebook/sam3](https://huggingface.co/facebook/sam3)
+repo. Accept Meta's terms on the model page while logged in, then give sam3rs a token
+from that account, with `hf auth login` or the `HF_TOKEN` environment variable.
+`Sam3.from_pretrained()` downloads the 3.4 GB checkpoint into the Hugging Face cache on
+first use. `Sam3.load(path)` reads a directory that already holds `model.safetensors`,
+`vocab.json` and `merges.txt`.
+
+## Usage
+
+```python
+import sam3rs
+
+model = sam3rs.Sam3.from_pretrained(precision="bf16")
+embedding = model.encode("dogs.jpg")  # or an (height, width, 3) uint8 RGB array
+
+dogs = model.detect(embedding, text="dog")
+print(dogs.scores)       # (n,) float32
+print(dogs.boxes)        # (n, 4) float32, x0 y0 x1 y1 in pixels
+print(dogs.masks.shape)  # (n, height, width) bool
+
+# box exemplars: find more things like the positive box, but not like the negative one
+similar = model.detect(
+    embedding,
+    boxes=[[1233, 376, 1649, 691]],
+    negative_boxes=[[1400, 500, 1500, 600]],
+)
+
+# clicks: label 1 is foreground, 0 background
+click = model.segment_points(embedding, [(1439, 504), (1500, 600)], labels=[1, 0])
+print(click.score, click.mask.sum())
+
+tinted = sam3rs.overlay(sam3rs.load_image("dogs.jpg"), dogs.masks)
+```
+
+An embedding works only with the model that made it, and costs nothing to reuse, so
+encode once and run as many prompts as you need against it.
+
+`precision="bf16"` (the default) runs the vision backbone on BF16 tensor cores with
+fused attention. `precision="fp32"` is the strict FP32 reference path, about 4x slower
+to encode. On an RTX 5090, BF16 takes about 38 ms to encode an image, 2.4 ms per point
+prompt and 16 ms per text or box prompt.
+
+Calls release the GIL while the GPU works. Calls on one model from several threads
+take turns.
+
+## Command line
+
+```sh
+sam3rs dogs.jpg --text dog --out dogs.png
+sam3rs dogs.jpg --box 1233,376,1649,691 --neg-box 1400,500,1500,600
+sam3rs dogs.jpg --point 1439,504 --neg-point 1500,600 --model ./sam3
+```
+
+Prints one JSON object per result. `--out` writes the image with the masks drawn on it.
+
+## License
+
+TODO(license): pick the license before release.
