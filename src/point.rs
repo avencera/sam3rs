@@ -265,7 +265,7 @@ impl PointDecoder {
 
         // multimask output: mask tokens 1..=3 (token 0 is the single-mask output)
         let low_res = gpu.empty(&[3, LOW_RES * LOW_RES])?;
-        let proj = Linear { w: up, b: None };
+        let proj = Linear::new(up, None);
         for m in 0..3 {
             let token = gpu.empty(&[1, D])?;
             gpu.copy_dtod(queries.at((3 + m) * D), token.ptr(), D * 4)?;

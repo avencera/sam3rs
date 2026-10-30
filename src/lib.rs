@@ -3,6 +3,7 @@
 //! Loads the Hugging Face `model.safetensors` checkpoint and runs the image encoder,
 //! text encoder, detector and SAM 2 style point decoder on one CUDA stream
 
+pub mod blaslt;
 pub mod detector;
 pub mod gpu;
 pub mod image;

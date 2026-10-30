@@ -65,7 +65,7 @@ impl Backbone {
     pub fn load(gpu: &Gpu, wts: &Weights) -> Result<Self> {
         let p = "detector_model.vision_encoder.backbone";
         let patch_w = wts.get(gpu, &format!("{p}.embeddings.patch_embeddings.projection.weight"))?;
-        let patch = Linear { w: patch_w.reshape(&[DIM, 3 * PATCH * PATCH]), b: None };
+        let patch = Linear::new(patch_w.reshape(&[DIM, 3 * PATCH * PATCH]), None);
         let pos = wts.get(gpu, &format!("{p}.embeddings.position_embeddings"))?;
         let ln_pre = LayerNorm::load(gpu, wts, &format!("{p}.layer_norm"), 1e-5)?;
         let mut blocks = Vec::new();
@@ -74,11 +74,11 @@ impl Backbone {
             let a = format!("{l}.attention");
             blocks.push(Block {
                 norm1: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm1"), 1e-5)?,
-                qkv: Linear::load_concat(gpu, wts, &[format!("{a}.q_proj"), format!("{a}.k_proj"), format!("{a}.v_proj")])?,
-                proj: Linear::load(gpu, wts, &format!("{a}.o_proj"))?,
+                qkv: Linear::load_concat(gpu, wts, &[format!("{a}.q_proj"), format!("{a}.k_proj"), format!("{a}.v_proj")])?.bf16(gpu)?,
+                proj: Linear::load(gpu, wts, &format!("{a}.o_proj"))?.bf16(gpu)?,
                 norm2: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm2"), 1e-5)?,
-                fc1: Linear::load(gpu, wts, &format!("{l}.mlp.fc1"))?,
-                fc2: Linear::load(gpu, wts, &format!("{l}.mlp.fc2"))?,
+                fc1: Linear::load(gpu, wts, &format!("{l}.mlp.fc1"))?.bf16(gpu)?,
+                fc2: Linear::load(gpu, wts, &format!("{l}.mlp.fc2"))?.bf16(gpu)?,
                 global: GLOBAL_BLOCKS.contains(&i),
             });
         }

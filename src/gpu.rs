@@ -14,6 +14,8 @@ use cudarc::driver::sys::{self as cu, CUdeviceptr, CUfunction, CUmodule, CUstrea
 use cudarc::driver::{CudaContext, CudaStream, result as cur};
 use eyre::{Result, WrapErr, bail, eyre};
 
+use crate::blaslt::{BlasLt, Epilogue};
+
 static FATBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sam3rs.fatbin"));
 
 /// A device allocation, freed in stream order on drop
@@ -189,6 +191,8 @@ impl std::str::FromStr for Precision {
 }
 
 pub struct Gpu {
+    // first, so it is dropped while the context is still alive
+    lt: Option<BlasLt>,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: CUmodule,
@@ -234,7 +238,12 @@ impl Gpu {
             Precision::Bf16 => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
         };
 
-        Ok(Self { ctx, stream, module, functions: RefCell::new(HashMap::new()), blas: handle, compute, precision })
+        let lt = match precision {
+            Precision::Fp32 => None,
+            Precision::Bf16 => Some(BlasLt::new()?),
+        };
+
+        Ok(Self { lt, ctx, stream, module, functions: RefCell::new(HashMap::new()), blas: handle, compute, precision })
     }
 
     pub fn precision(&self) -> Precision {
@@ -372,6 +381,23 @@ impl Gpu {
         unsafe { cur::launch_kernel(f, grid, block, smem, self.cu_stream(), &mut params) }
             .wrap_err_with(|| format!("launch {name}"))?;
         Ok(())
+    }
+
+    /// See [`BlasLt::linear`]; only available in BF16 mode
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_bf16(
+        &self,
+        mnk: (usize, usize, usize),
+        x: u64,
+        x_ld: usize,
+        w: u64,
+        out: u64,
+        beta: f32,
+        bias: u64,
+        epilogue: Epilogue,
+    ) -> Result<()> {
+        let lt = self.lt.as_ref().ok_or_else(|| eyre!("cuBLASLt linears need Precision::Bf16"))?;
+        lt.linear(self.cu_stream(), mnk, x, x_ld, w, out, beta, bias, epilogue)
     }
 
     /// Row-major `C[m,n] = alpha * op(A)[m,k] @ op(B)[k,n] + beta * C`, batched by stride

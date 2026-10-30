@@ -427,7 +427,7 @@ impl Detector {
         let embed = self.mask_embed.forward(gpu, hs)?;
         // masks [200, 288^2] = embed [200, 256] @ instance^T
         let masks = gpu.empty(&[QUERIES, side * side])?;
-        let lin = Linear { w: instance, b: None };
+        let lin = Linear::new(instance, None);
         lin.forward_raw(gpu, embed.ptr(), D, QUERIES, masks.ptr(), 0.0)?;
         Ok(masks)
     }

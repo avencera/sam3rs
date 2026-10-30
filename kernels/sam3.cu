@@ -735,3 +735,10 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const f
     }
 FLASH_ATTN(32)
 FLASH_ATTN(64)
+
+// rows of `cols` floats with row stride `ld` -> contiguous bf16 [rows, cols]
+extern "C" __global__ void f32_to_bf16(__nv_bfloat16* dst, const float* src, long long rows, int cols, long long ld) {
+    long long n = rows * cols;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        dst[i] = __float2bfloat16(src[(i / cols) * ld + i % cols]);
+}

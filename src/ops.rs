@@ -3,7 +3,8 @@
 
 use eyre::Result;
 
-use crate::gpu::{Arg, Gpu, Mat, Precision, Tensor, blocks};
+use crate::blaslt::Epilogue;
+use crate::gpu::{Arg, Buf, Gpu, Mat, Precision, Tensor, blocks};
 use crate::launch;
 use crate::weights::Weights;
 
@@ -42,9 +43,26 @@ pub fn add_assign(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<()> {
 pub struct Linear {
     pub w: Tensor,
     pub b: Option<Tensor>,
+    /// BF16 copy of `w` in `Precision::Bf16`, for the cuBLASLt path
+    w16: Option<Buf>,
 }
 
 impl Linear {
+    /// A linear over existing device weights, run in FP32 whatever the precision
+    pub fn new(w: Tensor, b: Option<Tensor>) -> Self {
+        Self { w, b, w16: None }
+    }
+
+    /// Runs this linear through BF16 cuBLASLt when the GPU is in BF16 mode. Only the
+    /// vision backbone opts in: it holds nearly all the FLOPs, while BF16 activations in
+    /// the small detector heads cost score accuracy for little time
+    pub fn bf16(mut self, gpu: &Gpu) -> Result<Self> {
+        if gpu.precision() == Precision::Bf16 {
+            self.w16 = Some(to_bf16(gpu, self.w.ptr(), self.w.cols(), self.w.rows(), self.w.cols())?);
+        }
+        Ok(self)
+    }
+
     pub fn load(gpu: &Gpu, wts: &Weights, prefix: &str) -> Result<Self> {
         let w = wts.get(gpu, &format!("{prefix}.weight"))?;
         let w = match w.shape().len() {
@@ -57,7 +75,7 @@ impl Linear {
         };
         let bias = format!("{prefix}.bias");
         let b = if wts.contains(&bias) { Some(wts.get(gpu, &bias)?) } else { None };
-        Ok(Self { w, b })
+        Ok(Self::new(w, b))
     }
 
     /// Fuses separate projections that read the same input, such as q/k/v
@@ -65,7 +83,7 @@ impl Linear {
         let names = |s: &str| prefixes.iter().map(|p| format!("{p}.{s}")).collect::<Vec<_>>();
         let w = wts.concat(gpu, &names("weight"))?;
         let b = Some(wts.concat(gpu, &names("bias"))?);
-        Ok(Self { w, b })
+        Ok(Self::new(w, b))
     }
 
     pub fn out_features(&self) -> usize {
@@ -84,6 +102,12 @@ impl Linear {
         assert_eq!(x.cols(), self.in_features(), "linear input {:?} vs weight {:?}", x.shape(), self.w.shape());
         let rows = x.rows();
         let out = gpu.empty(&[rows, self.out_features()])?;
+        if self.w16.is_some() {
+            if !self.forward_bf16(gpu, x, out.ptr(), 0.0, act)? {
+                bias_act(gpu, &out, None, act)?;
+            }
+            return Ok(out);
+        }
         self.forward_raw(gpu, x.ptr(), x.cols(), rows, out.ptr(), 0.0)?;
         if self.b.is_some() || act != ACT_NONE {
             bias_act(gpu, &out, self.b.as_ref(), act)?;
@@ -95,11 +119,33 @@ impl Linear {
     pub fn forward_residual(&self, gpu: &Gpu, x: &Tensor, residual: &Tensor) -> Result<()> {
         assert_eq!(residual.cols(), self.out_features());
         assert_eq!(x.rows(), residual.rows());
+        if self.w16.is_some() {
+            self.forward_bf16(gpu, x, residual.ptr(), 1.0, ACT_NONE)?;
+            return Ok(());
+        }
         self.forward_raw(gpu, x.ptr(), x.cols(), x.rows(), residual.ptr(), 1.0)?;
         if self.b.is_some() {
             bias_act(gpu, residual, self.b.as_ref(), ACT_NONE)?;
         }
         Ok(())
+    }
+
+    /// `out = act(x @ W^T + b) + beta * out` through cuBLASLt with BF16 operands. Returns
+    /// whether the epilogue applied `act`; if not, only the bias was added
+    fn forward_bf16(&self, gpu: &Gpu, x: &Tensor, out: u64, beta: f32, act: i32) -> Result<bool> {
+        let w16 = self.w16.as_ref().expect("bf16 weights");
+        let (m, n, k) = (x.rows(), self.out_features(), self.in_features());
+        let x16 = to_bf16(gpu, x.ptr(), k, m, k)?;
+        let bias = self.b.as_ref().map_or(0, Tensor::ptr);
+        let has_bias = self.b.is_some();
+        let (epilogue, fused) = match act {
+            ACT_NONE => (if has_bias { Epilogue::Bias } else { Epilogue::None }, true),
+            ACT_RELU => (if has_bias { Epilogue::ReluBias } else { Epilogue::Relu }, true),
+            ACT_GELU_TANH => (if has_bias { Epilogue::GeluBias } else { Epilogue::Gelu }, true),
+            _ => (if has_bias { Epilogue::Bias } else { Epilogue::None }, false),
+        };
+        gpu.linear_bf16((m, n, k), x16.ptr(), k, w16.ptr(), out, beta, bias, epilogue)?;
+        Ok(fused)
     }
 
     /// GEMM only, no bias: `out = x @ W^T + beta * out` over raw strided rows
@@ -419,6 +465,13 @@ pub fn concat_rows(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let out = gpu.empty(&[a.rows() + b.rows(), a.cols()])?;
     gpu.copy_dtod(a.ptr(), out.ptr(), a.len() * 4)?;
     gpu.copy_dtod(b.ptr(), out.at(a.len()), b.len() * 4)?;
+    Ok(out)
+}
+
+/// `rows` rows of `cols` floats (row stride `ld`) -> contiguous BF16 `[rows, cols]`
+pub fn to_bf16(gpu: &Gpu, src: u64, cols: usize, rows: usize, ld: usize) -> Result<Buf> {
+    let out = gpu.alloc_bytes(rows * cols * 2)?;
+    launch!(gpu, "f32_to_bf16", ew(rows * cols), B256, 0; out.ptr(), src, rows as u64, cols, ld as u64)?;
     Ok(out)
 }
 
