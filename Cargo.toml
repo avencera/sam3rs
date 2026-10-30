@@ -4,6 +4,7 @@ members = ["crates/sam3rs-python"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 # TODO(license): Apache-2.0 is a placeholder until the license is chosen. To switch to
 # Meta's SAM License, which has no SPDX id: put its text in LICENSE, replace this line
 # with `license-file = "LICENSE"`, set `license = "LicenseRef-SAM-License"` in
@@ -24,6 +25,7 @@ redundant_closure_for_method_calls = "warn"
 name = "sam3rs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Native Rust/CUDA runtime for Meta SAM 3 image segmentation with text, box and point prompts"
 license.workspace = true
 repository.workspace = true
