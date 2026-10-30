@@ -23,8 +23,9 @@ There is also a Python package with numpy in and out; see
 - `bf16` (default): BF16 tensor-core GEMMs with FP32 accumulation for the backbone,
   necks and convs, bias and GELU fused into cuBLASLt epilogues, and a fused
   flash-attention kernel. Everything else (text encoder, fusion encoder, detector and
-  point decoder) keeps FP32 activations and runs FP32 GEMMs, with no TF32 or BF16
-  inputs.
+  point decoder) keeps FP32 activations and runs FP32 GEMMs with no TF32 or BF16
+  inputs. Its unmasked attention also runs the fused kernel, which rounds q, k and v
+  to BF16.
 - `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
   is the reference path for parity checks.
 
