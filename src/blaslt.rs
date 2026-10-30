@@ -50,6 +50,7 @@ struct Key {
     k: usize,
     x_ld: usize,
     epilogue: Epilogue,
+    out_bf16: bool,
 }
 
 /// Descriptors and the heuristic's algorithm for one shape
@@ -80,7 +81,7 @@ impl BlasLt {
     }
 
     /// Row-major `out[m, n] = epilogue(x[m, k] @ w[n, k]^T + beta * out)` with BF16 `x`
-    /// (row stride `x_ld`) and `w`, FP32 `out` and FP32 `bias[n]`
+    /// (row stride `x_ld`) and `w`, and FP32 or BF16 `out` and `bias[n]`
     #[allow(clippy::too_many_arguments)]
     pub fn linear(
         &self,
@@ -89,12 +90,12 @@ impl BlasLt {
         x: u64,
         x_ld: usize,
         w: u64,
-        out: u64,
+        (out, out_bf16): (u64, bool),
         beta: f32,
         bias: u64,
         epilogue: Epilogue,
     ) -> Result<()> {
-        let key = Key { m, n, k, x_ld, epilogue };
+        let key = Key { m, n, k, x_ld, epilogue, out_bf16 };
         let mut plans = self.plans.borrow_mut();
         let plan = match plans.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -136,7 +137,7 @@ impl BlasLt {
 
     /// Column-major view of the row-major problem: out^T[n, m] = w[n, k] (w^T stored) @ x^T
     fn plan(&self, key: Key) -> Result<Plan> {
-        let Key { m, n, k, x_ld, epilogue } = key;
+        let Key { m, n, k, x_ld, epilogue, out_bf16 } = key;
         unsafe {
             let mut desc = std::ptr::null_mut();
             check(lt::cublasLtMatmulDescCreate(
@@ -151,9 +152,10 @@ impl BlasLt {
             set(CUBLASLT_MATMUL_DESC_TRANSB, (&no_trans as *const i32).cast(), 4)?;
             let epi = epilogue.raw();
             set(CUBLASLT_MATMUL_DESC_EPILOGUE, (&epi as *const lt::cublasLtEpilogue_t).cast(), size_of_val(&epi))?;
+            // the bias has the output's type
+            let out_ty = if out_bf16 { lt::cudaDataType_t::CUDA_R_16BF } else { lt::cudaDataType_t::CUDA_R_32F };
             if epilogue.has_bias() {
-                let ty = lt::cudaDataType_t::CUDA_R_32F;
-                set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, (&ty as *const lt::cudaDataType_t).cast(), size_of_val(&ty))?;
+                set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, (&out_ty as *const lt::cudaDataType_t).cast(), size_of_val(&out_ty))?;
             }
 
             let layout = |ty, rows: usize, cols: usize, ld: usize| -> Result<lt::cublasLtMatrixLayout_t> {
@@ -163,7 +165,7 @@ impl BlasLt {
             };
             let w = layout(lt::cudaDataType_t::CUDA_R_16BF, k, n, k)?;
             let x = layout(lt::cudaDataType_t::CUDA_R_16BF, k, m, x_ld)?;
-            let out = layout(lt::cudaDataType_t::CUDA_R_32F, n, m, n)?;
+            let out = layout(out_ty, n, m, n)?;
 
             let mut pref = std::ptr::null_mut();
             check(lt::cublasLtMatmulPreferenceCreate(&mut pref))?;

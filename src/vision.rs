@@ -3,9 +3,9 @@
 
 use eyre::Result;
 
-use crate::gpu::{Gpu, Mat, Tensor};
+use crate::gpu::{Gpu, Mat, Precision, Tensor};
 use crate::launch;
-use crate::ops::{ACT_GELU, ACT_GELU_TANH, B256, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, attention, bias_act, ew};
+use crate::ops::{ACT_GELU, ACT_GELU_TANH, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, attention, bias_act, ew};
 use crate::weights::Weights;
 
 pub const IMAGE_SIZE: usize = 1008;
@@ -109,9 +109,13 @@ impl Backbone {
 
     fn block(&self, gpu: &Gpu, b: &Block, x: &Tensor) -> Result<()> {
         let tokens = GRID * GRID;
-        let h = b.norm1.forward(gpu, x)?;
-        let qkv = b.qkv.forward(gpu, &h)?;
-        drop(h);
+        // BF16 mode keeps the GEMM inputs in BF16 from the kernel that produces them
+        let bf16 = gpu.precision() == Precision::Bf16;
+        let qkv = if bf16 {
+            b.qkv.forward16(gpu, &b.norm1.forward16(gpu, x)?)?
+        } else {
+            b.qkv.forward(gpu, &b.norm1.forward(gpu, x)?)?
+        };
 
         let (win, rope) = if b.global { (GRID, &self.rope_global) } else { (WINDOW, &self.rope_window) };
         let batch = (GRID / win) * (GRID / win) * HEADS;
@@ -127,6 +131,17 @@ impl Backbone {
         let view = |t: &Tensor| Mat::new(t.ptr(), HEAD_DIM).stride(l * HEAD_DIM);
         attention(gpu, view(&q), view(&k), view(&v), view(&o), batch, l, l, HEAD_DIM, Mask::default())?;
         drop((q, k, v));
+
+        if bf16 {
+            let merged = Bf16::empty(gpu, tokens, DIM)?;
+            launch!(gpu, "vit_merge_heads_bf16", ew(tokens * DIM), B256, 0;
+                merged.buf.ptr(), &o, GRID, win, HEADS, HEAD_DIM)?;
+            drop(o);
+            b.proj.forward16_residual(gpu, &merged, x)?;
+            drop(merged);
+            let hidden = b.fc1.forward16_act16(gpu, &b.norm2.forward16(gpu, x)?, ACT_GELU_TANH)?;
+            return b.fc2.forward16_residual(gpu, &hidden, x);
+        }
 
         let merged = gpu.empty(&[tokens, DIM])?;
         launch!(gpu, "vit_merge_heads", ew(merged.len()), B256, 0; &merged, &o, GRID, win, HEADS, HEAD_DIM)?;

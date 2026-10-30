@@ -391,7 +391,7 @@ impl Gpu {
         x: u64,
         x_ld: usize,
         w: u64,
-        out: u64,
+        out: (u64, bool),
         beta: f32,
         bias: u64,
         epilogue: Epilogue,

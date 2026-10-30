@@ -79,11 +79,16 @@ extern "C" __global__ void add_row(float* out, const float* a, const float* b, l
 
 // LayerNorm over the last dim, one block per row; out may alias x. If `residual` is
 // non-null it is added to x first and the sum is written back to `residual`
-extern "C" __global__ void layernorm(float* out, const float* x, const float* w, const float* b, int cols, float eps) {
+DEV void store(float* p, float v) { *p = v; }
+DEV void store(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
+// one block per row; the bf16 variant feeds a BF16 GEMM directly
+template <typename T>
+DEV void layernorm_row(T* out, const float* x, const float* w, const float* b, int cols, float eps) {
     __shared__ float scratch[32];
     long long row = blockIdx.x;
     const float* xr = x + row * cols;
-    float* yr = out + row * cols;
+    T* yr = out + row * cols;
     float s = 0.f;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) s += xr[c];
     float mean = block_sum(s, scratch) / cols;
@@ -95,8 +100,17 @@ extern "C" __global__ void layernorm(float* out, const float* x, const float* w,
     float rstd = rsqrtf(block_sum(v, scratch) / cols + eps);
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
         float y = (xr[c] - mean) * rstd;
-        yr[c] = w ? y * w[c] + (b ? b[c] : 0.f) : y;
+        store(yr + c, w ? y * w[c] + (b ? b[c] : 0.f) : y);
     }
+}
+
+extern "C" __global__ void layernorm(float* out, const float* x, const float* w, const float* b, int cols, float eps) {
+    layernorm_row(out, x, w, b, cols, eps);
+}
+
+extern "C" __global__ void layernorm_bf16(__nv_bfloat16* out, const float* x, const float* w, const float* b, int cols,
+                                          float eps) {
+    layernorm_row(out, x, w, b, cols, eps);
 }
 
 // Row softmax over x[rows, n] in place. Row r is query q = r % lq of batch g = r / lq.
@@ -244,7 +258,8 @@ extern "C" __global__ void vit_split_rope(float* q, float* k, float* v, const fl
 }
 
 // o [windows*heads, win*win, hd] -> [grid*grid, heads*hd], undoing the window partition
-extern "C" __global__ void vit_merge_heads(float* out, const float* o, int grid, int win, int heads, int hd) {
+template <typename T>
+DEV void merge_heads(T* out, const float* o, int grid, int win, int heads, int hd) {
     int nwx = grid / win;
     int dim = heads * hd;
     long long n = (long long)grid * grid * dim;
@@ -254,8 +269,16 @@ extern "C" __global__ void vit_merge_heads(float* out, const float* o, int grid,
         long long tok = i / dim;
         int y = tok / grid, x = tok % grid;
         int wy = y / win, wx = x / win, ly = y % win, lx = x % win;
-        out[i] = o[(((long long)(wy * nwx + wx) * heads + h) * win * win + ly * win + lx) * hd + d];
+        store(out + i, o[(((long long)(wy * nwx + wx) * heads + h) * win * win + ly * win + lx) * hd + d]);
     }
+}
+
+extern "C" __global__ void vit_merge_heads(float* out, const float* o, int grid, int win, int heads, int hd) {
+    merge_heads(out, o, grid, win, heads, hd);
+}
+
+extern "C" __global__ void vit_merge_heads_bf16(__nv_bfloat16* out, const float* o, int grid, int win, int heads, int hd) {
+    merge_heads(out, o, grid, win, heads, hd);
 }
 
 // ---------------------------------------------------------------------------------------

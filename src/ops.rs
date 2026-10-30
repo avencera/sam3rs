@@ -1,7 +1,7 @@
 //! Layers shared by every stage: linears, norms, attention and convolutions, all on
 //! channels-last `[rows, features]` tensors
 
-use eyre::Result;
+use eyre::{Result, bail, eyre};
 
 use crate::blaslt::Epilogue;
 use crate::gpu::{Arg, Buf, Gpu, Mat, Precision, Tensor, blocks};
@@ -39,18 +39,37 @@ pub fn add_assign(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<()> {
     launch!(gpu, "add", ew(a.len()), B256, 0; a, a, b, a.len() as u64)
 }
 
+/// A row-major BF16 activation matrix
+pub struct Bf16 {
+    pub buf: Buf,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Bf16 {
+    pub fn empty(gpu: &Gpu, rows: usize, cols: usize) -> Result<Self> {
+        Ok(Self { buf: gpu.alloc_bytes(rows * cols * 2)?, rows, cols })
+    }
+
+    pub fn from_f32(gpu: &Gpu, x: &Tensor) -> Result<Self> {
+        Ok(Self { buf: to_bf16(gpu, x.ptr(), x.cols(), x.rows(), x.cols())?, rows: x.rows(), cols: x.cols() })
+    }
+}
+
 /// A dense layer `y = x @ W^T + b` with W stored `[out, in]` like PyTorch
 pub struct Linear {
     pub w: Tensor,
     pub b: Option<Tensor>,
-    /// BF16 copy of `w` in `Precision::Bf16`, for the cuBLASLt path
+    /// BF16 copies of `w` and `b` in `Precision::Bf16`, for the cuBLASLt path; a BF16
+    /// output needs a BF16 bias
     w16: Option<Buf>,
+    b16: Option<Buf>,
 }
 
 impl Linear {
     /// A linear over existing device weights, run in FP32 whatever the precision
     pub fn new(w: Tensor, b: Option<Tensor>) -> Self {
-        Self { w, b, w16: None }
+        Self { w, b, w16: None, b16: None }
     }
 
     /// Runs this linear through BF16 cuBLASLt when the GPU is in BF16 mode. Only the
@@ -59,6 +78,9 @@ impl Linear {
     pub fn bf16(mut self, gpu: &Gpu) -> Result<Self> {
         if gpu.precision() == Precision::Bf16 {
             self.w16 = Some(to_bf16(gpu, self.w.ptr(), self.w.cols(), self.w.rows(), self.w.cols())?);
+            if let Some(b) = &self.b {
+                self.b16 = Some(to_bf16(gpu, b.ptr(), b.len(), 1, b.len())?);
+            }
         }
         Ok(self)
     }
@@ -130,13 +152,43 @@ impl Linear {
         Ok(())
     }
 
-    /// `out = act(x @ W^T + b) + beta * out` through cuBLASLt with BF16 operands. Returns
-    /// whether the epilogue applied `act`; if not, only the bias was added
+    /// FP32 input: converts to BF16, then [`Self::forward_lt`]
     fn forward_bf16(&self, gpu: &Gpu, x: &Tensor, out: u64, beta: f32, act: i32) -> Result<bool> {
-        let w16 = self.w16.as_ref().expect("bf16 weights");
-        let (m, n, k) = (x.rows(), self.out_features(), self.in_features());
-        let x16 = to_bf16(gpu, x.ptr(), k, m, k)?;
-        let bias = self.b.as_ref().map_or(0, Tensor::ptr);
+        let x16 = Bf16::from_f32(gpu, x)?;
+        self.forward_lt(gpu, &x16, (out, false), beta, act)
+    }
+
+    /// FP32 `x16 @ W^T + b`
+    pub fn forward16(&self, gpu: &Gpu, x16: &Bf16) -> Result<Tensor> {
+        let out = gpu.empty(&[x16.rows, self.out_features()])?;
+        self.forward_lt(gpu, x16, (out.ptr(), false), 0.0, ACT_NONE)?;
+        Ok(out)
+    }
+
+    /// BF16 `act(x16 @ W^T + b)`, for a following BF16 linear; `act` must be one the
+    /// epilogue fuses
+    pub fn forward16_act16(&self, gpu: &Gpu, x16: &Bf16, act: i32) -> Result<Bf16> {
+        let out = Bf16::empty(gpu, x16.rows, self.out_features())?;
+        if !self.forward_lt(gpu, x16, (out.buf.ptr(), true), 0.0, act)? {
+            bail!("activation {act} has no cuBLASLt epilogue");
+        }
+        Ok(out)
+    }
+
+    /// `residual += x16 @ W^T + b`
+    pub fn forward16_residual(&self, gpu: &Gpu, x16: &Bf16, residual: &Tensor) -> Result<()> {
+        assert_eq!((residual.rows(), residual.cols()), (x16.rows, self.out_features()));
+        self.forward_lt(gpu, x16, (residual.ptr(), false), 1.0, ACT_NONE)?;
+        Ok(())
+    }
+
+    /// `out = act(x16 @ W^T + b) + beta * out` through cuBLASLt. Returns whether the
+    /// epilogue applied `act`; if not, only the bias was added
+    fn forward_lt(&self, gpu: &Gpu, x16: &Bf16, out: (u64, bool), beta: f32, act: i32) -> Result<bool> {
+        let w16 = self.w16.as_ref().ok_or_else(|| eyre!("linear has no BF16 weights"))?;
+        assert_eq!(x16.cols, self.in_features());
+        let (m, n, k) = (x16.rows, self.out_features(), self.in_features());
+        let bias = if out.1 { self.b16.as_ref().map_or(0, Buf::ptr) } else { self.b.as_ref().map_or(0, Tensor::ptr) };
         let has_bias = self.b.is_some();
         let (epilogue, fused) = match act {
             ACT_NONE => (if has_bias { Epilogue::Bias } else { Epilogue::None }, true),
@@ -144,7 +196,7 @@ impl Linear {
             ACT_GELU_TANH => (if has_bias { Epilogue::GeluBias } else { Epilogue::Gelu }, true),
             _ => (if has_bias { Epilogue::Bias } else { Epilogue::None }, false),
         };
-        gpu.linear_bf16((m, n, k), x16.ptr(), k, w16.ptr(), out, beta, bias, epilogue)?;
+        gpu.linear_bf16((m, n, k), x16.buf.ptr(), k, w16.ptr(), out, beta, bias, epilogue)?;
         Ok(fused)
     }
 
@@ -216,6 +268,15 @@ impl LayerNorm {
 
     pub fn forward_inplace(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
         self.forward_into(gpu, x, x)
+    }
+
+    /// Normalized rows in BF16, as the input of a BF16 linear
+    pub fn forward16(&self, gpu: &Gpu, x: &Tensor) -> Result<Bf16> {
+        assert_eq!(x.cols(), self.w.len());
+        let out = Bf16::empty(gpu, x.rows(), x.cols())?;
+        launch!(gpu, "layernorm_bf16", (x.rows() as u32, 1, 1), B256, 0;
+            out.buf.ptr(), x, &self.w, &self.b, x.cols(), self.eps)?;
+        Ok(out)
     }
 
     fn forward_into(&self, gpu: &Gpu, x: &Tensor, out: &Tensor) -> Result<()> {
