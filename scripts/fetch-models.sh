@@ -42,8 +42,9 @@ fetch() {
   mkdir -p "$dest"
   local status
   status="$(curl -sSL --retry 5 -C - "${auth[@]}" -w '%{http_code}' -o "$dest/$file.part" "$hf/$repo/resolve/main/$file")"
+  # a failed response leaves its error body in .part, which `-C -` would resume onto
+  [[ "$status" == 200 || "$status" == 206 ]] || rm -f "$dest/$file.part"
   if [[ "$status" == 401 || "$status" == 403 ]]; then
-    rm -f "$dest/$file.part"
     echo "HTTP $status for $repo/$file: check that your token is valid and that its account" >&2
     echo "has accepted Meta's SAM License at $hf/$repo" >&2
     exit 1
