@@ -26,6 +26,11 @@ struct Args {
     /// (BF16 backbone, fused attention)
     #[arg(long, default_value = "bf16")]
     precision: Precision,
+    /// After timing, write the outputs of one more encode and one call per prompt to
+    /// this file (scores, boxes, DETR queries and masks), so a timed build can be
+    /// checked against the control by hashing it
+    #[arg(long)]
+    outputs: Option<PathBuf>,
 }
 
 fn median_ms(repeat: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
@@ -63,6 +68,29 @@ fn main() -> Result<()> {
     for (_, prompt) in &prompts {
         prompt(&emb)?;
         row.push(median_ms(args.repeat, || prompt(&emb))?);
+    }
+
+    if let Some(path) = &args.outputs {
+        let emb = model.encode(&img)?;
+        let mut bytes = Vec::new();
+        let pm = model.segment_points(&emb, &point)?;
+        bytes.extend(pm.score.to_le_bytes());
+        bytes.extend(&pm.mask);
+        let detections: [(&str, &[BoxPrompt]); 3] =
+            [(VISUAL_PROMPT, &[positive]), (VISUAL_PROMPT, &[positive, negative]), ("dog", &[])];
+        for (text, boxes) in detections {
+            let found = model.detect(&emb, text, boxes)?;
+            bytes.extend((found.len() as u64).to_le_bytes());
+            for d in found {
+                bytes.extend(d.score.to_le_bytes());
+                for v in d.bbox {
+                    bytes.extend(v.to_le_bytes());
+                }
+                bytes.extend((d.query as u64).to_le_bytes());
+                bytes.extend(&d.mask);
+            }
+        }
+        std::fs::write(path, bytes)?;
     }
 
     let names: Vec<&str> = prompts.iter().map(|(n, _)| *n).collect();
