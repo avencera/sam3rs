@@ -26,6 +26,9 @@ There is also a Python package with numpy in and out; see
   point decoder) keeps FP32 activations and runs FP32 GEMMs with no TF32 or BF16
   inputs. Its unmasked attention also runs the fused kernel, which rounds q, k and v
   to BF16.
+- `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
+  ONNX Runtime's CUDA provider runs FP32 models by default. FP32 weights and
+  activations, materialized attention.
 - `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
   is the reference path for parity checks.
 
@@ -111,15 +114,24 @@ decoding are excluded. Prompts are one point (1439, 504), one box
 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
-| osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.1 | 19.4 | 33.8 | 33.8 | 35.5 |
+| osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
+| **sam3rs `tf32`** | **94.9** | **2.2** | **25.1** | **25.3** | **25.0** |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.6 | 35.8 | 21.1 | 21.4 | 20.5 |
+| **sam3rs `bf16`** | **36.9** | **2.4** | **15.4** | **15.4** | **15.4** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.2 | 23.8 | 33.4 | 33.7 | 31.8 |
-| **sam3rs `bf16`** | **36.7** | **2.4** | **15.4** | **15.4** | **15.2** |
-| sam3rs `fp32` | 146.3 | 2.4 | 31.2 | 31.2 | 30.9 |
+| sam3rs `fp32` | 147.6 | 2.4 | 31.3 | 31.3 | 31.2 |
 
-sam3rs `bf16` against osam: 3.7x on encode, 8.1x on points and 2.2-2.3x on box and text
-prompts. Against PyTorch BF16: 1.08x on encode, 15x on points and 1.35-1.4x on box and
-text prompts.
+Each sam3rs row sits under the runtime that uses the same numerics:
+
+- `tf32` against osam, both FP32 with TF32 matmuls: 1.4x on encode, 8.9x on points and
+  1.35-1.4x on box and text prompts.
+- `bf16` against PyTorch BF16: 1.07x on encode, 15x on points and 1.3-1.4x on box and
+  text prompts.
+- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 14% faster. sam3rs is 9.9x
+  faster on points and 1.02-1.08x on box and text prompts.
+
+osam and the sam3rs rows come from one queued session, three runs each, reporting the
+median run. The PyTorch rows come from an earlier session on the same machine.
 
 Where the time goes:
 
@@ -145,7 +157,7 @@ cargo run --release --example bench -- --precision fp32
 ## Parity
 
 `tests/parity.rs` runs four images and 13 prompts (text, box, negative box, points)
-through both precision modes and compares against PyTorch FP32 outputs of the official
+through all three precision modes and compares against PyTorch FP32 outputs of the official
 implementation. The fixtures come from `scripts/reference.py dump`. The gate: the same
 kept DETR queries, scores within 0.01, box corners within 0.5% of the image's longer
 side, and mask IoU of at least 0.99.
@@ -155,6 +167,7 @@ Worst case over 43 checks:
 | Mode | Max score delta | Max box delta | Min mask IoU |
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
+| `tf32` | 0.0051 | 0.18 px | 0.9987 |
 | `bf16` | 0.0076 | 0.63 px | 0.9912 |
 
 ```sh
