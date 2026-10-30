@@ -32,7 +32,19 @@ documentation = "https://docs.rs/sam3rs"
 readme = "README.md"
 keywords = ["sam3", "segmentation", "cuda", "vision", "inference"]
 categories = ["computer-vision", "science"]
-include = ["/src/**", "/kernels/**", "/csrc/**", "/examples/**", "/build.rs", "/README.md", "/LICENSE", "/NOTICE", "/Cargo.toml"]
+include = [
+    "/src/**",
+    "/kernels/**",
+    "/csrc/**",
+    "/examples/**",
+    "/build.rs",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/Cargo.toml",
+    # the tokenizer unit test compares against these upstream cases
+    "/tests/tokenizer_cases.json",
+]
 
 [lints]
 workspace = true

@@ -1,12 +1,35 @@
 #!/usr/bin/env bash
-# Fetch SAM 3 weights into models/ and verify them against the official facebook/sam3 hashes.
-# facebook/sam3 is gated with manual approval, so files come from a mirror whose LFS sha256
-# matches the official repo; the check below fails loudly if the mirror ever drifts
+# Fetch SAM 3 weights into models/sam3 and the test images into models/images, then check
+# the weights against the official facebook/sam3 hashes
+#
+# facebook/sam3 is gated: accept Meta's SAM License at https://huggingface.co/facebook/sam3
+# while logged in, then run `hf auth login` or set HF_TOKEN. `--mirror` instead downloads
+# from an ungated mirror (SAM3_MIRROR, default jetjodh/sam3) for our own testing; the
+# sha256 check catches a mirror that drifts from the official files
+#
+#   scripts/fetch-models.sh [--mirror] [extra files, e.g. sam3.pt]
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-mirror="${SAM3_MIRROR:-jetjodh/sam3}"
+repo=facebook/sam3
+if [[ "${1:-}" == "--mirror" ]]; then
+  repo="${SAM3_MIRROR:-jetjodh/sam3}"
+  shift
+fi
 hf="https://huggingface.co"
+
+auth=()
+if [[ "$repo" == facebook/sam3 ]]; then
+  token="${HF_TOKEN:-}"
+  token_file="${HF_TOKEN_PATH:-${HF_HOME:-$HOME/.cache/huggingface}/token}"
+  [[ -z "$token" && -s "$token_file" ]] && token="$(<"$token_file")"
+  if [[ -z "$token" ]]; then
+    echo "facebook/sam3 is gated: accept Meta's SAM License at $hf/facebook/sam3, then run" >&2
+    echo "\`hf auth login\` or set HF_TOKEN (or pass --mirror for our own testing)" >&2
+    exit 1
+  fi
+  auth=(-H "Authorization: Bearer $token")
+fi
 
 declare -A sha=(
   [model.safetensors]=6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a
@@ -17,13 +40,22 @@ fetch() {
   local repo="$1" file="$2" dest="$3"
   [[ -s "$dest/$file" ]] && return 0
   mkdir -p "$dest"
-  curl -sSL --retry 5 -C - -o "$dest/$file.part" "$hf/$repo/resolve/main/$file"
+  local status
+  status="$(curl -sSL --retry 5 -C - "${auth[@]}" -w '%{http_code}' -o "$dest/$file.part" "$hf/$repo/resolve/main/$file")"
+  # a failed response leaves its error body in .part, which `-C -` would resume onto
+  [[ "$status" == 200 || "$status" == 206 ]] || rm -f "$dest/$file.part"
+  if [[ "$status" == 401 || "$status" == 403 ]]; then
+    echo "HTTP $status for $repo/$file: check that your token is valid and that its account" >&2
+    echo "has accepted Meta's SAM License at $hf/$repo" >&2
+    exit 1
+  fi
+  [[ "$status" == 200 || "$status" == 206 ]] || { echo "HTTP $status for $repo/$file" >&2; exit 1; }
   mv "$dest/$file.part" "$dest/$file"
 }
 
 for f in config.json merges.txt processor_config.json special_tokens_map.json \
   tokenizer.json tokenizer_config.json vocab.json model.safetensors "${@:-}"; do
-  [[ -n "$f" ]] && fetch "$mirror" "$f" "$root/models/sam3"
+  [[ -n "$f" ]] && fetch "$repo" "$f" "$root/models/sam3"
 done
 
 for f in "${!sha[@]}"; do

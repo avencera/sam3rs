@@ -16,12 +16,12 @@ cd "$root"
 nvidia-smi --query-gpu=name,clocks.sm,clocks.mem,power.draw,utilization.gpu,memory.used --format=csv > "$run/gpu-before.csv"
 nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv >> "$run/gpu-before.csv"
 
-for precision in fp32 bf16; do
+for precision in fp32 tf32 bf16; do
   for _ in 1 2 3; do
     "$run/bench" --precision "$precision" | tail -n 1
   done | tee "$run/bench-$precision.txt"
 done
-for precision in fp32 bf16; do
+for precision in fp32 tf32 bf16; do
   nsys profile -t cuda,nvtx,cublas --force-overwrite true -o "$profiles/sam3rs-$name-$precision" \
     "$run/bench" --precision "$precision" > "$run/nsys-$precision.log" 2>&1
 done

@@ -50,7 +50,7 @@ MODEL_REPO: str = _native.MODEL_REPO
 #: Detections scoring at or below this are dropped, as in upstream ``Sam3Processor``
 SCORE_THRESHOLD: float = _native.SCORE_THRESHOLD
 
-Precision = Literal["bf16", "fp32"]
+Precision = Literal["bf16", "tf32", "fp32"]
 #: An ``(height, width, 3)`` uint8 RGB array, or a path to a PNG or JPEG
 ImageInput = Union[npt.NDArray[np.uint8], str, "os.PathLike[str]"]
 Embedding = _native.Embedding
@@ -111,7 +111,8 @@ class Sam3:
         """Load ``model.safetensors``, ``vocab.json`` and ``merges.txt`` from a directory.
 
         ``bf16`` runs the vision backbone on BF16 tensor cores with fused attention;
-        ``fp32`` is the strict FP32 reference path, about 4x slower to encode.
+        ``fp32`` is the strict FP32 reference path, about 4x slower to encode; ``tf32``
+        is the FP32 path with TF32 tensor-core GEMMs, as ONNX Runtime runs FP32 models.
         """
         prepare_libraries()
         with _cuda_hint():
@@ -169,7 +170,14 @@ class Sam3:
         xy = _rows(points, 2, "points")
         if not xy:
             raise ValueError("give at least one point")
-        flags = [True] * len(xy) if labels is None else [bool(v) for v in np.asarray(labels).reshape(-1)]
+        if labels is None:
+            flags = [True] * len(xy)
+        else:
+            values = np.asarray(labels).reshape(-1)
+            # SAM's -1 padding label would otherwise read as foreground
+            if not np.isin(values, (0, 1)).all():
+                raise ValueError(f"labels must be 0 (background) or 1 (foreground), got {values.tolist()}")
+            flags = [bool(v) for v in values]
         if len(flags) != len(xy):
             raise ValueError(f"{len(xy)} points but {len(flags)} labels")
         score, mask = self._native.segment_points(embedding, [(x, y, f) for (x, y), f in zip(xy, flags)])

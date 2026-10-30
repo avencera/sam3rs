@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # runners have no CUDA toolkit or driver; pointing CUDA_HOME nowhere also proves the
+  # default build never looks for one
+  CUDA_HOME: /nonexistent
+
+jobs:
+  cargo-deny:
+    name: Cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # a prebuilt binary instead of cargo-deny-action, whose Docker build fails
+      # whenever Docker Hub rate-limits or times out the runner
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Check dependency policy
+        run: cargo deny --workspace --all-features check
+
+  rust:
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    env:
+      # openai/clip-vit-base-patch32 ships SAM 3's tokenizer vocab and merges (only the
+      # merges header comment differs) without a gate, so the tokenizer test runs here
+      CLIP_REV: 3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268
+      SAM3RS_TOKENIZER_DIR: ${{ github.workspace }}/clip-tokenizer
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust
+
+      # every feature except nvtx, which compiles against the CUDA toolkit's headers
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features cli --locked -- -D warnings
+
+      - name: Clippy without default features
+        run: cargo clippy -p sam3rs --lib --no-default-features --locked -- -D warnings
+
+      - name: Build docs as docs.rs does
+        env:
+          DOCS_RS: "1"
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p sam3rs --no-deps --locked
+
+      - name: Fetch tokenizer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SAM3RS_TOKENIZER_DIR"
+          base="https://huggingface.co/openai/clip-vit-base-patch32/resolve/$CLIP_REV"
+          for file in vocab.json merges.txt; do
+            curl --retry 3 --retry-delay 5 -LfsS "$base/$file" -o "$SAM3RS_TOKENIZER_DIR/$file"
+          done
+          sha256sum --check <<EOF
+          5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363  $SAM3RS_TOKENIZER_DIR/vocab.json
+          f526393189112391ce6f9795d4695f704121ce452c3aad1f5335cc41337eba85  $SAM3RS_TOKENIZER_DIR/merges.txt
+          EOF
+
+      # the parity and stage tests need a GPU and the gated weights, so they run locally
+      - name: Unit tests
+        run: cargo test --workspace --lib --locked
+
+      - name: Doc tests
+        run: cargo test -p sam3rs --doc --locked
+
+  ptx:
+    name: PTX matches kernel sources
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check committed PTX
+        run: scripts/check-ptx.sh
+
+  python-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Ruff
+        working-directory: crates/sam3rs-python
+        run: uvx ruff check .

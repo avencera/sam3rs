@@ -38,8 +38,8 @@ model = sam3rs.Sam3.from_pretrained(precision="bf16")
 embedding = model.encode("dogs.jpg")  # or an (height, width, 3) uint8 RGB array
 
 dogs = model.detect(embedding, text="dog")
-print(dogs.scores)       # (n,) float32
-print(dogs.boxes)        # (n, 4) float32, x0 y0 x1 y1 in pixels
+print(dogs.scores)  # (n,) float32
+print(dogs.boxes)  # (n, 4) float32, x0 y0 x1 y1 in pixels
 print(dogs.masks.shape)  # (n, height, width) bool
 
 # box exemplars: find more things like the positive box, but not like the negative one
@@ -60,9 +60,11 @@ An embedding works only with the model that made it, and costs nothing to reuse,
 encode once and run as many prompts as you need against it.
 
 `precision="bf16"` (the default) runs the vision backbone on BF16 tensor cores with
-fused attention. `precision="fp32"` is the strict FP32 reference path, about 4x slower
-to encode. On an RTX 5090, BF16 takes about 38 ms to encode an image, 2.4 ms per point
-prompt and 16 ms per text or box prompt.
+fused attention. `precision="tf32"` keeps FP32 weights and activations but runs the
+matrix multiplies on TF32 tensor cores, as ONNX Runtime does for FP32 models.
+`precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image
+takes about 37 ms in BF16, 95 ms in TF32 and 148 ms in FP32; a point prompt about
+2.4 ms in each, and a text or box prompt 15, 25 and 31 ms.
 
 Calls release the GIL while the GPU works. Calls on one model from several threads
 take turns.
