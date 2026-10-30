@@ -672,11 +672,20 @@ __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const __nv
 // Batch entry blockIdx.y reads q + y * q_stride etc.; row i of each view starts at
 // i * ld. scale_log2 = log2(e) / sqrt(D). Keys with key_pad[j] != 0 are skipped; rows
 // with no valid key produce zeros, like the softmax kernel
-template <int D, typename T>
+//
+// With RPB, the box relative position bias of the DETR decoder's image cross-attention is
+// added to the scores without materializing it: for head h = blockIdx.y, query row 1 + q
+// and key y * side + x it is dy[q, y, h] + dx[q, x, h], and row 0 (presence token) gets none
+//
+// With `part`, block z covers keys [z * kv_chunk, (z + 1) * kv_chunk) only and writes its
+// unnormalized accumulators, row max and row sum to part[z][batch][row][D + 2] for
+// flash_combine, so few query rows over many keys still fill the GPU
+template <int D, typename T, bool RPB = false>
 __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T* q, long long q_ld,
                            long long q_stride, const T* k, long long k_ld, long long k_stride, const T* v,
                            long long v_ld, long long v_stride, int lq, int lk, float scale_log2,
-                           const uint8_t* key_pad) {
+                           const uint8_t* key_pad, const float* rpb_dx = nullptr, const float* rpb_dy = nullptr,
+                           int side = 0, float* part = nullptr, int kv_chunk = 0) {
     static_assert(FA_BM == 64, "fa_stage assumes 64-row tiles");
     constexpr int LDS = D + 8;  // padding keeps fragment loads bank-conflict free
     __shared__ __align__(16) __nv_bfloat16 qs[FA_BM * LDS];
@@ -705,10 +714,31 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
 
     float acc[D / 8][4] = {};
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
-    for (int k0 = 0; k0 < lk; k0 += FA_BN) {
+    // per fragment row: this head's dx and dy rows, or null for the presence token and
+    // rows past lq
+    const float* rdx[2] = {nullptr, nullptr};
+    const float* rdy[2] = {nullptr, nullptr};
+    if constexpr (RPB) {
+        int heads = gridDim.y;
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            int row = q0 + wr + g + r * 8;
+            if (row >= 1 && row < lq) {
+                long long base = (long long)(row - 1) * side * heads + b;
+                rdx[r] = rpb_dx + base;
+                rdy[r] = rpb_dy + base;
+            }
+        }
+    }
+    int k_begin = 0, k_end = lk;
+    if (part) {
+        k_begin = blockIdx.z * kv_chunk;
+        k_end = min(lk, k_begin + kv_chunk);
+    }
+    for (int k0 = k_begin; k0 < k_end; k0 += FA_BN) {
         __syncthreads();
-        fa_stage<D>(ks, LDS, k + k0 * k_ld, k_ld, lk - k0);
-        fa_stage<D>(vs, LDS, v + k0 * v_ld, v_ld, lk - k0);
+        fa_stage<D>(ks, LDS, k + k0 * k_ld, k_ld, k_end - k0);
+        fa_stage<D>(vs, LDS, v + k0 * v_ld, v_ld, k_end - k0);
         __syncthreads();
 
         float s[FA_BN / 8][4];
@@ -730,7 +760,14 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
             for (int e = 0; e < 4; e++) {
                 int col = k0 + j * 8 + t * 2 + (e & 1);
                 float x = s[j][e] * scale_log2;
-                if (col >= lk || (key_pad && key_pad[col])) x = -INFINITY;
+                if constexpr (RPB) {
+                    const float* dx = rdx[e / 2];
+                    if (dx && col < lk) {
+                        int y = col / side, xx = col - y * side, heads = gridDim.y;
+                        x += (__ldg(rdy[e / 2] + y * heads) + __ldg(dx + xx * heads)) * 1.4426950408889634f;
+                    }
+                }
+                if (col >= k_end || (key_pad && key_pad[col])) x = -INFINITY;
                 s[j][e] = x;
                 mx[e / 2] = fmaxf(mx[e / 2], x);
             }
@@ -783,8 +820,26 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
     for (int r = 0; r < 2; r++) {
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
         l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
-        l[r] = l[r] > 0.f ? 1.f / l[r] : 0.f;
     }
+    if (part) {
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            int row = q0 + wr + g + r * 8;
+            if (row >= lq) continue;
+            float* out = part + (((long long)blockIdx.z * gridDim.y + b) * lq + row) * (D + 2);
+#pragma unroll
+            for (int dj = 0; dj < D / 8; dj++) {
+                *reinterpret_cast<float2*>(out + dj * 8 + t * 2) = make_float2(acc[dj][2 * r], acc[dj][2 * r + 1]);
+            }
+            if (t == 0) {
+                out[D] = m[r];
+                out[D + 1] = l[r];
+            }
+        }
+        return;
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) l[r] = l[r] > 0.f ? 1.f / l[r] : 0.f;
 #pragma unroll
     for (int r = 0; r < 2; r++) {
         int row = q0 + wr + g + r * 8;
@@ -809,6 +864,50 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
 FLASH_ATTN(flash_attn_d32, 32, float)
 FLASH_ATTN(flash_attn_d64, 64, float)
 FLASH_ATTN(flash_attn_bf16_d64, 64, __nv_bfloat16)
+
+extern "C" __global__ void __launch_bounds__(FA_WARPS * 32)
+    flash_attn_rpb_d32(float* o, long long o_ld, long long o_stride, const float* q, long long q_ld, long long q_stride,
+                       const float* k, long long k_ld, long long k_stride, const float* v, long long v_ld,
+                       long long v_stride, int lq, int lk, float scale_log2, const float* rpb_dx, const float* rpb_dy,
+                       int side, float* part, int kv_chunk) {
+    flash_attn<32, float, true>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,
+                                scale_log2, nullptr, rpb_dx, rpb_dy, side, part, kv_chunk);
+}
+
+// merges the key splits of a split flash_attn: one warp per (batch, row), lane d < D
+// owns output column d. Rows with no valid key in any split produce zeros
+template <int D>
+__device__ void flash_combine(float* o, long long o_ld, long long o_stride, const float* part, int splits, int batch,
+                              int lq) {
+    int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    if (w >= batch * lq) return;
+    int b = w / lq, row = w % lq;
+    long long step = (long long)batch * lq * (D + 2);
+    const float* p = part + (long long)w * (D + 2);
+    float mx = -INFINITY;
+    for (int z = 0; z < splits; z++) mx = fmaxf(mx, p[z * step + D]);
+    float l = 0.f, acc[D / 32] = {};
+    if (mx != -INFINITY) {
+        for (int z = 0; z < splits; z++) {
+            const float* ps = p + z * step;
+            float mz = ps[D];
+            if (mz == -INFINITY) continue;
+            float c = exp2f(mz - mx);
+            l += c * ps[D + 1];
+#pragma unroll
+            for (int i = 0; i < D / 32; i++) acc[i] += c * ps[lane + i * 32];
+        }
+    }
+    float inv = l > 0.f ? 1.f / l : 0.f;
+    float* out = o + b * o_stride + row * o_ld;
+#pragma unroll
+    for (int i = 0; i < D / 32; i++) out[lane + i * 32] = acc[i] * inv;
+}
+
+extern "C" __global__ void flash_combine_d32(float* o, long long o_ld, long long o_stride, const float* part,
+                                             int splits, int batch, int lq) {
+    flash_combine<32>(o, o_ld, o_stride, part, splits, batch, lq);
+}
 
 // rows of `cols` floats with row stride `ld` -> contiguous bf16 [rows, cols]
 extern "C" __global__ void f32_to_bf16(__nv_bfloat16* dst, const float* src, long long rows, int cols, long long ld) {

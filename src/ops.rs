@@ -307,6 +307,22 @@ pub struct Mask {
     /// u8 per key, nonzero means the key is padding
     pub key_pad: u64,
     pub causal: bool,
+    pub rpb: Option<BoxRpb>,
+}
+
+/// Key splits for the fused box-RPB attention
+const RPB_SPLITS: usize = 16;
+
+/// Box relative position bias in factored form: for head `h`, query row `1 + q` and key
+/// `y * side + x`, the bias is `dy[q, y, h] + dx[q, x, h]`, and row 0 gets none. The
+/// fused kernel adds it per score instead of reading a `[heads, lq, side^2]` tensor
+#[derive(Clone, Copy)]
+pub struct BoxRpb {
+    /// `[lq - 1, side, heads]`
+    pub dx: u64,
+    /// `[lq - 1, side, heads]`
+    pub dy: u64,
+    pub side: usize,
 }
 
 /// Scaled dot-product attention over `batch` independent (q, k, v) slices described by
@@ -325,9 +341,10 @@ pub fn attention(
     mask: Mask,
 ) -> Result<()> {
     if flash_ok(gpu, &[q, k, v, out], hd, &mask) {
-        let kernel = match (q.bf16, hd) {
-            (true, _) => "flash_attn_bf16_d64",
-            (false, 32) => "flash_attn_d32",
+        let kernel = match (q.bf16, hd, mask.rpb) {
+            (true, _, _) => "flash_attn_bf16_d64",
+            (false, 32, Some(_)) => "flash_attn_rpb_d32",
+            (false, 32, None) => "flash_attn_d32",
             _ => "flash_attn_d64",
         };
         let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
@@ -337,10 +354,37 @@ pub fn attention(
         for m in [out, q, k, v] {
             args.extend(view(m));
         }
-        args.extend([Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2), Arg::from(mask.key_pad)]);
-        return gpu.launch(kernel, grid, (128, 1, 1), 0, args);
+        args.extend([Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2)]);
+        let Some(r) = mask.rpb else {
+            args.push(Arg::from(mask.key_pad));
+            return gpu.launch(kernel, grid, (128, 1, 1), 0, args);
+        };
+
+        // the decoder has 201 queries over 5184 keys: 32 blocks would leave most SMs idle,
+        // so split the keys and merge the partial softmaxes
+        let chunk = lk.div_ceil(RPB_SPLITS).next_multiple_of(64);
+        let splits = lk.div_ceil(chunk);
+        let part = gpu.empty(&[splits, batch, lq, hd + 2])?;
+        args.extend([Arg::from(r.dx), Arg::from(r.dy), Arg::from(r.side), Arg::from(part.ptr()), Arg::from(chunk)]);
+        gpu.launch(kernel, (grid.0, grid.1, splits as u32), (128, 1, 1), 0, args)?;
+        let warps = batch * lq;
+        return launch!(gpu, "flash_combine_d32", (blocks(warps * 32, 256), 1, 1), B256, 0;
+            out.ptr, out.ld as u64, out.stride as u64, &part, splits, batch, lq);
     }
 
+    let mut mask = mask;
+    let _bias = match mask.rpb {
+        Some(r) => {
+            assert!(mask.bias == 0 && lk == r.side * r.side, "box RPB covers a side x side key grid");
+            let bias = gpu.empty(&[batch, lq, lk])?;
+            launch!(gpu, "rpb_combine", ew(bias.len()), B256, 0;
+                &bias, r.dx, r.dy, lq - 1, r.side, batch)?;
+            mask.bias = bias.ptr();
+            mask.bias_div = 1;
+            Some(bias)
+        }
+        None => None,
+    };
     let scores = gpu.empty(&[batch, lq, lk])?;
     let scale = 1.0 / (hd as f32).sqrt();
     let s = Mat::new(scores.ptr(), lk).stride(lq * lk);
@@ -352,7 +396,8 @@ pub fn attention(
 
 /// The fused kernel covers BF16 mode for FP32 q/k/v with head dims 32 and 64, which it
 /// rounds to BF16 for `mma.sync`, and BF16 q/k/v with head dim 64, without additive bias
-/// or causal masking. It loads q/k/v in 16-byte chunks and stores float2. BF16 q/k/v
+/// or causal masking, except the box RPB, which it fuses for FP32 q/k/v with head dim 32
+/// and no key padding. It loads q/k/v in 16-byte chunks and stores float2. BF16 q/k/v
 /// must use it, since the materialized path reads FP32
 fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
     let aligned = |m: &Mat, elems: usize, size: usize| {
@@ -366,6 +411,7 @@ fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> boo
     let inputs = if bf16 { (8, 2) } else { (4, 4) };
     let ok = gpu.precision() == Precision::Bf16
         && (hd == 64 || (hd == 32 && !bf16))
+        && (mask.rpb.is_none() || (hd == 32 && !bf16 && mask.key_pad == 0))
         && mask.bias == 0
         && !mask.causal
         && aligned(out, 2, 4)

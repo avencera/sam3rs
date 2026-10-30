@@ -6,7 +6,8 @@ use eyre::{Result, WrapErr, ensure};
 use crate::gpu::{Gpu, Tensor, launch};
 use crate::nvtx::range;
 use crate::ops::{
-    ACT_RELU, Attention, B256, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm, upload_i32,
+    ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm,
+    upload_i32,
 };
 use crate::posenc::box_encoding;
 use crate::text::TextFeatures;
@@ -363,7 +364,6 @@ impl Detector {
         crate::ops::bias_act(gpu, &boxes, None, crate::ops::ACT_SIGMOID)?;
         let mem_pos = add(gpu, memory, &self.pos)?;
         let qpos = gpu.zeros(&[n, D])?;
-        let bias = gpu.empty(&[HEADS, n, GRID * GRID])?;
         let mut hs = None;
         let mut presence = None;
 
@@ -372,7 +372,7 @@ impl Detector {
             launch!(gpu, "box_sine_embed", ew(sine.len()), B256, 0; &sine, &boxes, QUERIES)?;
             let pos = self.ref_point_head.forward(gpu, &sine)?;
             gpu.copy_dtod(pos.ptr(), qpos.at(D), pos.len() * 4)?;
-            self.box_rpb(gpu, &boxes, &bias)?;
+            let [dx, dy] = self.box_rpb(gpu, &boxes)?;
 
             let qk = add(gpu, &x, &qpos)?;
             l.self_attn.forward_residual(gpu, &qk, &qk, &x, Mask::default(), &x)?;
@@ -383,7 +383,7 @@ impl Detector {
             l.text_norm.forward_inplace(gpu, &x)?;
 
             let q = add(gpu, &x, &qpos)?;
-            let rpb = Mask { bias: bias.ptr(), bias_div: 1, ..Mask::default() };
+            let rpb = Mask { rpb: Some(BoxRpb { dx: dx.ptr(), dy: dy.ptr(), side: GRID }), ..Mask::default() };
             l.image_attn.forward_residual(gpu, &q, &mem_pos, memory, rpb, &x)?;
             l.image_norm.forward_inplace(gpu, &x)?;
 
@@ -410,15 +410,15 @@ impl Detector {
         Ok((hs.unwrap(), boxes, presence.unwrap()))
     }
 
-    /// Box relative position bias for the image cross-attention, `[8, 201, 5184]`
-    fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor, bias: &Tensor) -> Result<()> {
-        let mut deltas = Vec::new();
-        for (axis, mlp) in [(0i32, &self.rpb_x), (1, &self.rpb_y)] {
+    /// Box relative position bias for the image cross-attention in factored form, `dx`
+    /// and `dy` as `[200, 72, 8]` (see [`BoxRpb`])
+    fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor) -> Result<[Tensor; 2]> {
+        let delta = |axis: i32, mlp: &Mlp| -> Result<Tensor> {
             let d = gpu.empty(&[QUERIES * GRID, 2])?;
             launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, QUERIES, GRID, axis)?;
-            deltas.push(mlp.forward(gpu, &d)?);
-        }
-        launch!(gpu, "rpb_combine", ew(bias.len()), B256, 0; bias, &deltas[0], &deltas[1], QUERIES, GRID, HEADS)
+            mlp.forward(gpu, &d)
+        };
+        Ok([delta(0, &self.rpb_x)?, delta(1, &self.rpb_y)?])
     }
 
     fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf, len: usize) -> Result<Tensor> {
