@@ -229,12 +229,13 @@ pub enum Precision {
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default
     Tf32,
-    /// BF16 tensor-core GEMMs (FP32 accumulation) everywhere. The vision backbone, necks
-    /// and text encoder MLP keep BF16 activations; the rest of the text encoder, the
-    /// fusion encoder, detector and point decoder keep FP32 activations and round GEMM
-    /// inputs to BF16 inside cuBLAS. Unmasked attention with head dim 32 or 64, and the
-    /// detector's box-biased cross-attention, run the fused kernel, which rounds q, k
-    /// and v to BF16
+    /// Tensor-core GEMMs with FP32 accumulation everywhere. The vision backbone, necks
+    /// and text encoder MLP keep BF16 weights and activations; the rest of the text
+    /// encoder, the fusion encoder, detector and point decoder keep FP32 ones, and cuBLAS
+    /// may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though it
+    /// picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
+    /// and the detector's box-biased cross-attention, run the fused kernel, which rounds
+    /// q, k and v to BF16
     Bf16,
 }
 
@@ -295,8 +296,8 @@ impl Gpu {
             check_blas(blas::cublasCreate_v2(&mut handle))?;
             check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
         }
-        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and BF16
-        // tensor cores for the FP32-input GEMMs of BF16 mode
+        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and for the
+        // FP32-input GEMMs of BF16 mode, tensor cores that may round inputs to BF16
         let (math, fp32_compute) = match precision {
             Precision::Fp32 => {
                 (blas::cublasMath_t::CUBLAS_PEDANTIC_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC)
@@ -305,7 +306,8 @@ impl Gpu {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32)
             }
             // strict FP32 compute here cost a third of a detect call with no parity gain,
-            // and BF16 kept more score headroom than TF32 on the parity set
+            // and FAST_16BF kept more score headroom than FAST_TF32 on the parity set. cuBLAS
+            // still picks TF32 kernels for most of these shapes on an RTX 5090
             Precision::Bf16 => {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF)
             }

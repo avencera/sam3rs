@@ -56,7 +56,7 @@ pub enum Operands {
     F32,
     /// FP32 x, w and output on TF32 tensor cores
     F32FastTf32,
-    /// FP32 x, w and output on BF16 tensor cores
+    /// FP32 x, w and output on tensor cores that may round the inputs to BF16
     F32Fast16Bf,
 }
 
