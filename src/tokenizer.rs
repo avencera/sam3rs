@@ -2,7 +2,8 @@
 //!
 //! Text cleaning is whitespace collapsing and lowercasing. Upstream also runs
 //! `ftfy.fix_text` and `html.unescape`, which only change mojibake and HTML entities and
-//! are not ported
+//! are not ported. `<start_of_text>` and `<end_of_text>` in the text become their special
+//! ids, as upstream's BPE cache makes them
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,6 +14,9 @@ use regex::Regex;
 pub const CONTEXT: usize = 32;
 const SOT: u32 = 49406;
 const EOT: u32 = 49407;
+/// Upstream's spellings; Hugging Face's vocab.json names the same ids `<|startoftext|>`
+/// and `<|endoftext|>`
+const SPECIAL: [(&str, u32); 2] = [("<start_of_text>", SOT), ("<end_of_text>", EOT)];
 
 pub struct Tokenizer {
     encoder: HashMap<String, u32>,
@@ -94,6 +98,10 @@ impl Tokenizer {
         let clean = self.whitespace.replace_all(text.trim(), " ").trim().to_lowercase();
         let mut ids = Vec::new();
         for m in self.pattern.find_iter(&clean) {
+            if let Some((_, id)) = SPECIAL.iter().find(|(text, _)| *text == m.as_str()) {
+                ids.push(*id);
+                continue;
+            }
             let mapped: String = m.as_str().bytes().map(|b| self.byte_encoder[b as usize]).collect();
             for piece in self.bpe(&mapped) {
                 ids.push(*self.encoder.get(&piece).ok_or_else(|| eyre!("token {piece:?} not in vocab"))?);
@@ -114,5 +122,34 @@ impl Tokenizer {
         let mut out = [0u32; CONTEXT];
         out[..tokens.len()].copy_from_slice(&tokens);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::Value;
+
+    use super::Tokenizer;
+
+    /// Compares against upstream's tokenizer on the cases from scripts/tokenizer_cases.py.
+    /// Reads vocab.json and merges.txt from `SAM3RS_TOKENIZER_DIR`, default models/sam3;
+    /// openai/clip-vit-base-patch32 ships the same vocab and merges
+    #[test]
+    fn matches_upstream() {
+        let dir = std::env::var_os("SAM3RS_TOKENIZER_DIR").map_or_else(|| PathBuf::from("models/sam3"), PathBuf::from);
+        let tokenizer = Tokenizer::open(&dir).unwrap_or_else(|e| panic!("{e:#}: run scripts/fetch-models.sh"));
+        let cases: Value = serde_json::from_str(include_str!("../tests/tokenizer_cases.json")).unwrap();
+        let mut failures = Vec::new();
+        for case in cases.as_array().unwrap() {
+            let text = case["text"].as_str().unwrap();
+            let want: Vec<u32> = case["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            let got = tokenizer.tokenize(text).unwrap();
+            if got.as_slice() != want {
+                failures.push(format!("{text:?}\n  got  {got:?}\n  want {want:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
