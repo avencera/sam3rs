@@ -6,9 +6,10 @@ use std::path::Path;
 use eyre::Result;
 
 use crate::detector::{BoxPrompt, Detector, DetectorImage, QUERIES};
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, Precision};
 use crate::image::{RgbImage, preprocess};
 use crate::launch;
+use crate::nvtx::range;
 use crate::ops::{B256, ew, upload_i32};
 use crate::point::{LOW_RES, PointDecoder, PointImage, PointPrompt, clamped_mask, full_res_masks};
 use crate::text::TextEncoder;
@@ -62,8 +63,8 @@ pub struct Sam3 {
 
 impl Sam3 {
     /// Loads `model.safetensors`, `vocab.json` and `merges.txt` from `dir`
-    pub fn load(dir: &Path, device: usize) -> Result<Self> {
-        let gpu = Gpu::new(device)?;
+    pub fn load(dir: &Path, device: usize, precision: Precision) -> Result<Self> {
+        let gpu = Gpu::new(device, precision)?;
         let wts = Weights::open(&dir.join("model.safetensors"))?;
         let model = Self {
             tokenizer: Tokenizer::open(dir)?,
@@ -86,9 +87,17 @@ impl Sam3 {
     /// Runs the vision backbone and both necks; the result serves any number of prompts
     pub fn encode(&self, img: &RgbImage) -> Result<Embedding> {
         let gpu = &self.gpu;
-        let pixels = preprocess(gpu, img)?;
-        let trunk = self.backbone.forward(gpu, &pixels)?;
+        let _r = range(c"encode");
+        let pixels = {
+            let _r = range(c"preprocess");
+            preprocess(gpu, img)?
+        };
+        let trunk = {
+            let _r = range(c"backbone");
+            self.backbone.forward(gpu, &pixels)?
+        };
         drop(pixels);
+        let _r = range(c"necks");
         let point = self.point.prepare_image(gpu, &self.tracker_neck.forward(gpu, &trunk)?)?;
         let detector = self.detector.prepare_image(gpu, self.neck.forward(gpu, &trunk)?)?;
         gpu.synchronize()?;
@@ -99,8 +108,13 @@ impl Sam3 {
     /// for boxes alone), keeping those scoring above `SCORE_THRESHOLD`
     pub fn detect(&self, emb: &Embedding, text: &str, boxes: &[BoxPrompt]) -> Result<Vec<Detection>> {
         let gpu = &self.gpu;
-        let feats = self.text.forward(gpu, &self.tokenizer.tokenize(text)?)?;
+        let _r = range(c"detect");
+        let feats = {
+            let _r = range(c"text");
+            self.text.forward(gpu, &self.tokenizer.tokenize(text)?)?
+        };
         let out = self.detector.forward(gpu, &emb.detector, &feats, boxes)?;
+        let _r = range(c"postprocess");
         let presence = gpu.download(&out.presence)?[0];
         let logits = gpu.download(&out.logits)?;
         let boxes = gpu.download(&out.boxes)?;
@@ -149,12 +163,14 @@ impl Sam3 {
     /// and osam do), returning the second pass's best mask after hole filling
     pub fn segment_points(&self, emb: &Embedding, points: &[PointPrompt]) -> Result<PointMask> {
         let gpu = &self.gpu;
+        let _r = range(c"segment_points");
         let (w, h) = (emb.width, emb.height);
         let first = self.point.forward(gpu, &emb.point, points, w, h, None)?;
         let mask_input = clamped_mask(gpu, &first.low_res, argmax(&first.iou))?;
         let second = self.point.forward(gpu, &emb.point, points, w, h, Some(&mask_input))?;
         let best = argmax(&second.iou);
 
+        let _r = range(c"postprocess");
         let side = LOW_RES * LOW_RES;
         let low_res = gpu.empty(&[1, side])?;
         gpu.copy_dtod(second.low_res.at(best * side), low_res.ptr(), side * 4)?;

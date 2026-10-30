@@ -3,6 +3,9 @@
 //! speakrs writes its kernels with cuda-oxide, which needs nightly Rust. sam3rs stays on
 //! stable, so its kernels are CUDA C++ built here. The fatbin carries an sm_120 cubin for
 //! the RTX 50 series plus compute_120 PTX that newer drivers can JIT
+//!
+//! It also builds csrc/nvtx.c, a two-function shim over the header-only NVTX3 API, into
+//! a static library so profiles can be split by pipeline stage
 
 use std::env;
 use std::path::PathBuf;
@@ -34,4 +37,27 @@ fn main() {
         .status()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", nvcc.display()));
     assert!(status.success(), "nvcc failed");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let object = out_dir.join("nvtx.o");
+    println!("cargo:rerun-if-changed=csrc/nvtx.c");
+    let status = Command::new("cc")
+        .args(["-c", "-O2", "-fPIC", "-I"])
+        .arg(PathBuf::from(&cuda).join("include"))
+        .arg("-o")
+        .arg(&object)
+        .arg("csrc/nvtx.c")
+        .status()
+        .expect("failed to run cc");
+    assert!(status.success(), "cc failed on csrc/nvtx.c");
+    let status = Command::new("ar")
+        .arg("rcs")
+        .arg(out_dir.join("libsam3rs_nvtx.a"))
+        .arg(&object)
+        .status()
+        .expect("failed to run ar");
+    assert!(status.success(), "ar failed");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=sam3rs_nvtx");
+    println!("cargo:rustc-link-lib=dylib=dl");
 }

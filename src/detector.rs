@@ -5,6 +5,7 @@ use eyre::Result;
 
 use crate::gpu::{Gpu, Tensor};
 use crate::launch;
+use crate::nvtx::range;
 use crate::ops::{
     ACT_RELU, Attention, B256, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm, upload_i32,
 };
@@ -275,17 +276,29 @@ impl Detector {
         text: &TextFeatures,
         boxes: &[BoxPrompt],
     ) -> Result<DetectorOutput> {
-        let geo = self.encode_geometry(gpu, img, boxes)?;
+        let geo = {
+            let _r = range(c"geometry");
+            self.encode_geometry(gpu, img, boxes)?
+        };
         let prompt = concat_rows(gpu, &text.feats, &geo)?;
         let mut pad = text.pad.to_vec();
         pad.resize(prompt.rows(), 0);
         let pad = gpu.upload_bytes(&pad)?;
         let prompt_mask = Mask { key_pad: pad.ptr(), ..Mask::default() };
 
-        let memory = self.fusion_encoder(gpu, img, &prompt, prompt_mask)?;
-        let (hs, boxes, presence) = self.decode(gpu, &memory, &prompt, prompt_mask)?;
+        let memory = {
+            let _r = range(c"fusion_encoder");
+            self.fusion_encoder(gpu, img, &prompt, prompt_mask)?
+        };
+        let (hs, boxes, presence) = {
+            let _r = range(c"decoder");
+            self.decode(gpu, &memory, &prompt, prompt_mask)?
+        };
         let logits = self.score(gpu, &hs, &prompt, &pad, prompt.rows())?;
-        let masks = self.segment(gpu, img, &memory, &hs, &prompt, prompt_mask)?;
+        let masks = {
+            let _r = range(c"seg_head");
+            self.segment(gpu, img, &memory, &hs, &prompt, prompt_mask)?
+        };
         Ok(DetectorOutput { logits, presence, boxes, masks })
     }
 
