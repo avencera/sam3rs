@@ -75,9 +75,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=int, default=0)
     p.add_argument(
         "--precision",
-        choices=["bf16", "fp32"],
+        choices=["bf16", "tf32", "fp32"],
         default="bf16",
-        help="fp32 (strict reference path) or bf16 (tensor cores, fused attention)",
+        help="fp32 (strict reference path), tf32 (FP32 with TF32 tensor-core GEMMs) or bf16 (BF16 backbone, fused attention)",
     )
     return p
 

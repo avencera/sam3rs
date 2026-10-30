@@ -561,7 +561,7 @@ pub fn concat_rows(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// BF16 copy of a weight tensor in BF16 mode, for the conv layers in the necks
 fn bf16_weights(gpu: &Gpu, w: &Tensor) -> Result<Option<Buf>> {
     Ok(match gpu.precision() {
-        Precision::Fp32 => None,
+        Precision::Fp32 | Precision::Tf32 => None,
         Precision::Bf16 => Some(to_bf16(gpu, w.ptr(), w.len(), 1, w.len())?),
     })
 }

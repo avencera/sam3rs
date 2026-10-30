@@ -23,6 +23,7 @@ fn precision(name: &str) -> PyResult<Precision> {
 fn precision_name(p: Precision) -> &'static str {
     match p {
         Precision::Fp32 => "fp32",
+        Precision::Tf32 => "tf32",
         Precision::Bf16 => "bf16",
     }
 }

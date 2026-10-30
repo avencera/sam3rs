@@ -51,7 +51,7 @@ fn matches_pytorch() -> Result<()> {
         return Err(eyre!("missing weights, run scripts/fetch-models.sh"));
     }
     let mut failures = Vec::new();
-    for precision in [Precision::Fp32, Precision::Bf16] {
+    for precision in [Precision::Fp32, Precision::Tf32, Precision::Bf16] {
         println!("== {precision:?}");
         let model = Sam3::load(model_dir, 0, precision)?;
         let worst = check(&model, &mut failures, precision)?;
