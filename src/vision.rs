@@ -3,9 +3,10 @@
 
 use eyre::Result;
 
-use crate::gpu::{Gpu, Mat, Precision, Tensor};
-use crate::launch;
-use crate::ops::{ACT_GELU, ACT_GELU_TANH, ACT_NONE, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, attention, bias_act, ew};
+use crate::gpu::{Gpu, Mat, Precision, Tensor, launch};
+use crate::ops::{
+    ACT_GELU, ACT_GELU_TANH, ACT_NONE, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, attention, bias_act, ew,
+};
 use crate::weights::Weights;
 
 pub const IMAGE_SIZE: usize = 1008;
@@ -24,8 +25,7 @@ const GLOBAL_BLOCKS: [usize; 4] = [7, 15, 23, 31];
 /// 24x24 pretraining grid). Angles are formed in f32 like PyTorch before cos/sin
 fn rope_tables(gpu: &Gpu, side: usize, scale: f32) -> Result<(Tensor, Tensor)> {
     let quarter = HEAD_DIM / 4;
-    let freqs: Vec<f32> =
-        (0..quarter).map(|i| 1.0 / 10000f32.powf((4 * i) as f32 / HEAD_DIM as f32)).collect();
+    let freqs: Vec<f32> = (0..quarter).map(|i| 1.0 / 10000f32.powf((4 * i) as f32 / HEAD_DIM as f32)).collect();
     let half = HEAD_DIM / 2;
     let mut cos = vec![0f32; side * side * half];
     let mut sin = vec![0f32; side * side * half];
@@ -39,7 +39,7 @@ fn rope_tables(gpu: &Gpu, side: usize, scale: f32) -> Result<(Tensor, Tensor)> {
         }
     }
     let shape = [side * side, half];
-    Ok((gpu.upload(&cos, &shape)?, gpu.upload(&sin, &shape)?))
+    Ok((gpu.upload(cos, &shape)?, gpu.upload(sin, &shape)?))
 }
 
 struct Block {
@@ -74,7 +74,12 @@ impl Backbone {
             let a = format!("{l}.attention");
             blocks.push(Block {
                 norm1: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm1"), 1e-5)?,
-                qkv: Linear::load_concat(gpu, wts, &[format!("{a}.q_proj"), format!("{a}.k_proj"), format!("{a}.v_proj")])?.bf16(gpu)?,
+                qkv: Linear::load_concat(
+                    gpu,
+                    wts,
+                    &[format!("{a}.q_proj"), format!("{a}.k_proj"), format!("{a}.v_proj")],
+                )?
+                .bf16(gpu)?,
                 proj: Linear::load(gpu, wts, &format!("{a}.o_proj"))?.bf16(gpu)?,
                 norm2: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm2"), 1e-5)?,
                 fc1: Linear::load(gpu, wts, &format!("{l}.mlp.fc1"))?.bf16(gpu)?,

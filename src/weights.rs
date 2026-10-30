@@ -33,11 +33,7 @@ impl Weights {
         if view.dtype() != Dtype::F32 {
             bail!("weight {name} is {:?}, expected F32", view.dtype());
         }
-        let data = view
-            .data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
+        let data = bytemuck::pod_collect_to_vec(view.data());
         Ok((data, view.shape().to_vec()))
     }
 
@@ -47,7 +43,7 @@ impl Weights {
 
     pub fn get(&self, gpu: &Gpu, name: &str) -> Result<Tensor> {
         let (data, shape) = self.host(name)?;
-        gpu.upload(&data, &shape)
+        gpu.upload(data, &shape)
     }
 
     /// Several tensors concatenated along dim 0, such as separate q/k/v projections
@@ -68,6 +64,6 @@ impl Weights {
             }
         }
         let shape = shape.ok_or_else(|| eyre!("concat of nothing"))?;
-        gpu.upload(&data, &shape)
+        gpu.upload(data, &shape)
     }
 }

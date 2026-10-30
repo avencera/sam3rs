@@ -1,10 +1,9 @@
 //! SAM 3 detector: geometry (box) encoder, fusion encoder, DETR decoder with presence
 //! token, dot-product scoring and the segmentation head
 
-use eyre::Result;
+use eyre::{Result, WrapErr, ensure};
 
-use crate::gpu::{Gpu, Tensor};
-use crate::launch;
+use crate::gpu::{Gpu, Tensor, launch};
 use crate::nvtx::range;
 use crate::ops::{
     ACT_RELU, Attention, B256, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm, upload_i32,
@@ -20,18 +19,49 @@ pub const QUERIES: usize = 200;
 const ROI: usize = 7;
 
 /// A box prompt in normalized cxcywh with its label (true = positive)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoxPrompt {
-    pub cxcywh: [f32; 4],
-    pub positive: bool,
+    cxcywh: [f32; 4],
+    positive: bool,
 }
 
 impl BoxPrompt {
     /// A box from pixel corners `[x0, y0, x1, y1]` in a `width` x `height` image
-    pub fn from_xyxy(xyxy: [f32; 4], width: usize, height: usize, positive: bool) -> Self {
+    ///
+    /// The box may extend past the image by up to one image size on each side
+    pub fn from_xyxy(xyxy: [f32; 4], width: usize, height: usize, positive: bool) -> Result<Self> {
+        ensure!(width > 0 && height > 0, "image size {width}x{height} is empty");
+        ensure!(xyxy.iter().all(|v| v.is_finite()), "box {xyxy:?} has a non-finite coordinate");
         let (w, h) = (width as f32, height as f32);
         let [x0, y0, x1, y1] = xyxy;
-        Self { cxcywh: [(x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h, (x1 - x0) / w, (y1 - y0) / h], positive }
+        Self::from_cxcywh([(x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h, (x1 - x0) / w, (y1 - y0) / h], positive)
+            .wrap_err_with(|| format!("box {xyxy:?} in a {width}x{height} image"))
+    }
+
+    /// A box from its center and size as fractions of the image width and height
+    ///
+    /// Width and height must be positive, and the corners within `[-1, 2]`: no more than
+    /// one image size past each edge. That bounds the ROI pooling work per box
+    pub fn from_cxcywh(cxcywh: [f32; 4], positive: bool) -> Result<Self> {
+        let [cx, cy, w, h] = cxcywh;
+        ensure!(cxcywh.iter().all(|v| v.is_finite()), "box {cxcywh:?} has a non-finite value");
+        ensure!(w > 0.0 && h > 0.0, "box {cxcywh:?} has no area");
+        let corners = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
+        ensure!(
+            corners.iter().all(|c| (-1.0..=2.0).contains(c)),
+            "box {cxcywh:?} reaches more than one image size past the image"
+        );
+        Ok(Self { cxcywh, positive })
+    }
+
+    /// Center x, center y, width and height as fractions of the image size
+    pub fn cxcywh(&self) -> [f32; 4] {
+        self.cxcywh
+    }
+
+    /// Whether the box is a positive exemplar rather than a negative one
+    pub fn positive(&self) -> bool {
+        self.positive
     }
 }
 
@@ -154,8 +184,9 @@ impl Detector {
             layers: (0..3).map(|i| EncoderLayer::load(gpu, wts, &format!("{g}.layers.{i}"))).collect::<Result<_>>()?,
             out_norm: LayerNorm::load(gpu, wts, &format!("{g}.output_layer_norm"), 1e-5)?,
         };
-        let encoder =
-            (0..6).map(|i| EncoderLayer::load(gpu, wts, &format!("{p}.detr_encoder.layers.{i}"))).collect::<Result<_>>()?;
+        let encoder = (0..6)
+            .map(|i| EncoderLayer::load(gpu, wts, &format!("{p}.detr_encoder.layers.{i}")))
+            .collect::<Result<_>>()?;
         let dd = format!("{p}.detr_decoder");
         let mut decoder = Vec::new();
         for i in 0..6 {
@@ -209,7 +240,7 @@ impl Detector {
                 .collect::<Result<_>>()?,
             instance_proj: Linear::load(gpu, wts, &format!("{m}.instance_projection"))?,
             mask_embed: Mlp::load_indexed(gpu, wts, &format!("{m}.mask_embedder"), 3, ACT_RELU)?,
-            pos: gpu.upload(&crate::posenc::sine_2d(GRID), &[GRID * GRID, D])?,
+            pos: gpu.upload(crate::posenc::sine_2d(GRID), &[GRID * GRID, D])?,
         })
     }
 
@@ -226,7 +257,7 @@ impl Detector {
             gpu.clone_tensor(&g.cls)?
         } else {
             let raw: Vec<f32> = boxes.iter().flat_map(|b| b.cxcywh).collect();
-            let raw = gpu.upload(&raw, &[n, 4])?;
+            let raw = gpu.upload(raw, &[n, 4])?;
             let x = g.direct.forward(gpu, &raw)?;
 
             let side = GRID as f32;
@@ -237,18 +268,18 @@ impl Detector {
                     [(cx - 0.5 * w) * side, (cy - 0.5 * h) * side, (cx + 0.5 * w) * side, (cy + 0.5 * h) * side]
                 })
                 .collect();
-            let xyxy = gpu.upload(&xyxy, &[n, 4])?;
+            let xyxy = gpu.upload(xyxy, &[n, 4])?;
             let pooled = gpu.empty(&[n, D * ROI * ROI])?;
             launch!(gpu, "roi_align", ew(pooled.len()), B256, 0;
                 &pooled, &img.fpn2_normed, &xyxy, n, GRID, GRID, D, ROI)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
             let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh)).collect();
-            let enc = gpu.upload(&enc, &[n, 258])?;
+            let enc = gpu.upload(enc, &[n, 258])?;
             g.pos.forward_residual(gpu, &enc, &x)?;
 
             let labels: Vec<i32> = boxes.iter().map(|b| b.positive as i32).collect();
-            let labels = upload_i32(gpu, &labels)?;
+            let labels = upload_i32(gpu, labels)?;
             let label = gpu.empty(&[n, D])?;
             launch!(gpu, "gather_rows", ew(n * D), B256, 0; &label, &g.label, labels.ptr(), n, D)?;
             crate::ops::add_assign(gpu, &x, &label)?;
@@ -283,7 +314,7 @@ impl Detector {
         let prompt = concat_rows(gpu, &text.feats, &geo)?;
         let mut pad = text.pad.to_vec();
         pad.resize(prompt.rows(), 0);
-        let pad = gpu.upload_bytes(&pad)?;
+        let pad = gpu.upload_buf(pad)?;
         let prompt_mask = Mask { key_pad: pad.ptr(), ..Mask::default() };
 
         let memory = {
@@ -318,7 +349,13 @@ impl Detector {
 
     /// Returns normed final query states `[200, 256]`, boxes `[200, 4]` and the presence
     /// logit `[1]`
-    fn decode(&self, gpu: &Gpu, memory: &Tensor, prompt: &Tensor, prompt_mask: Mask) -> Result<(Tensor, Tensor, Tensor)> {
+    fn decode(
+        &self,
+        gpu: &Gpu,
+        memory: &Tensor,
+        prompt: &Tensor,
+        prompt_mask: Mask,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let n = QUERIES + 1;
         // row 0 is the presence token, which has a zero query position
         let x = concat_rows(gpu, &self.presence_token, &self.query_embed)?;
@@ -376,9 +413,9 @@ impl Detector {
     /// Box relative position bias for the image cross-attention, `[8, 201, 5184]`
     fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor, bias: &Tensor) -> Result<()> {
         let mut deltas = Vec::new();
-        for (axis, mlp) in [(0, &self.rpb_x), (1, &self.rpb_y)] {
+        for (axis, mlp) in [(0i32, &self.rpb_x), (1, &self.rpb_y)] {
             let d = gpu.empty(&[QUERIES * GRID, 2])?;
-            launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, QUERIES, GRID, axis as i32)?;
+            launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, QUERIES, GRID, axis)?;
             deltas.push(mlp.forward(gpu, &d)?);
         }
         launch!(gpu, "rpb_combine", ew(bias.len()), B256, 0; bias, &deltas[0], &deltas[1], QUERIES, GRID, HEADS)

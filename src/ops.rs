@@ -4,8 +4,7 @@
 use eyre::{Result, bail, eyre};
 
 use crate::blaslt::Epilogue;
-use crate::gpu::{Arg, Buf, Gpu, Mat, Precision, Tensor, blocks};
-use crate::launch;
+use crate::gpu::{Arg, Buf, Gpu, Mat, Precision, Tensor, blocks, launch};
 use crate::weights::Weights;
 
 pub const ACT_NONE: i32 = 0;
@@ -156,13 +155,6 @@ impl Linear {
     fn forward_bf16(&self, gpu: &Gpu, x: &Tensor, out: u64, beta: f32, act: i32) -> Result<bool> {
         let x16 = Bf16::from_f32(gpu, x)?;
         self.forward_lt(gpu, &x16, (out, false), beta, act)
-    }
-
-    /// FP32 `x16 @ W^T + b`
-    pub fn forward16(&self, gpu: &Gpu, x16: &Bf16) -> Result<Tensor> {
-        let out = gpu.empty(&[x16.rows, self.out_features()])?;
-        self.forward_lt(gpu, x16, (out.ptr(), false), 0.0, ACT_NONE)?;
-        Ok(out)
     }
 
     /// BF16 `act(x16 @ W^T + b)`, for a following BF16 linear; `act` must be one the
@@ -342,7 +334,10 @@ pub fn attention(
 /// float2. BF16 q/k/v must use it, since the materialized path reads FP32
 fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
     let aligned = |m: &Mat, elems: usize, size: usize| {
-        !m.trans && m.ptr % (elems * size) as u64 == 0 && m.ld % elems == 0 && m.stride % elems == 0
+        !m.trans
+            && m.ptr.is_multiple_of((elems * size) as u64)
+            && m.ld.is_multiple_of(elems)
+            && m.stride.is_multiple_of(elems)
     };
     let bf16 = q.bf16;
     assert!(k.bf16 == bf16 && v.bf16 == bf16 && !out.bf16, "q/k/v share a type, out is FP32");
@@ -409,7 +404,7 @@ impl Conv3x3 {
                 }
             }
         }
-        let w = gpu.upload(&taps, &[9, o, c])?;
+        let w = gpu.upload(taps, &[9, o, c])?;
         let w16 = bf16_weights(gpu, &w)?;
         Ok(Self { w, b: wts.get(gpu, &format!("{prefix}.bias"))?, w16 })
     }
@@ -469,10 +464,6 @@ impl ConvT2x2 {
         Ok(Self { w, b: wts.get(gpu, &format!("{prefix}.bias"))?, w16 })
     }
 
-    pub fn out_channels(&self) -> usize {
-        self.w.shape()[1] / 4
-    }
-
     pub fn forward(&self, gpu: &Gpu, x: &Tensor, h: usize, w: usize) -> Result<Tensor> {
         let (c, n) = (self.w.shape()[0], self.w.shape()[1]);
         assert_eq!(x.shape(), &[h * w, c]);
@@ -483,20 +474,23 @@ impl ConvT2x2 {
                 let (input, weight) = (Mat::new(x16.buf.ptr(), c).bf16(), Mat::new(w16.ptr(), n).bf16());
                 gpu.gemm(h * w, n, c, input, weight, Mat::new(g.ptr(), n), 1, 1.0, 0.0)?;
             }
-            None => gpu.gemm(h * w, n, c, Mat::new(x.ptr(), c), Mat::new(self.w.ptr(), n), Mat::new(g.ptr(), n), 1, 1.0, 0.0)?,
+            None => gpu.gemm(
+                h * w,
+                n,
+                c,
+                Mat::new(x.ptr(), c),
+                Mat::new(self.w.ptr(), n),
+                Mat::new(g.ptr(), n),
+                1,
+                1.0,
+                0.0,
+            )?,
         }
         let o = n / 4;
         let y = gpu.empty(&[4 * h * w, o])?;
         launch!(gpu, "convt2x2_scatter", ew(y.len()), B256, 0; &y, &g, &self.b, h, w, o)?;
         Ok(y)
     }
-}
-
-/// `[rows, cols]` -> `[cols, rows]`
-pub fn transpose(gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
-    let out = gpu.empty(&[x.cols(), x.rows()])?;
-    launch!(gpu, "transpose", ew(x.len()), B256, 0; &out, x, x.rows() as u64, x.cols())?;
-    Ok(out)
 }
 
 /// Multi-head attention with separate q/k/v/o projections (`prefix.{q,k,v,o}_proj`). The
@@ -578,7 +572,6 @@ pub fn to_bf16(gpu: &Gpu, src: u64, cols: usize, rows: usize, ld: usize) -> Resu
     Ok(out)
 }
 
-pub fn upload_i32(gpu: &Gpu, v: &[i32]) -> Result<crate::gpu::Buf> {
-    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-    gpu.upload_bytes(&bytes)
+pub fn upload_i32(gpu: &Gpu, v: Vec<i32>) -> Result<Buf> {
+    gpu.upload_buf(v)
 }

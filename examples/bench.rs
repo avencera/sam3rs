@@ -2,17 +2,15 @@
 //! excluded, one warm-up then the median of 5 runs for the image encoder and for each
 //! prompt (point, box, negative box, text). Every prompt call ends with full-resolution
 //! masks on the host, and detection prompts re-run the text encoder, as osam does
+//!
+//!     cargo run --release --example bench -- --precision bf16
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
 use eyre::Result;
-use sam3rs::detector::BoxPrompt;
-use sam3rs::gpu::Precision;
-use sam3rs::image::RgbImage;
-use sam3rs::pipeline::{Embedding, Sam3, VISUAL_PROMPT};
-use sam3rs::point::PointPrompt;
+use sam3rs::{BoxPrompt, Embedding, PointPrompt, Precision, RgbImage, Sam3, VISUAL_PROMPT};
 
 #[derive(Parser)]
 struct Args {
@@ -45,12 +43,12 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let model = Sam3::load(&args.model, args.device, args.precision)?;
     let img = RgbImage::open(&args.image)?;
-    let (w, h) = (img.width, img.height);
+    let (w, h) = (img.width(), img.height());
 
     // the osam benchmark prompts for dogs.jpg
-    let positive = BoxPrompt::from_xyxy([1233.0, 376.0, 1649.0, 691.0], w, h, true);
-    let negative = BoxPrompt::from_xyxy([1400.0, 500.0, 1500.0, 600.0], w, h, false);
-    let point = [PointPrompt { x: 1439.0, y: 504.0, positive: true }];
+    let positive = BoxPrompt::from_xyxy([1233.0, 376.0, 1649.0, 691.0], w, h, true)?;
+    let negative = BoxPrompt::from_xyxy([1400.0, 500.0, 1500.0, 600.0], w, h, false)?;
+    let point = [PointPrompt::new(1439.0, 504.0, true)?];
     type Prompt<'a> = Box<dyn Fn(&Embedding) -> Result<()> + 'a>;
     let prompts: [(&str, Prompt); 4] = [
         ("point", Box::new(|e| model.segment_points(e, &point).map(drop))),

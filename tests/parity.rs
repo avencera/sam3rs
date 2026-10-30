@@ -10,11 +10,7 @@ use std::path::Path;
 
 use eyre::{Result, eyre};
 use safetensors::{Dtype, SafeTensors};
-use sam3rs::detector::BoxPrompt;
-use sam3rs::gpu::Precision;
-use sam3rs::image::RgbImage;
-use sam3rs::pipeline::{Sam3, VISUAL_PROMPT};
-use sam3rs::point::PointPrompt;
+use sam3rs::{BoxPrompt, PointPrompt, Precision, RgbImage, Sam3, VISUAL_PROMPT};
 use serde_json::Value;
 
 const SCORE_TOL: f32 = 0.01;
@@ -23,7 +19,7 @@ const MIN_IOU: f64 = 0.99;
 fn fixture(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     let t = st.tensor(name).map_err(|e| eyre!("{name}: {e}"))?;
     Ok(match t.dtype() {
-        Dtype::F32 => t.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+        Dtype::F32 => bytemuck::pod_collect_to_vec(t.data()),
         Dtype::U8 => t.data().iter().map(|&b| b as f32).collect(),
         d => return Err(eyre!("{name}: unsupported {d:?}")),
     })
@@ -61,7 +57,8 @@ fn matches_pytorch_fp32() -> Result<()> {
 
 /// Runs every fixture prompt, returning the checks that miss the gate
 fn check(model: &Sam3) -> Result<Vec<String>> {
-    let mut fixtures: Vec<_> = std::fs::read_dir("models/parity")?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
+    let mut fixtures: Vec<_> =
+        std::fs::read_dir("models/parity")?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
     fixtures.sort();
     assert!(!fixtures.is_empty(), "no fixtures, run scripts/reference.py dump");
 
@@ -75,7 +72,7 @@ fn check(model: &Sam3) -> Result<Vec<String>> {
 
         let rgb = st.tensor("image_rgb")?;
         let (height, width) = (rgb.shape()[0], rgb.shape()[1]);
-        let img = RgbImage { width, height, data: rgb.data().to_vec() };
+        let img = RgbImage::new(width, height, rgb.data().to_vec())?;
         let emb = model.encode(&img)?;
         let hw = width * height;
 
@@ -96,9 +93,9 @@ fn check(model: &Sam3) -> Result<Vec<String>> {
                     .iter()
                     .map(|p| {
                         let v = numbers(p);
-                        PointPrompt { x: v[0], y: v[1], positive: v[2] != 0.0 }
+                        PointPrompt::new(v[0], v[1], v[2] != 0.0)
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 let got = model.segment_points(&emb, &points)?;
                 let want_iou = fixture(&st, &format!("{key}.iou"))?;
                 let best = (0..3).fold(0, |b, i| if want_iou[i] > want_iou[b] { i } else { b });
@@ -119,7 +116,7 @@ fn check(model: &Sam3) -> Result<Vec<String>> {
                 .unwrap_or_default()
                 .iter()
                 .map(|v| BoxPrompt::from_xyxy([v[0], v[1], v[2], v[3]], width, height, v[4] != 0.0))
-                .collect();
+                .collect::<Result<_>>()?;
             let got = model.detect(&emb, text, &boxes)?;
             let want_scores = fixture(&st, &format!("{key}.scores"))?;
             let want_masks = fixture(&st, &format!("{key}.masks"))?;

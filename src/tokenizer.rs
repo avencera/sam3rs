@@ -24,7 +24,8 @@ pub struct Tokenizer {
 
 /// GPT-2's reversible byte to printable-unicode map
 fn bytes_to_unicode() -> [char; 256] {
-    let mut printable: Vec<u32> = ('!' as u32..='~' as u32).chain('¡' as u32..='¬' as u32).chain('®' as u32..='ÿ' as u32).collect();
+    let mut printable: Vec<u32> =
+        ('!' as u32..='~' as u32).chain('¡' as u32..='¬' as u32).chain('®' as u32..='ÿ' as u32).collect();
     let mut chars = printable.clone();
     let mut n = 0;
     for b in 0..256u32 {
@@ -56,9 +57,8 @@ impl Tokenizer {
                 Ok(((a.to_string(), b.to_string()), i))
             })
             .collect::<Result<_>>()?;
-        let pattern = Regex::new(
-            r"(?i)<start_of_text>|<end_of_text>|'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}|[^\s\p{L}\p{N}]+",
-        )?;
+        let pattern =
+            Regex::new(r"(?i)<start_of_text>|<end_of_text>|'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}|[^\s\p{L}\p{N}]+")?;
         Ok(Self { encoder, ranks, byte_encoder: bytes_to_unicode(), pattern, whitespace: Regex::new(r"\s+")? })
     }
 

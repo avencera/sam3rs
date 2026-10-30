@@ -145,7 +145,8 @@ impl BlasLt {
                 lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 lt::cudaDataType_t::CUDA_R_32F,
             ))?;
-            let set = |attr, value: *const c_void, size| check(lt::cublasLtMatmulDescSetAttribute(desc, attr, value, size));
+            let set =
+                |attr, value: *const c_void, size| check(lt::cublasLtMatmulDescSetAttribute(desc, attr, value, size));
             use lt::cublasLtMatmulDescAttributes_t::*;
             let (trans, no_trans) = (1i32, 0i32); // CUBLAS_OP_T, CUBLAS_OP_N
             set(CUBLASLT_MATMUL_DESC_TRANSA, (&trans as *const i32).cast(), 4)?;
@@ -155,7 +156,11 @@ impl BlasLt {
             // the bias has the output's type
             let out_ty = if out_bf16 { lt::cudaDataType_t::CUDA_R_16BF } else { lt::cudaDataType_t::CUDA_R_32F };
             if epilogue.has_bias() {
-                set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, (&out_ty as *const lt::cudaDataType_t).cast(), size_of_val(&out_ty))?;
+                set(
+                    CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                    (&out_ty as *const lt::cudaDataType_t).cast(),
+                    size_of_val(&out_ty),
+                )?;
             }
 
             let layout = |ty, rows: usize, cols: usize, ld: usize| -> Result<lt::cublasLtMatrixLayout_t> {
@@ -178,8 +183,18 @@ impl BlasLt {
             ))?;
             let mut result = std::mem::MaybeUninit::<lt::cublasLtMatmulHeuristicResult_t>::zeroed();
             let mut found = 0;
-            let status =
-                lt::cublasLtMatmulAlgoGetHeuristic(self.handle, desc, w, x, out, out, pref, 1, result.as_mut_ptr(), &mut found);
+            let status = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.handle,
+                desc,
+                w,
+                x,
+                out,
+                out,
+                pref,
+                1,
+                result.as_mut_ptr(),
+                &mut found,
+            );
             lt::cublasLtMatmulPreferenceDestroy(pref);
             check(status)?;
             if found == 0 {

@@ -3,11 +3,12 @@
 
 use std::f64::consts::PI;
 
-use eyre::Result;
+use eyre::{Result, ensure};
 
-use crate::gpu::{Gpu, Tensor};
-use crate::launch;
-use crate::ops::{ACT_GELU, ACT_RELU, ACT_SIGMOID, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew};
+use crate::gpu::{Gpu, Tensor, launch};
+use crate::ops::{
+    ACT_GELU, ACT_RELU, ACT_SIGMOID, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew,
+};
 use crate::vision::{GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
@@ -17,11 +18,34 @@ const HEADS: usize = 8;
 pub const LOW_RES: usize = 4 * GRID;
 
 /// A click in original image pixels; positive = foreground
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointPrompt {
-    pub x: f32,
-    pub y: f32,
-    pub positive: bool,
+    x: f32,
+    y: f32,
+    positive: bool,
+}
+
+impl PointPrompt {
+    /// A click at `(x, y)` in original image pixels; fails on a non-finite coordinate
+    pub fn new(x: f32, y: f32, positive: bool) -> Result<Self> {
+        ensure!(x.is_finite() && y.is_finite(), "point ({x}, {y}) has a non-finite coordinate");
+        Ok(Self { x, y, positive })
+    }
+
+    /// Horizontal position in pixels
+    pub fn x(&self) -> f32 {
+        self.x
+    }
+
+    /// Vertical position in pixels
+    pub fn y(&self) -> f32 {
+        self.y
+    }
+
+    /// Whether the click marks foreground rather than background
+    pub fn positive(&self) -> bool {
+        self.positive
+    }
 }
 
 /// Image features the point decoder reads, computed once per image
@@ -136,7 +160,7 @@ impl PointDecoder {
             mask_conv2: Linear::load(gpu, wts, &format!("{pe}.mask_embed.conv2"))?,
             mask_ln2: LayerNorm::load(gpu, wts, &format!("{pe}.mask_embed.layer_norm2"), 1e-6)?,
             mask_conv3: Linear::load(gpu, wts, &format!("{pe}.mask_embed.conv3"))?,
-            dense_pe: gpu.upload(&dense, &[GRID * GRID, D])?,
+            dense_pe: gpu.upload(dense, &[GRID * GRID, D])?,
             output_tokens,
             layers,
             final_attn: Attention::load(gpu, wts, &format!("{t}.final_attn_token_to_image"), HEADS)?,
@@ -219,7 +243,7 @@ impl PointDecoder {
         let mut tokens = self.output_tokens.clone();
         tokens.extend(self.sparse_tokens(points, width, height));
         let n = tokens.len() / D;
-        let prompt_pe = gpu.upload(&tokens, &[n, D])?;
+        let prompt_pe = gpu.upload(tokens, &[n, D])?;
         let queries = gpu.clone_tensor(&prompt_pe)?;
 
         let keys = self.dense(gpu, mask_input)?;
@@ -333,17 +357,17 @@ pub fn fill_holes(logits: &mut [f32], side: usize, max_area: usize) {
 /// the original size and thresholds at 0, returning `[n, height * width]` 0/1 bytes
 pub fn full_res_masks(gpu: &Gpu, low_res: &Tensor, n: usize, width: usize, height: usize) -> Result<Vec<u8>> {
     let side = LOW_RES;
-    let mut logits = vec![0f32; n * side * side];
-    gpu.download_into(low_res.ptr(), &mut logits)?;
+    assert_eq!(low_res.len(), n * side * side);
+    let mut logits = gpu.download(low_res)?;
     for m in logits.chunks_mut(side * side) {
         fill_holes(m, side, 256);
     }
-    let filled = gpu.upload(&logits, &[n, side * side])?;
+    let filled = gpu.upload(logits, &[n, side * side])?;
     let up = gpu.empty(&[n, height * width])?;
     launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &filled, n, side, side, height, width)?;
     let mask = gpu.alloc_bytes(up.len())?;
     launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.ptr(), &up, up.len() as u64, 0.0f32)?;
     let mut out = vec![0u8; up.len()];
-    gpu.download_into(mask.ptr(), &mut out)?;
+    gpu.download_into(&mask, &mut out)?;
     Ok(out)
 }

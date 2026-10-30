@@ -2,8 +2,7 @@
 
 use eyre::Result;
 
-use crate::gpu::{Gpu, Tensor};
-use crate::launch;
+use crate::gpu::{Gpu, Tensor, launch};
 use crate::ops::{ACT_GELU, B256, LayerNorm, Linear, Mask, ew, mha};
 use crate::tokenizer::CONTEXT;
 use crate::weights::Weights;
@@ -43,7 +42,11 @@ impl TextEncoder {
             let a = format!("{l}.self_attn");
             layers.push(Layer {
                 ln1: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm1"), 1e-5)?,
-                qkv: Linear::load_concat(gpu, wts, &[format!("{a}.q_proj"), format!("{a}.k_proj"), format!("{a}.v_proj")])?,
+                qkv: Linear::load_concat(
+                    gpu,
+                    wts,
+                    &[format!("{a}.q_proj"), format!("{a}.k_proj"), format!("{a}.v_proj")],
+                )?,
                 out: Linear::load(gpu, wts, &format!("{a}.out_proj"))?,
                 ln2: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm2"), 1e-5)?,
                 fc1: Linear::load(gpu, wts, &format!("{l}.mlp.fc1"))?,
@@ -60,8 +63,7 @@ impl TextEncoder {
     }
 
     pub fn forward(&self, gpu: &Gpu, tokens: &[u32; CONTEXT]) -> Result<TextFeatures> {
-        let ids: Vec<u8> = tokens.iter().flat_map(|t| (*t as i32).to_le_bytes()).collect();
-        let ids = gpu.upload_bytes(&ids)?;
+        let ids = gpu.upload_buf(tokens.map(|t| t as i32).to_vec())?;
         let x = gpu.empty(&[CONTEXT, WIDTH])?;
         launch!(gpu, "text_embed", ew(x.len()), B256, 0; &x, &self.tok, &self.pos, ids.ptr(), CONTEXT, WIDTH)?;
 
@@ -73,7 +75,17 @@ impl TextEncoder {
             let h = l.ln1.forward(gpu, &x)?;
             let qkv = l.qkv.forward(gpu, &h)?;
             let ld = 3 * WIDTH;
-            let o = mha(gpu, (qkv.ptr(), ld), (qkv.at(WIDTH), ld), (qkv.at(2 * WIDTH), ld), CONTEXT, CONTEXT, HEADS, hd, mask)?;
+            let o = mha(
+                gpu,
+                (qkv.ptr(), ld),
+                (qkv.at(WIDTH), ld),
+                (qkv.at(2 * WIDTH), ld),
+                CONTEXT,
+                CONTEXT,
+                HEADS,
+                hd,
+                mask,
+            )?;
             l.out.forward_residual(gpu, &o, &x)?;
             let h = l.ln2.forward(gpu, &x)?;
             let hidden = l.fc1.forward_act(gpu, &h, ACT_GELU)?;

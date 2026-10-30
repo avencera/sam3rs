@@ -3,16 +3,14 @@
 //!     sam3rs image.jpg --text dog --out dogs.png
 //!     sam3rs image.jpg --box 1233,376,1649,691 --neg-box 1400,500,1500,600
 //!     sam3rs image.jpg --point 1439,504 --neg-point 1500,600
+//!
+//! Without `--model`, the weights come from the gated facebook/sam3 Hugging Face repo
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use eyre::{Result, bail, eyre};
-use sam3rs::detector::BoxPrompt;
-use sam3rs::gpu::Precision;
-use sam3rs::image::RgbImage;
-use sam3rs::pipeline::{Sam3, VISUAL_PROMPT};
-use sam3rs::point::PointPrompt;
+use sam3rs::{BoxPrompt, PointPrompt, Precision, RgbImage, Sam3, VISUAL_PROMPT};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -37,8 +35,10 @@ struct Args {
     /// PNG with the masks drawn over the image
     #[arg(long)]
     out: Option<PathBuf>,
-    #[arg(long, default_value = "models/sam3")]
-    model: PathBuf,
+    /// directory with model.safetensors, vocab.json and merges.txt [default: download
+    /// facebook/sam3 from Hugging Face]
+    #[arg(long)]
+    model: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     device: usize,
     /// fp32 (strict reference path) or bf16 (tensor cores, fused attention)
@@ -53,17 +53,18 @@ fn parse_coords<const N: usize>(s: &str) -> Result<[f32; N]> {
 
 /// Tints each mask's pixels with its own color
 fn overlay(img: &RgbImage, masks: &[&[u8]]) -> image::RgbImage {
-    const COLORS: [[u8; 3]; 6] = [[230, 25, 75], [60, 180, 75], [0, 130, 200], [245, 130, 48], [145, 30, 180], [70, 240, 240]];
-    let mut data = img.data.clone();
+    const COLORS: [[u8; 3]; 6] =
+        [[230, 25, 75], [60, 180, 75], [0, 130, 200], [245, 130, 48], [145, 30, 180], [70, 240, 240]];
+    let mut data = img.data().to_vec();
     for (m, mask) in masks.iter().enumerate() {
         let color = COLORS[m % COLORS.len()];
-        for (px, _) in data.chunks_exact_mut(3).zip(mask.iter()).filter(|(_, v)| **v != 0) {
-            for c in 0..3 {
-                px[c] = ((px[c] as u16 + color[c] as u16) / 2) as u8;
+        for (px, _) in data.as_chunks_mut::<3>().0.iter_mut().zip(mask.iter()).filter(|(_, v)| **v != 0) {
+            for (p, c) in px.iter_mut().zip(color) {
+                *p = ((*p as u16 + c as u16) / 2) as u8;
             }
         }
     }
-    image::RgbImage::from_raw(img.width as u32, img.height as u32, data).expect("buffer matches image size")
+    image::RgbImage::from_raw(img.width() as u32, img.height() as u32, data).expect("buffer matches image size")
 }
 
 fn main() -> Result<()> {
@@ -79,18 +80,23 @@ fn main() -> Result<()> {
     }
 
     let img = RgbImage::open(&args.image)?;
-    let model = Sam3::load(&args.model, args.device, args.precision)?;
+    let model = match &args.model {
+        Some(dir) => Sam3::load(dir, args.device, args.precision)?,
+        None => load_pretrained(args.device, args.precision)?,
+    };
     let emb = model.encode(&img)?;
 
     let (results, masks) = if has_points {
         let clicks = args.points.iter().map(|p| (p, true)).chain(args.neg_points.iter().map(|p| (p, false)));
-        let points: Vec<PointPrompt> = clicks.map(|(p, positive)| PointPrompt { x: p[0], y: p[1], positive }).collect();
+        let points: Vec<PointPrompt> =
+            clicks.map(|(p, positive)| PointPrompt::new(p[0], p[1], positive)).collect::<Result<_>>()?;
         let m = model.segment_points(&emb, &points)?;
         (vec![json!({ "score": m.score })], vec![m.mask])
     } else {
         let exemplars = args.boxes.iter().map(|b| (b, true)).chain(args.neg_boxes.iter().map(|b| (b, false)));
-        let boxes: Vec<BoxPrompt> =
-            exemplars.map(|(b, positive)| BoxPrompt::from_xyxy(*b, img.width, img.height, positive)).collect();
+        let boxes: Vec<BoxPrompt> = exemplars
+            .map(|(b, positive)| BoxPrompt::from_xyxy(*b, img.width(), img.height(), positive))
+            .collect::<Result<_>>()?;
         let text = args.text.as_deref().unwrap_or(VISUAL_PROMPT);
         let dets = model.detect(&emb, text, &boxes)?;
         let results = dets.iter().map(|d| json!({ "score": d.score, "bbox_xyxy": d.bbox })).collect();
@@ -105,4 +111,14 @@ fn main() -> Result<()> {
         eprintln!("wrote {}", out.display());
     }
     Ok(())
+}
+
+#[cfg(feature = "online")]
+fn load_pretrained(device: usize, precision: Precision) -> Result<Sam3> {
+    Sam3::from_pretrained(device, precision)
+}
+
+#[cfg(not(feature = "online"))]
+fn load_pretrained(_device: usize, _precision: Precision) -> Result<Sam3> {
+    bail!("this build has no `online` feature, so pass --model with a local model directory")
 }
