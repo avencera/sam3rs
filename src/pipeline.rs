@@ -191,19 +191,20 @@ impl Sam3 {
         // sigmoid(x) > 0.5 is x > 0
         let mask = gpu.alloc_bytes(up.len())?;
         launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.ptr(), &up, up.len() as u64, 0.0f32)?;
-        let mut masks = vec![0u8; up.len()];
-        gpu.download_into(&mask, &mut masks)?;
+        // calloc per mask: cloning one zeroed Vec would touch every page up front
+        let mut masks: Vec<Vec<u8>> = kept.iter().map(|_| vec![0u8; h * w]).collect();
+        gpu.download_split(&mask, &mut masks)?;
 
         Ok(kept
             .iter()
-            .zip(masks.chunks_exact(h * w))
+            .zip(masks)
             .map(|(&(i, score), mask)| {
                 let [cx, cy, bw, bh] = [boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2], boxes[i * 4 + 3]];
                 let (wf, hf) = (w as f32, h as f32);
                 Detection {
                     score,
                     bbox: [(cx - bw / 2.0) * wf, (cy - bh / 2.0) * hf, (cx + bw / 2.0) * wf, (cy + bh / 2.0) * hf],
-                    mask: mask.to_vec(),
+                    mask,
                     query: i,
                 }
             })

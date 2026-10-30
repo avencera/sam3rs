@@ -433,6 +433,19 @@ impl Gpu {
         self.synchronize()
     }
 
+    /// Copies consecutive runs of `src` into each of `hosts` in turn and waits once, so
+    /// results land in their final buffers without a staging copy
+    pub fn download_split(&self, src: &Buf, hosts: &mut [Vec<u8>]) -> Result<()> {
+        let total: usize = hosts.iter().map(Vec::len).sum();
+        ensure!(total <= src.bytes, "download of {total} bytes from a {} byte buffer", src.bytes);
+        let mut offset = 0;
+        for host in hosts.iter_mut().filter(|h| !h.is_empty()) {
+            unsafe { cur::memcpy_dtoh_async(host.as_mut_slice(), src.ptr + offset as u64, self.cu_stream())? };
+            offset += host.len();
+        }
+        self.synchronize()
+    }
+
     pub fn download(&self, t: &Tensor) -> Result<Vec<f32>> {
         let mut host = vec![0f32; t.len()];
         self.download_into(&t.buf, &mut host)?;
