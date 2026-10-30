@@ -148,3 +148,5 @@ def test_rejects_bad_prompts(model: sam3rs.Sam3) -> None:
         model.segment_points(emb, [])
     with pytest.raises(ValueError):
         model.segment_points(emb, [(1, 2)], labels=[1, 0])
+    with pytest.raises(ValueError):
+        model.segment_points(emb, [(1, 2)], labels=[-1])

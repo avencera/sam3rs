@@ -32,12 +32,20 @@ fn precision_name(p: Precision) -> &'static str {
 /// `Sam3` is `Send` but not `Sync`, so calls from several Python threads take turns
 /// on the mutex, which matches the model's single CUDA stream anyway
 #[pyclass(name = "Model", module = "sam3rs._native", frozen)]
-struct Model(Mutex<Sam3>);
+struct Model {
+    model: Mutex<Sam3>,
+    // kept outside the mutex, so reading it never waits on a GPU call with the GIL held
+    precision: Precision,
+}
 
 impl Model {
+    fn new(model: Sam3) -> Self {
+        Self { precision: model.precision(), model: Mutex::new(model) }
+    }
+
     fn lock(&self) -> MutexGuard<'_, Sam3> {
         // a panic mid-call leaves no Rust state half-written that later calls rely on
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.model.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -68,19 +76,19 @@ impl Model {
     fn load(py: Python<'_>, path: PathBuf, device: usize, precision_name: &str) -> PyResult<Self> {
         let p = precision(precision_name)?;
         let model = py.detach(|| Sam3::load(&path, device, p)).map_err(error)?;
-        Ok(Self(Mutex::new(model)))
+        Ok(Self::new(model))
     }
 
     #[staticmethod]
     fn from_pretrained(py: Python<'_>, device: usize, precision_name: &str) -> PyResult<Self> {
         let p = precision(precision_name)?;
         let model = py.detach(|| Sam3::from_pretrained(device, p)).map_err(error)?;
-        Ok(Self(Mutex::new(model)))
+        Ok(Self::new(model))
     }
 
     #[getter]
     fn precision(&self) -> &'static str {
-        precision_name(self.lock().precision())
+        precision_name(self.precision)
     }
 
     fn encode(&self, py: Python<'_>, width: usize, height: usize, rgb: &[u8]) -> PyResult<Embedding> {

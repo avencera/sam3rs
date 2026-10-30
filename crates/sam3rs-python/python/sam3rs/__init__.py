@@ -169,7 +169,14 @@ class Sam3:
         xy = _rows(points, 2, "points")
         if not xy:
             raise ValueError("give at least one point")
-        flags = [True] * len(xy) if labels is None else [bool(v) for v in np.asarray(labels).reshape(-1)]
+        if labels is None:
+            flags = [True] * len(xy)
+        else:
+            values = np.asarray(labels).reshape(-1)
+            # SAM's -1 padding label would otherwise read as foreground
+            if not np.isin(values, (0, 1)).all():
+                raise ValueError(f"labels must be 0 (background) or 1 (foreground), got {values.tolist()}")
+            flags = [bool(v) for v in values]
         if len(flags) != len(xy):
             raise ValueError(f"{len(xy)} points but {len(flags)} labels")
         score, mask = self._native.segment_points(embedding, [(x, y, f) for (x, y), f in zip(xy, flags)])
