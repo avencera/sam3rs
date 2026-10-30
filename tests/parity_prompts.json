@@ -1,0 +1,35 @@
+[
+  {
+    "image": "models/images/dogs.jpg",
+    "prompts": [
+      {"name": "point", "points": [[1439, 504, 1]]},
+      {"name": "box", "boxes": [[1233, 376, 1649, 691, 1]]},
+      {"name": "negative box", "boxes": [[1233, 376, 1649, 691, 1], [1400, 500, 1500, 600, 0]]},
+      {"name": "text", "text": "dog"}
+    ]
+  },
+  {
+    "image": "models/images/bus.jpg",
+    "prompts": [
+      {"name": "person", "text": "person"},
+      {"name": "bus", "text": "bus"},
+      {"name": "point", "points": [[400, 600, 1], [700, 900, 0]]}
+    ]
+  },
+  {
+    "image": "models/images/truck.jpg",
+    "prompts": [
+      {"name": "wheel", "text": "wheel"},
+      {"name": "box", "boxes": [[440, 620, 680, 850, 1]]},
+      {"name": "point", "points": [[1150, 560, 1]]}
+    ]
+  },
+  {
+    "image": "models/images/groceries.jpg",
+    "prompts": [
+      {"name": "bag", "text": "paper bag"},
+      {"name": "taillight", "text": "red tail light of the car"},
+      {"name": "point", "points": [[470, 260, 1]]}
+    ]
+  }
+]
