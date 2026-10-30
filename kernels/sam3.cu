@@ -528,3 +528,25 @@ extern "C" __global__ void gather_rows(float* out, const float* src, const int* 
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x)
         out[i] = src[(long long)idx[i / dim] * dim + i % dim];
 }
+
+// ---------------------------------------------------------------------------------------
+// SAM 2 point decoder
+
+// non-overlapping 2x2 patches of channels-last x [h * w, c] -> [(h/2) * (w/2), c * 4] in
+// (c, ky, kx) order, so a stride-2 2x2 conv is one GEMM with the [O, C, 2, 2] weight
+extern "C" __global__ void patchify2x2(float* out, const float* x, int h, int w, int c) {
+    int oh = h / 2, ow = w / 2;
+    long long n = (long long)oh * ow * c * 4;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        int col = i % (c * 4);
+        long long p = i / (c * 4);
+        int ch = col / 4, ky = (col / 2) % 2, kx = col % 2;
+        int y = p / ow, xx = p % ow;
+        out[i] = x[((long long)(2 * y + ky) * w + 2 * xx + kx) * c + ch];
+    }
+}
+
+extern "C" __global__ void clamp(float* x, long long n, float lo, float hi) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        x[i] = fminf(fmaxf(x[i], lo), hi);
+}

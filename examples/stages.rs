@@ -10,6 +10,7 @@ use sam3rs::gpu::{Gpu, Tensor};
 use sam3rs::image::{RgbImage, preprocess};
 use sam3rs::detector::{BoxPrompt, Detector};
 use sam3rs::ops::transpose;
+use sam3rs::point::{LOW_RES, PointDecoder, PointPrompt, clamped_mask, full_res_masks};
 use sam3rs::text::TextEncoder;
 use sam3rs::tokenizer::Tokenizer;
 use sam3rs::vision::{Backbone, Neck};
@@ -81,6 +82,52 @@ fn main() -> Result<()> {
         compare(&format!("fpn{i}"), &chw(&gpu, f)?, &fixture(&st, &format!("fpn{i}"))?);
     }
     drop((backbone, neck));
+
+    let tracker_neck = Neck::load(&gpu, &wts, "tracker_neck")?;
+    let sam2_fpn = tracker_neck.forward(&gpu, &trunk)?;
+    let point_decoder = PointDecoder::load(&gpu, &wts)?;
+    let point_img = point_decoder.prepare_image(&gpu, &sam2_fpn)?;
+    compare("sam2_fpn0", &chw(&gpu, &point_img.feat_s0)?, &fixture(&st, "sam2_fpn0")?);
+    compare("sam2_fpn1", &chw(&gpu, &point_img.feat_s1)?, &fixture(&st, "sam2_fpn1")?);
+    compare("sam2_fpn2", &chw(&gpu, &sam2_fpn[2])?, &fixture(&st, "sam2_fpn2")?);
+    drop((tracker_neck, sam2_fpn));
+    for prompt in meta["prompts"].as_array().unwrap() {
+        let Some(points) = prompt.get("points") else { continue };
+        let key = prompt["name"].as_str().unwrap().replace(' ', "_");
+        let points: Vec<PointPrompt> = points
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let v: Vec<f64> = p.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+                PointPrompt { x: v[0] as f32, y: v[1] as f32, positive: v[2] != 0.0 }
+            })
+            .collect();
+        println!("-- {key} ({} points)", points.len());
+        let first = point_decoder.forward(&gpu, &point_img, &points, img.width, img.height, None)?;
+        println!("  iou_first {:?} vs {:?}", first.iou, fixture(&st, &format!("{key}.iou_first"))?);
+        let clamped: Vec<f32> = gpu.download(&first.low_res)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
+        compare("low_first", &clamped, &fixture(&st, &format!("{key}.low_res_first"))?);
+        let best = (0..3).max_by(|a, b| first.iou[*a].total_cmp(&first.iou[*b])).unwrap();
+        let mask_input = clamped_mask(&gpu, &first.low_res, best)?;
+        let second = point_decoder.forward(&gpu, &point_img, &points, img.width, img.height, Some(&mask_input))?;
+        println!("  iou {:?} vs {:?}", second.iou, fixture(&st, &format!("{key}.iou"))?);
+        let clamped: Vec<f32> = gpu.download(&second.low_res)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
+        compare("low_res", &clamped, &fixture(&st, &format!("{key}.low_res"))?);
+        let masks = full_res_masks(&gpu, &second.low_res, 3, img.width, img.height)?;
+        let want = fixture(&st, &format!("{key}.masks"))?;
+        let hw = img.width * img.height;
+        for m in 0..3 {
+            let (mut inter, mut union) = (0usize, 0usize);
+            for (a, b) in masks[m * hw..][..hw].iter().zip(&want[m * hw..][..hw]) {
+                let (a, b) = (*a != 0, *b != 0.0);
+                inter += (a && b) as usize;
+                union += (a || b) as usize;
+            }
+            println!("  mask {m} iou {:.5}", inter as f64 / union.max(1) as f64);
+        }
+        let _ = LOW_RES;
+    }
 
     // detector stages from the reference fpn features
     let sides = [288usize, 144, 72];

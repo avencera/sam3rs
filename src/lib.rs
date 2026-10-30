@@ -7,6 +7,7 @@ pub mod detector;
 pub mod gpu;
 pub mod image;
 pub mod ops;
+pub mod point;
 pub mod posenc;
 pub mod text;
 pub mod tokenizer;
