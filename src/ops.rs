@@ -312,7 +312,11 @@ pub fn attention(
     mask: Mask,
 ) -> Result<()> {
     if flash_ok(gpu, &[q, k, v, out], hd, &mask) {
-        let kernel = if hd == 32 { "flash_attn_d32" } else { "flash_attn_d64" };
+        let kernel = match (q.bf16, hd) {
+            (true, _) => "flash_attn_bf16_d64",
+            (false, 32) => "flash_attn_d32",
+            _ => "flash_attn_d64",
+        };
         let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
         let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
         let view = |m: Mat| [Arg::from(m.ptr), Arg::from(m.ld as u64), Arg::from(m.stride as u64)];
@@ -333,18 +337,24 @@ pub fn attention(
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
 }
 
-/// The fused kernel covers BF16 mode for head dims 32 and 64 without additive bias or
-/// causal masking; it loads q/k/v as float4 and stores float2
-fn flash_ok(gpu: &Gpu, views: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
-    let aligned = |m: &Mat, floats: usize| {
-        !m.trans && m.ptr % (floats as u64 * 4) == 0 && m.ld % floats == 0 && m.stride % floats == 0
+/// The fused kernel covers BF16 mode for head dims 32 and 64 (64 only for BF16 inputs)
+/// without additive bias or causal masking. It loads q/k/v in 16-byte chunks and stores
+/// float2. BF16 q/k/v must use it, since the materialized path reads FP32
+fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
+    let aligned = |m: &Mat, elems: usize, size: usize| {
+        !m.trans && m.ptr % (elems * size) as u64 == 0 && m.ld % elems == 0 && m.stride % elems == 0
     };
-    gpu.precision() == Precision::Bf16
-        && (hd == 32 || hd == 64)
+    let bf16 = q.bf16;
+    assert!(k.bf16 == bf16 && v.bf16 == bf16 && !out.bf16, "q/k/v share a type, out is FP32");
+    let inputs = if bf16 { (8, 2) } else { (4, 4) };
+    let ok = gpu.precision() == Precision::Bf16
+        && (hd == 64 || (hd == 32 && !bf16))
         && mask.bias == 0
         && !mask.causal
-        && aligned(&views[0], 2)
-        && views[1..].iter().all(|m| aligned(m, 4))
+        && aligned(out, 2, 4)
+        && [q, k, v].iter().all(|m| aligned(m, inputs.0, inputs.1));
+    assert!(ok || !bf16, "BF16 attention inputs need the fused kernel");
+    ok
 }
 
 /// Multi-head attention where q, k, v are `[tokens, heads * hd]` row-major (possibly

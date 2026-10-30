@@ -231,8 +231,9 @@ extern "C" __global__ void add_pos_tiled(float* x, const float* pos, int grid, i
 // qkv [grid*grid, 3*heads*hd] -> q, k, v [windows*heads, win*win, hd], partitioning into
 // windows (win == grid for global attention) and applying interleaved axial RoPE to q
 // and k. cos/sin tables are [win*win, hd/2]
-extern "C" __global__ void vit_split_rope(float* q, float* k, float* v, const float* qkv, const float* cos_t,
-                                          const float* sin_t, int grid, int win, int heads, int hd) {
+template <typename In, typename Out>
+DEV void split_rope(Out* q, Out* k, Out* v, const In* qkv, const float* cos_t, const float* sin_t, int grid, int win,
+                    int heads, int hd) {
     int nwx = grid / win;
     int dim = heads * hd;
     long long n = (long long)grid * grid * dim / 2;
@@ -244,17 +245,28 @@ extern "C" __global__ void vit_split_rope(float* q, float* k, float* v, const fl
         int wy = y / win, wx = x / win, ly = y % win, lx = x % win;
         int wtok = ly * win + lx;
         long long dst = (((long long)(wy * nwx + wx) * heads + h) * win * win + wtok) * hd + 2 * p;
-        const float* src = qkv + tok * 3 * dim + h * hd + 2 * p;
+        const In* src = qkv + tok * 3 * dim + h * hd + 2 * p;
         float c = cos_t[wtok * (hd / 2) + p], s = sin_t[wtok * (hd / 2) + p];
-        float q0 = src[0], q1 = src[1];
-        q[dst] = q0 * c - q1 * s;
-        q[dst + 1] = q0 * s + q1 * c;
-        float k0 = src[dim], k1 = src[dim + 1];
-        k[dst] = k0 * c - k1 * s;
-        k[dst + 1] = k0 * s + k1 * c;
-        v[dst] = src[2 * dim];
-        v[dst + 1] = src[2 * dim + 1];
+        float q0 = (float)src[0], q1 = (float)src[1];
+        store(q + dst, q0 * c - q1 * s);
+        store(q + dst + 1, q0 * s + q1 * c);
+        float k0 = (float)src[dim], k1 = (float)src[dim + 1];
+        store(k + dst, k0 * c - k1 * s);
+        store(k + dst + 1, k0 * s + k1 * c);
+        store(v + dst, (float)src[2 * dim]);
+        store(v + dst + 1, (float)src[2 * dim + 1]);
     }
+}
+
+extern "C" __global__ void vit_split_rope(float* q, float* k, float* v, const float* qkv, const float* cos_t,
+                                          const float* sin_t, int grid, int win, int heads, int hd) {
+    split_rope(q, k, v, qkv, cos_t, sin_t, grid, win, heads, hd);
+}
+
+extern "C" __global__ void vit_split_rope_bf16(__nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
+                                               const __nv_bfloat16* qkv, const float* cos_t, const float* sin_t,
+                                               int grid, int win, int heads, int hd) {
+    split_rope(q, k, v, qkv, cos_t, sin_t, grid, win, heads, hd);
 }
 
 // o [windows*heads, win*win, hd] -> [grid*grid, heads*hd], undoing the window partition
@@ -613,8 +625,8 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p) {
                  : "r"(addr));
 }
 
-// rows [0, rows) of a [64, D] fp32 tile -> bf16 smem with row stride lds; rows past
-// `valid` are zero
+// rows [0, 64) of a [64, D] tile -> bf16 smem with row stride lds; rows past `valid`
+// are zero. FP32 sources are rounded here; BF16 sources copy 16 bytes at a time
 template <int D>
 __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const float* src, long long ld, int valid) {
     for (int i = threadIdx.x; i < 64 * D / 4; i += blockDim.x) {
@@ -626,12 +638,22 @@ __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const floa
     }
 }
 
+template <int D>
+__device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const __nv_bfloat16* src, long long ld,
+                                         int valid) {
+    for (int i = threadIdx.x; i < 64 * D / 8; i += blockDim.x) {
+        int r = i / (D / 8), c = (i % (D / 8)) * 8;
+        uint4 x = r < valid ? *reinterpret_cast<const uint4*>(src + r * ld + c) : make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4*>(dst + r * lds + c) = x;
+    }
+}
+
 // Batch entry blockIdx.y reads q + y * q_stride etc.; row i of each view starts at
 // i * ld. scale_log2 = log2(e) / sqrt(D). Keys with key_pad[j] != 0 are skipped; rows
 // with no valid key produce zeros, like the softmax kernel
-template <int D>
-__device__ void flash_attn(float* o, long long o_ld, long long o_stride, const float* q, long long q_ld,
-                           long long q_stride, const float* k, long long k_ld, long long k_stride, const float* v,
+template <int D, typename T>
+__device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T* q, long long q_ld,
+                           long long q_stride, const T* k, long long k_ld, long long k_stride, const T* v,
                            long long v_ld, long long v_stride, int lq, int lk, float scale_log2,
                            const uint8_t* key_pad) {
     static_assert(FA_BM == 64, "fa_stage assumes 64-row tiles");
@@ -755,16 +777,17 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const f
     }
 }
 
-#define FLASH_ATTN(D)                                                                                              \
-    extern "C" __global__ void __launch_bounds__(FA_WARPS * 32) flash_attn_d##D(                                   \
-        float* o, long long o_ld, long long o_stride, const float* q, long long q_ld, long long q_stride,           \
-        const float* k, long long k_ld, long long k_stride, const float* v, long long v_ld, long long v_stride,     \
-        int lq, int lk, float scale_log2, const uint8_t* key_pad) {                                                \
-        flash_attn<D>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,          \
-                      scale_log2, key_pad);                                                                        \
+#define FLASH_ATTN(NAME, D, T)                                                                                     \
+    extern "C" __global__ void __launch_bounds__(FA_WARPS * 32)                                                    \
+        NAME(float* o, long long o_ld, long long o_stride, const T* q, long long q_ld, long long q_stride, const T* k, \
+             long long k_ld, long long k_stride, const T* v, long long v_ld, long long v_stride, int lq, int lk,     \
+             float scale_log2, const uint8_t* key_pad) {                                                           \
+        flash_attn<D, T>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,       \
+                         scale_log2, key_pad);                                                                     \
     }
-FLASH_ATTN(32)
-FLASH_ATTN(64)
+FLASH_ATTN(flash_attn_d32, 32, float)
+FLASH_ATTN(flash_attn_d64, 64, float)
+FLASH_ATTN(flash_attn_bf16_d64, 64, __nv_bfloat16)
 
 // rows of `cols` floats with row stride `ld` -> contiguous bf16 [rows, cols]
 extern "C" __global__ void f32_to_bf16(__nv_bfloat16* dst, const float* src, long long rows, int cols, long long ld) {

@@ -5,7 +5,7 @@ use eyre::Result;
 
 use crate::gpu::{Gpu, Mat, Precision, Tensor};
 use crate::launch;
-use crate::ops::{ACT_GELU, ACT_GELU_TANH, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, attention, bias_act, ew};
+use crate::ops::{ACT_GELU, ACT_GELU_TANH, ACT_NONE, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, attention, bias_act, ew};
 use crate::weights::Weights;
 
 pub const IMAGE_SIZE: usize = 1008;
@@ -111,26 +111,32 @@ impl Backbone {
         let tokens = GRID * GRID;
         // BF16 mode keeps the GEMM inputs in BF16 from the kernel that produces them
         let bf16 = gpu.precision() == Precision::Bf16;
-        let qkv = if bf16 {
-            b.qkv.forward16(gpu, &b.norm1.forward16(gpu, x)?)?
-        } else {
-            b.qkv.forward(gpu, &b.norm1.forward(gpu, x)?)?
-        };
-
         let (win, rope) = if b.global { (GRID, &self.rope_global) } else { (WINDOW, &self.rope_window) };
         let batch = (GRID / win) * (GRID / win) * HEADS;
         let l = win * win;
-        let q = gpu.empty(&[batch, l, HEAD_DIM])?;
-        let k = gpu.empty(&[batch, l, HEAD_DIM])?;
-        let v = gpu.empty(&[batch, l, HEAD_DIM])?;
-        launch!(gpu, "vit_split_rope", ew(tokens * DIM / 2), B256, 0;
-            &q, &k, &v, &qkv, &rope.0, &rope.1, GRID, win, HEADS, HEAD_DIM)?;
-        drop(qkv);
-
         let o = gpu.empty(&[batch, l, HEAD_DIM])?;
-        let view = |t: &Tensor| Mat::new(t.ptr(), HEAD_DIM).stride(l * HEAD_DIM);
-        attention(gpu, view(&q), view(&k), view(&v), view(&o), batch, l, l, HEAD_DIM, Mask::default())?;
-        drop((q, k, v));
+        let out = Mat::new(o.ptr(), HEAD_DIM).stride(l * HEAD_DIM);
+        if bf16 {
+            let qkv = b.qkv.forward16_act16(gpu, &b.norm1.forward16(gpu, x)?, ACT_NONE)?;
+            let q = Bf16::empty(gpu, batch * l, HEAD_DIM)?;
+            let k = Bf16::empty(gpu, batch * l, HEAD_DIM)?;
+            let v = Bf16::empty(gpu, batch * l, HEAD_DIM)?;
+            launch!(gpu, "vit_split_rope_bf16", ew(tokens * DIM / 2), B256, 0;
+                q.buf.ptr(), k.buf.ptr(), v.buf.ptr(), qkv.buf.ptr(), &rope.0, &rope.1, GRID, win, HEADS, HEAD_DIM)?;
+            drop(qkv);
+            let view = |t: &Bf16| Mat::new(t.buf.ptr(), HEAD_DIM).stride(l * HEAD_DIM).bf16();
+            attention(gpu, view(&q), view(&k), view(&v), out, batch, l, l, HEAD_DIM, Mask::default())?;
+        } else {
+            let qkv = b.qkv.forward(gpu, &b.norm1.forward(gpu, x)?)?;
+            let q = gpu.empty(&[batch, l, HEAD_DIM])?;
+            let k = gpu.empty(&[batch, l, HEAD_DIM])?;
+            let v = gpu.empty(&[batch, l, HEAD_DIM])?;
+            launch!(gpu, "vit_split_rope", ew(tokens * DIM / 2), B256, 0;
+                &q, &k, &v, &qkv, &rope.0, &rope.1, GRID, win, HEADS, HEAD_DIM)?;
+            drop(qkv);
+            let view = |t: &Tensor| Mat::new(t.ptr(), HEAD_DIM).stride(l * HEAD_DIM);
+            attention(gpu, view(&q), view(&k), view(&v), out, batch, l, l, HEAD_DIM, Mask::default())?;
+        }
 
         if bf16 {
             let merged = Bf16::empty(gpu, tokens, DIM)?;
