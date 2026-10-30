@@ -49,8 +49,10 @@ impl TextEncoder {
                 )?,
                 out: Linear::load(gpu, wts, &format!("{a}.out_proj"))?,
                 ln2: LayerNorm::load(gpu, wts, &format!("{l}.layer_norm2"), 1e-5)?,
-                fc1: Linear::load(gpu, wts, &format!("{l}.mlp.fc1"))?,
-                fc2: Linear::load(gpu, wts, &format!("{l}.mlp.fc2"))?,
+                // two thirds of the encoder's weights, read once per prompt for 32 tokens;
+                // BF16 attention projections cost more score accuracy for less time
+                fc1: Linear::load(gpu, wts, &format!("{l}.mlp.fc1"))?.bf16(gpu)?,
+                fc2: Linear::load(gpu, wts, &format!("{l}.mlp.fc2"))?.bf16(gpu)?,
             });
         }
         Ok(Self {

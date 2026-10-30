@@ -57,7 +57,10 @@ impl Bf16 {
 
 /// A dense layer `y = x @ W^T + b` with W stored `[out, in]` like PyTorch
 pub struct Linear {
-    pub w: Tensor,
+    /// FP32 `[out, in]`, dropped once [`Self::bf16`] replaces it
+    w: Option<Tensor>,
+    /// `[out, in]`
+    shape: [usize; 2],
     pub b: Option<Tensor>,
     /// BF16 copies of `w` and `b` in `Precision::Bf16`, for the cuBLASLt path; a BF16
     /// output needs a BF16 bias
@@ -68,20 +71,29 @@ pub struct Linear {
 impl Linear {
     /// A linear over existing device weights, run in FP32 whatever the precision
     pub fn new(w: Tensor, b: Option<Tensor>) -> Self {
-        Self { w, b, w16: None, b16: None }
+        let shape = [w.rows(), w.cols()];
+        Self { w: Some(w), shape, b, w16: None, b16: None }
     }
 
-    /// Runs this linear through BF16 cuBLASLt when the GPU is in BF16 mode. Only the
-    /// vision backbone opts in: it holds nearly all the FLOPs, while BF16 activations in
-    /// the small detector heads cost score accuracy for little time
+    /// In BF16 mode, keeps only a BF16 copy of the weights and runs this linear through
+    /// BF16 cuBLASLt. The vision backbone opts in for its FLOPs and the text encoder's
+    /// MLP for its weight reads (32 tokens over 800 MB of FP32 weights); the detector
+    /// heads keep FP32 activations and weights
     pub fn bf16(mut self, gpu: &Gpu) -> Result<Self> {
-        if gpu.precision() == Precision::Bf16 {
-            self.w16 = Some(to_bf16(gpu, self.w.ptr(), self.w.cols(), self.w.rows(), self.w.cols())?);
+        if gpu.precision() == Precision::Bf16
+            && let Some(w) = self.w.take()
+        {
+            self.w16 = Some(to_bf16(gpu, w.ptr(), w.cols(), w.rows(), w.cols())?);
             if let Some(b) = &self.b {
                 self.b16 = Some(to_bf16(gpu, b.ptr(), b.len(), 1, b.len())?);
             }
         }
         Ok(self)
+    }
+
+    /// FP32 weights; a linear converted by [`Self::bf16`] has none
+    fn w(&self) -> &Tensor {
+        self.w.as_ref().expect("FP32 path of a linear that keeps only BF16 weights")
     }
 
     pub fn load(gpu: &Gpu, wts: &Weights, prefix: &str) -> Result<Self> {
@@ -108,11 +120,11 @@ impl Linear {
     }
 
     pub fn out_features(&self) -> usize {
-        self.w.shape()[0]
+        self.shape[0]
     }
 
     pub fn in_features(&self) -> usize {
-        self.w.shape()[1]
+        self.shape[1]
     }
 
     pub fn forward(&self, gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
@@ -120,7 +132,7 @@ impl Linear {
     }
 
     pub fn forward_act(&self, gpu: &Gpu, x: &Tensor, act: i32) -> Result<Tensor> {
-        assert_eq!(x.cols(), self.in_features(), "linear input {:?} vs weight {:?}", x.shape(), self.w.shape());
+        assert_eq!(x.cols(), self.in_features(), "linear input {:?} vs weight {:?}", x.shape(), self.shape);
         let rows = x.rows();
         let out = gpu.empty(&[rows, self.out_features()])?;
         if self.w16.is_some() {
@@ -132,7 +144,7 @@ impl Linear {
         let (epilogue, fused) = self.epilogue(act);
         let bias = self.b.as_ref().map_or(0, Tensor::ptr);
         let mnk = (rows, self.out_features(), self.in_features());
-        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w.ptr(), out.ptr(), 0.0, bias, epilogue)? {
+        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), out.ptr(), 0.0, bias, epilogue)? {
             if !fused {
                 bias_act(gpu, &out, None, act)?;
             }
@@ -168,7 +180,7 @@ impl Linear {
         let (epilogue, _) = self.epilogue(ACT_NONE);
         let bias = self.b.as_ref().map_or(0, Tensor::ptr);
         let mnk = (x.rows(), self.out_features(), self.in_features());
-        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w.ptr(), residual.ptr(), 1.0, bias, epilogue)? {
+        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), residual.ptr(), 1.0, bias, epilogue)? {
             return Ok(());
         }
         self.forward_raw(gpu, x.ptr(), x.cols(), x.rows(), residual.ptr(), 1.0)?;
@@ -216,7 +228,7 @@ impl Linear {
     /// GEMM only, no bias: `out = x @ W^T + beta * out` over raw strided rows
     pub fn forward_raw(&self, gpu: &Gpu, x: u64, x_ld: usize, rows: usize, out: u64, beta: f32) -> Result<()> {
         let (n, k) = (self.out_features(), self.in_features());
-        gpu.gemm(rows, n, k, Mat::new(x, x_ld), Mat::new(self.w.ptr(), k).t(), Mat::new(out, n), 1, 1.0, beta)
+        gpu.gemm(rows, n, k, Mat::new(x, x_ld), Mat::new(self.w().ptr(), k).t(), Mat::new(out, n), 1, 1.0, beta)
     }
 }
 
