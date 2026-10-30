@@ -550,3 +550,188 @@ extern "C" __global__ void clamp(float* x, long long n, float lo, float hi) {
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
         x[i] = fminf(fmaxf(x[i], lo), hi);
 }
+
+// ---------------------------------------------------------------------------------------
+// fused attention (FlashAttention-2 style) for the BF16 precision mode
+//
+// FP32 q/k/v are rounded to BF16 as they are staged in shared memory, scores and the
+// softmax run in FP32 with an online max, and P @ V uses BF16 tensor cores with FP32
+// accumulation. Each warp owns 16 query rows; a block walks all keys in tiles of 64,
+// so the [lq, lk] score matrix never reaches global memory
+
+constexpr int FA_WARPS = 4;
+constexpr int FA_BM = 16 * FA_WARPS;
+constexpr int FA_BN = 64;
+
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
+__device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p) {
+    uint32_t addr = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// rows [0, rows) of a [64, D] fp32 tile -> bf16 smem with row stride lds; rows past
+// `valid` are zero
+template <int D>
+__device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const float* src, long long ld, int valid) {
+    for (int i = threadIdx.x; i < 64 * D / 4; i += blockDim.x) {
+        int r = i / (D / 4), c = (i % (D / 4)) * 4;
+        float4 x = r < valid ? *reinterpret_cast<const float4*>(src + r * ld + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+        uint32_t* d = reinterpret_cast<uint32_t*>(dst + r * lds + c);
+        d[0] = pack_bf16(x.x, x.y);
+        d[1] = pack_bf16(x.z, x.w);
+    }
+}
+
+// Batch entry blockIdx.y reads q + y * q_stride etc.; row i of each view starts at
+// i * ld. scale_log2 = log2(e) / sqrt(D). Keys with key_pad[j] != 0 are skipped; rows
+// with no valid key produce zeros, like the softmax kernel
+template <int D>
+__device__ void flash_attn(float* o, long long o_ld, long long o_stride, const float* q, long long q_ld,
+                           long long q_stride, const float* k, long long k_ld, long long k_stride, const float* v,
+                           long long v_ld, long long v_stride, int lq, int lk, float scale_log2,
+                           const uint8_t* key_pad) {
+    static_assert(FA_BM == 64, "fa_stage assumes 64-row tiles");
+    constexpr int LDS = D + 8;  // padding keeps fragment loads bank-conflict free
+    __shared__ __align__(16) __nv_bfloat16 qs[FA_BM * LDS];
+    __shared__ __align__(16) __nv_bfloat16 ks[FA_BN * LDS];
+    __shared__ __align__(16) __nv_bfloat16 vs[FA_BN * LDS];
+
+    int b = blockIdx.y, q0 = blockIdx.x * FA_BM;
+    q += b * q_stride + q0 * q_ld;
+    k += b * k_stride;
+    v += b * v_stride;
+    o += b * o_stride;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int g = lane / 4, t = lane % 4, wr = warp * 16;
+
+    fa_stage<D>(qs, LDS, q, q_ld, lq - q0);
+    __syncthreads();
+    uint32_t qa[D / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < D / 16; kk++) {
+        const __nv_bfloat16* p = qs + (wr + g) * LDS + kk * 16 + t * 2;
+        qa[kk][0] = *reinterpret_cast<const uint32_t*>(p);
+        qa[kk][1] = *reinterpret_cast<const uint32_t*>(p + 8 * LDS);
+        qa[kk][2] = *reinterpret_cast<const uint32_t*>(p + 8);
+        qa[kk][3] = *reinterpret_cast<const uint32_t*>(p + 8 * LDS + 8);
+    }
+
+    float acc[D / 8][4] = {};
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+    for (int k0 = 0; k0 < lk; k0 += FA_BN) {
+        __syncthreads();
+        fa_stage<D>(ks, LDS, k + k0 * k_ld, k_ld, lk - k0);
+        fa_stage<D>(vs, LDS, v + k0 * v_ld, v_ld, lk - k0);
+        __syncthreads();
+
+        float s[FA_BN / 8][4];
+#pragma unroll
+        for (int j = 0; j < FA_BN / 8; j++) {
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < D / 16; kk++) {
+                const __nv_bfloat16* p = ks + (j * 8 + g) * LDS + kk * 16 + t * 2;
+                uint32_t bf[2] = {*reinterpret_cast<const uint32_t*>(p), *reinterpret_cast<const uint32_t*>(p + 8)};
+                mma_bf16(s[j], qa[kk], bf);
+            }
+        }
+
+        float mx[2] = {m[0], m[1]};
+#pragma unroll
+        for (int j = 0; j < FA_BN / 8; j++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int col = k0 + j * 8 + t * 2 + (e & 1);
+                float x = s[j][e] * scale_log2;
+                if (col >= lk || (key_pad && key_pad[col])) x = -INFINITY;
+                s[j][e] = x;
+                mx[e / 2] = fmaxf(mx[e / 2], x);
+            }
+        }
+        float corr[2];
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+            corr[r] = mx[r] == -INFINITY ? 1.f : exp2f(m[r] - mx[r]);
+            m[r] = mx[r];
+            l[r] *= corr[r];
+        }
+#pragma unroll
+        for (int j = 0; j < FA_BN / 8; j++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                float p = m[e / 2] == -INFINITY ? 0.f : exp2f(s[j][e] - m[e / 2]);
+                s[j][e] = p;
+                l[e / 2] += p;
+            }
+        }
+#pragma unroll
+        for (int dj = 0; dj < D / 8; dj++) {
+            acc[dj][0] *= corr[0];
+            acc[dj][1] *= corr[0];
+            acc[dj][2] *= corr[1];
+            acc[dj][3] *= corr[1];
+        }
+
+        // the score fragments of two adjacent 8-key tiles form the A fragment of P
+#pragma unroll
+        for (int kk = 0; kk < FA_BN / 16; kk++) {
+            uint32_t pa[4] = {pack_bf16(s[2 * kk][0], s[2 * kk][1]), pack_bf16(s[2 * kk][2], s[2 * kk][3]),
+                              pack_bf16(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                              pack_bf16(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int dj = 0; dj < D / 8; dj += 2) {
+                int mi = lane / 8, ri = lane % 8;
+                const __nv_bfloat16* p = vs + (kk * 16 + (mi & 1) * 8 + ri) * LDS + (dj + mi / 2) * 8;
+                uint32_t bf[4];
+                ldmatrix_x4_trans(bf, p);
+                mma_bf16(acc[dj], pa, bf);
+                mma_bf16(acc[dj + 1], pa, bf + 2);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffff, l[r], 2);
+        l[r] = l[r] > 0.f ? 1.f / l[r] : 0.f;
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        int row = q0 + wr + g + r * 8;
+        if (row >= lq) continue;
+        float* out = o + row * o_ld;
+#pragma unroll
+        for (int dj = 0; dj < D / 8; dj++) {
+            *reinterpret_cast<float2*>(out + dj * 8 + t * 2) =
+                make_float2(acc[dj][2 * r] * l[r], acc[dj][2 * r + 1] * l[r]);
+        }
+    }
+}
+
+#define FLASH_ATTN(D)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(FA_WARPS * 32) flash_attn_d##D(                                   \
+        float* o, long long o_ld, long long o_stride, const float* q, long long q_ld, long long q_stride,           \
+        const float* k, long long k_ld, long long k_stride, const float* v, long long v_ld, long long v_stride,     \
+        int lq, int lk, float scale_log2, const uint8_t* key_pad) {                                                \
+        flash_attn<D>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,          \
+                      scale_log2, key_pad);                                                                        \
+    }
+FLASH_ATTN(32)
+FLASH_ATTN(64)

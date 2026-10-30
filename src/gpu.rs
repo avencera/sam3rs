@@ -167,16 +167,39 @@ impl Mat {
     }
 }
 
+/// Numeric mode for the whole pipeline
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// Strict FP32 GEMMs (no TF32) and materialized attention: the parity reference path
+    Fp32,
+    /// FP32 storage with BF16 tensor-core GEMMs (FP32 accumulation) and fused attention
+    Bf16,
+}
+
+impl std::str::FromStr for Precision {
+    type Err = eyre::Report;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "fp32" => Ok(Self::Fp32),
+            "bf16" => Ok(Self::Bf16),
+            _ => bail!("unknown precision {s:?}, expected fp32 or bf16"),
+        }
+    }
+}
+
 pub struct Gpu {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: CUmodule,
     functions: RefCell<HashMap<&'static str, CUfunction>>,
     blas: blas::cublasHandle_t,
+    compute: blas::cublasComputeType_t,
+    precision: Precision,
 }
 
 impl Gpu {
-    pub fn new(ordinal: usize) -> Result<Self> {
+    pub fn new(ordinal: usize, precision: Precision) -> Result<Self> {
         let ctx = CudaContext::new(ordinal).wrap_err("open CUDA device")?;
         // a single stream, so cudarc's cross-stream event tracking is pure overhead
         unsafe { ctx.disable_event_tracking() };
@@ -206,8 +229,16 @@ impl Gpu {
             // FP32 means FP32: the parity reference runs with TF32 off
             check_blas(blas::cublasSetMathMode(handle, blas::cublasMath_t::CUBLAS_PEDANTIC_MATH))?;
         }
+        let compute = match precision {
+            Precision::Fp32 => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC,
+            Precision::Bf16 => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+        };
 
-        Ok(Self { ctx, stream, module, functions: RefCell::new(HashMap::new()), blas: handle })
+        Ok(Self { ctx, stream, module, functions: RefCell::new(HashMap::new()), blas: handle, compute, precision })
+    }
+
+    pub fn precision(&self) -> Precision {
+        self.precision
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {
@@ -383,7 +414,7 @@ impl Gpu {
                 c.ld as i32,
                 c.stride as i64,
                 batch as i32,
-                blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC,
+                self.compute,
                 blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
         };

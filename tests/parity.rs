@@ -4,13 +4,14 @@
 //! checks the gate: same kept detections, scores within 0.01 and mask IoU >= 0.99. The
 //! image comes from the fixture's decoded RGB because the `image` crate's JPEG decoder
 //! differs from PIL's libjpeg-turbo on a few percent of bytes. Needs a CUDA GPU and the
-//! weights from scripts/fetch-models.sh
+//! weights from scripts/fetch-models.sh. Both precision modes must pass the same gate
 
 use std::path::Path;
 
 use eyre::{Result, eyre};
 use safetensors::{Dtype, SafeTensors};
 use sam3rs::detector::BoxPrompt;
+use sam3rs::gpu::Precision;
 use sam3rs::image::RgbImage;
 use sam3rs::pipeline::{Sam3, VISUAL_PROMPT};
 use sam3rs::point::PointPrompt;
@@ -48,7 +49,18 @@ fn matches_pytorch_fp32() -> Result<()> {
     if !model_dir.join("model.safetensors").exists() {
         return Err(eyre!("missing weights, run scripts/fetch-models.sh"));
     }
-    let model = Sam3::load(model_dir, 0)?;
+    let mut failures = Vec::new();
+    for precision in [Precision::Fp32, Precision::Bf16] {
+        println!("== {precision:?}");
+        let model = Sam3::load(model_dir, 0, precision)?;
+        failures.extend(check(&model)?.into_iter().map(|f| format!("{precision:?} {f}")));
+    }
+    assert!(failures.is_empty(), "parity failures:\n{}", failures.join("\n"));
+    Ok(())
+}
+
+/// Runs every fixture prompt, returning the checks that miss the gate
+fn check(model: &Sam3) -> Result<Vec<String>> {
     let mut fixtures: Vec<_> = std::fs::read_dir("models/parity")?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
     fixtures.sort();
     assert!(!fixtures.is_empty(), "no fixtures, run scripts/reference.py dump");
@@ -126,6 +138,5 @@ fn matches_pytorch_fp32() -> Result<()> {
             }
         }
     }
-    assert!(failures.is_empty(), "parity failures:\n{}", failures.join("\n"));
-    Ok(())
+    Ok(failures)
 }

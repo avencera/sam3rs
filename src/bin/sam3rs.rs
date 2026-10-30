@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use eyre::{Result, bail, eyre};
 use sam3rs::detector::BoxPrompt;
+use sam3rs::gpu::Precision;
 use sam3rs::image::RgbImage;
 use sam3rs::pipeline::{Sam3, VISUAL_PROMPT};
 use sam3rs::point::PointPrompt;
@@ -40,6 +41,9 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value_t = 0)]
     device: usize,
+    /// fp32 (strict reference path) or bf16 (tensor cores, fused attention)
+    #[arg(long, default_value = "bf16")]
+    precision: Precision,
 }
 
 fn parse_coords<const N: usize>(s: &str) -> Result<[f32; N]> {
@@ -75,7 +79,7 @@ fn main() -> Result<()> {
     }
 
     let img = RgbImage::open(&args.image)?;
-    let model = Sam3::load(&args.model, args.device)?;
+    let model = Sam3::load(&args.model, args.device, args.precision)?;
     let emb = model.encode(&img)?;
 
     let (results, masks) = if has_points {

@@ -3,7 +3,7 @@
 
 use eyre::Result;
 
-use crate::gpu::{Gpu, Mat, Tensor, blocks};
+use crate::gpu::{Arg, Gpu, Mat, Precision, Tensor, blocks};
 use crate::launch;
 use crate::weights::Weights;
 
@@ -204,6 +204,19 @@ pub fn attention(
     hd: usize,
     mask: Mask,
 ) -> Result<()> {
+    if flash_ok(gpu, &[q, k, v, out], hd, &mask) {
+        let kernel = if hd == 32 { "flash_attn_d32" } else { "flash_attn_d64" };
+        let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
+        let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
+        let view = |m: Mat| [Arg::from(m.ptr), Arg::from(m.ld as u64), Arg::from(m.stride as u64)];
+        let mut args = Vec::with_capacity(16);
+        for m in [out, q, k, v] {
+            args.extend(view(m));
+        }
+        args.extend([Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2), Arg::from(mask.key_pad)]);
+        return gpu.launch(kernel, grid, (128, 1, 1), 0, args);
+    }
+
     let scores = gpu.empty(&[batch, lq, lk])?;
     let scale = 1.0 / (hd as f32).sqrt();
     let s = Mat::new(scores.ptr(), lk).stride(lq * lk);
@@ -211,6 +224,20 @@ pub fn attention(
     launch!(gpu, "softmax", ((batch * lq) as u32, 1, 1), B256, 0;
         &scores, lk, lq, mask.bias, mask.bias_div.max(1), mask.key_pad, mask.causal as i32)?;
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
+}
+
+/// The fused kernel covers BF16 mode for head dims 32 and 64 without additive bias or
+/// causal masking; it loads q/k/v as float4 and stores float2
+fn flash_ok(gpu: &Gpu, views: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
+    let aligned = |m: &Mat, floats: usize| {
+        !m.trans && m.ptr % (floats as u64 * 4) == 0 && m.ld % floats == 0 && m.stride % floats == 0
+    };
+    gpu.precision() == Precision::Bf16
+        && (hd == 32 || hd == 64)
+        && mask.bias == 0
+        && !mask.causal
+        && aligned(&views[0], 2)
+        && views[1..].iter().all(|m| aligned(m, 4))
 }
 
 /// Multi-head attention where q, k, v are `[tokens, heads * hd]` row-major (possibly

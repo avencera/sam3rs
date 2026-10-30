@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     let meta: serde_json::Value = serde_json::from_str(&meta.metadata().as_ref().unwrap()["meta"])?;
     let image_path = PathBuf::from(meta["image"].as_str().unwrap());
 
-    let gpu = Gpu::new(0)?;
+    let gpu = Gpu::new(0, sam3rs::gpu::Precision::Fp32)?;
     let wts = Weights::open("models/sam3/model.safetensors".as_ref())?;
 
     let img = RgbImage::open(&image_path)?;

@@ -9,6 +9,7 @@ use std::time::Instant;
 use clap::Parser;
 use eyre::Result;
 use sam3rs::detector::BoxPrompt;
+use sam3rs::gpu::Precision;
 use sam3rs::image::RgbImage;
 use sam3rs::pipeline::{Embedding, Sam3, VISUAL_PROMPT};
 use sam3rs::point::PointPrompt;
@@ -23,6 +24,9 @@ struct Args {
     repeat: usize,
     #[arg(long, default_value_t = 0)]
     device: usize,
+    /// fp32 (strict reference path) or bf16 (tensor cores, fused attention)
+    #[arg(long, default_value = "bf16")]
+    precision: Precision,
 }
 
 fn median_ms(repeat: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
@@ -39,7 +43,7 @@ fn median_ms(repeat: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
-    let model = Sam3::load(&args.model, args.device)?;
+    let model = Sam3::load(&args.model, args.device, args.precision)?;
     let img = RgbImage::open(&args.image)?;
     let (w, h) = (img.width, img.height);
 
@@ -65,6 +69,6 @@ fn main() -> Result<()> {
     let names: Vec<&str> = prompts.iter().map(|(n, _)| *n).collect();
     println!("| Runtime | Encode | {} |", names.join(" | "));
     let cells: Vec<String> = row.iter().map(|ms| format!("{ms:.1}")).collect();
-    println!("| sam3rs | {} |", cells.join(" | "));
+    println!("| sam3rs {:?} | {} |", args.precision, cells.join(" | "));
     Ok(())
 }
