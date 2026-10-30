@@ -1,0 +1,31 @@
+[package]
+name = "sam3rs"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust/CUDA runtime for Meta SAM 3 image inference"
+license = "Apache-2.0"
+authors = ["Praveen Perera"]
+publish = false
+
+[dependencies]
+# libcuda and cuBLAS are loaded at run time; kernels are compiled by nvcc in build.rs
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "std",
+    "driver",
+    "cublas",
+    "cublaslt",
+    "dynamic-loading",
+    "cuda-13020",
+] }
+safetensors = "0.8.0"
+memmap2 = "0.9.12"
+half = { version = "2", features = ["bytemuck"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde_json = "1"
+regex = "1.13"
+eyre = "0.6"
+color-eyre = "0.6"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+debug = "line-tables-only"
