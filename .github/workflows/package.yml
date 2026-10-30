@@ -35,6 +35,16 @@ jobs:
           cache-bin: false
           prefix-key: v1-rust
 
+      # the license is a placeholder until it is chosen, and both READMEs become
+      # registry pages, so no release goes out while a TODO(license) remains
+      - name: Check the license is settled
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if git grep -n 'TODO(license)' -- . ':(exclude).github'; then
+            echo "settle the license before tagging a release" >&2
+            exit 1
+          fi
+
       - name: Package crate
         run: |
           rm -rf target/package
@@ -224,9 +234,9 @@ jobs:
         working-directory: crates/sam3rs-python
         run: ../../.venv-wheel/bin/python -m pytest -rA
 
-  # a v* tag publishes to TestPyPI, installs that release, and only then publishes to
-  # PyPI and crates.io; each registry trusts this workflow and environment, so no token
-  # is stored
+  # a v* tag publishes to TestPyPI, installs that release, then publishes to crates.io
+  # and only then to PyPI, so a failed crate publish never leaves a PyPI-only release;
+  # each registry trusts this workflow and environment, so no token is stored
   testpypi-publish:
     name: Publish to TestPyPI
     if: startsWith(github.ref, 'refs/tags/v')
@@ -294,7 +304,7 @@ jobs:
 
   pypi-publish:
     name: Publish to PyPI
-    needs: testpypi-install
+    needs: crates-publish
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -328,18 +338,30 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Check the crate matches the tag
+        id: version
         shell: bash
         run: |
           set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "sam3rs") | .version')"
           test "v$version" = "$GITHUB_REF_NAME"
+          # trusted publishing can't create a crate, so the first release is published
+          # by hand before its tag; skip a version that is already on crates.io
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -A 'sam3rs-release (github.com/avencera/sam3rs)' \
+            "https://crates.io/api/v1/crates/sam3rs/$version")"
+          case "$status" in
+            200) echo "sam3rs $version is already on crates.io"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "crates.io answered HTTP $status" >&2; exit 1 ;;
+          esac
 
       - name: Get a crates.io token
+        if: steps.version.outputs.publish == 'true'
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish
+        if: steps.version.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p sam3rs
