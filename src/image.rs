@@ -58,6 +58,31 @@ impl RgbImage {
         &self.data
     }
 
+    /// A copy with each mask's pixels blended halfway toward its own color, cycling
+    /// through six colors; each mask is `height * width` bytes, nonzero = inside
+    pub fn overlay(&self, masks: &[&[u8]]) -> Result<Self> {
+        const COLORS: [[u8; 3]; 6] =
+            [[230, 25, 75], [60, 180, 75], [0, 130, 200], [245, 130, 48], [145, 30, 180], [70, 240, 240]];
+        let pixels = self.width * self.height;
+        let mut data = self.data.clone();
+        for (m, mask) in masks.iter().enumerate() {
+            ensure!(mask.len() == pixels, "mask {m} has {} pixels, the image {pixels}", mask.len());
+            let color = COLORS[m % COLORS.len()];
+            for (px, _) in data.as_chunks_mut::<3>().0.iter_mut().zip(mask.iter()).filter(|(_, v)| **v != 0) {
+                for (p, c) in px.iter_mut().zip(color) {
+                    *p = ((*p as u16 + c as u16) / 2) as u8;
+                }
+            }
+        }
+        Ok(Self { data, ..*self })
+    }
+
+    /// Writes the image as PNG or JPEG, chosen by the file extension
+    pub fn save(&self, path: &Path) -> Result<()> {
+        image::save_buffer(path, &self.data, self.width as u32, self.height as u32, image::ExtendedColorType::Rgb8)
+            .wrap_err_with(|| format!("write {}", path.display()))
+    }
+
     /// The RGB bytes, giving up the image
     pub fn into_data(self) -> Vec<u8> {
         self.data

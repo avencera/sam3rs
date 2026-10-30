@@ -51,22 +51,6 @@ fn parse_coords<const N: usize>(s: &str) -> Result<[f32; N]> {
     v.try_into().map_err(|_| eyre!("expected {N} comma-separated numbers"))
 }
 
-/// Tints each mask's pixels with its own color
-fn overlay(img: &RgbImage, masks: &[&[u8]]) -> image::RgbImage {
-    const COLORS: [[u8; 3]; 6] =
-        [[230, 25, 75], [60, 180, 75], [0, 130, 200], [245, 130, 48], [145, 30, 180], [70, 240, 240]];
-    let mut data = img.data().to_vec();
-    for (m, mask) in masks.iter().enumerate() {
-        let color = COLORS[m % COLORS.len()];
-        for (px, _) in data.as_chunks_mut::<3>().0.iter_mut().zip(mask.iter()).filter(|(_, v)| **v != 0) {
-            for (p, c) in px.iter_mut().zip(color) {
-                *p = ((*p as u16 + c as u16) / 2) as u8;
-            }
-        }
-    }
-    image::RgbImage::from_raw(img.width() as u32, img.height() as u32, data).expect("buffer matches image size")
-}
-
 fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
@@ -107,7 +91,7 @@ fn main() -> Result<()> {
     }
     if let Some(out) = &args.out {
         let masks: Vec<&[u8]> = masks.iter().map(Vec::as_slice).collect();
-        overlay(&img, &masks).save(out)?;
+        img.overlay(&masks)?.save(out)?;
         eprintln!("wrote {}", out.display());
     }
     Ok(())
