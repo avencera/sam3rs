@@ -4,9 +4,11 @@ members = []
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# TODO(license): placeholder until the license is chosen. For Meta's SAM License, which
-# has no SPDX id, replace this line with `license-file = "LICENSE"` (and the same in
-# crates/sam3rs-python/pyproject.toml)
+# TODO(license): Apache-2.0 is a placeholder until the license is chosen. To switch to
+# Meta's SAM License, which has no SPDX id: put its text in LICENSE, replace this line
+# with `license-file = "LICENSE"`, set `license = "LicenseRef-SAM-License"` in
+# crates/sam3rs-python/pyproject.toml, and drop NOTICE from the repo, `include` and
+# `license-files`
 license = "Apache-2.0"
 repository = "https://github.com/avencera/sam3rs"
 authors = ["Praveen Perera"]
@@ -30,7 +32,7 @@ documentation = "https://docs.rs/sam3rs"
 readme = "README.md"
 keywords = ["sam3", "segmentation", "cuda", "vision", "inference"]
 categories = ["computer-vision", "science"]
-include = ["/src/**", "/kernels/**", "/csrc/**", "/examples/**", "/build.rs", "/README.md", "/LICENSE", "/Cargo.toml"]
+include = ["/src/**", "/kernels/**", "/csrc/**", "/examples/**", "/build.rs", "/README.md", "/LICENSE", "/NOTICE", "/Cargo.toml"]
 
 [lints]
 workspace = true

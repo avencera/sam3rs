@@ -1,0 +1,7 @@
+sam3rs
+Copyright 2026 Praveen Perera
+
+sam3rs is an independent Rust/CUDA implementation of Meta's SAM 3 image model.
+It contains no SAM 3 weights. The weights are distributed by Meta under the
+SAM License at https://huggingface.co/facebook/sam3, and each user downloads
+them after accepting those terms.
