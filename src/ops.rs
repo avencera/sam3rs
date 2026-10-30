@@ -404,12 +404,18 @@ pub fn mha(
     Ok(out)
 }
 
-/// 3x3 conv, stride 1, padding 1, as nine shifted GEMMs over a padded input
+/// Output pixels per im2col chunk in BF16 mode: 16Ki rows of 9 x 256 BF16 channels is a
+/// 72 MiB buffer, where the whole 288x288 map at once would hold 382 MiB
+const IM2COL_ROWS: usize = 16 << 10;
+
+/// 3x3 conv, stride 1, padding 1: nine shifted GEMMs over a padded input in FP32 modes,
+/// and in BF16 mode one cuBLASLt GEMM with K = 9C over BF16 im2col chunks, with the bias
+/// in its epilogue
 pub struct Conv3x3 {
     /// `[9, O, C]`
     pub w: Tensor,
     pub b: Tensor,
-    /// BF16 copy of `w` in BF16 mode
+    /// BF16 `[O, 9 * C]` (tap-major within each row) in BF16 mode
     w16: Option<Buf>,
 }
 
@@ -426,43 +432,64 @@ impl Conv3x3 {
                 }
             }
         }
+        let w16 = match gpu.precision() {
+            Precision::Fp32 | Precision::Tf32 => None,
+            Precision::Bf16 => {
+                let mut rows = vec![0f32; w.len()];
+                for oc in 0..o {
+                    for t in 0..9 {
+                        for ic in 0..c {
+                            rows[(oc * 9 + t) * c + ic] = w[(oc * c + ic) * 9 + t];
+                        }
+                    }
+                }
+                let rows = gpu.upload(rows, &[o, 9 * c])?;
+                Some(to_bf16(gpu, rows.ptr(), rows.len(), 1, rows.len())?)
+            }
+        };
         let w = gpu.upload(taps, &[9, o, c])?;
-        let w16 = bf16_weights(gpu, &w)?;
         Ok(Self { w, b: wts.get(gpu, &format!("{prefix}.bias"))?, w16 })
     }
 
     pub fn forward(&self, gpu: &Gpu, x: &Tensor, h: usize, w: usize) -> Result<Tensor> {
         let (o, c) = (self.w.shape()[1], self.w.shape()[2]);
         assert_eq!(x.shape(), &[h * w, c]);
+        if let Some(w16) = &self.w16 {
+            return self.forward_im2col(gpu, x, w16, h, w);
+        }
+
         let wp = w + 2;
         let rows = (h + 2) * wp + 2;
-        // BF16 mode pads straight into BF16, so the nine GEMMs run on tensor cores
-        let (xp, elem) = match &self.w16 {
-            Some(_) => {
-                let xp = gpu.alloc_bytes(rows * c * 2)?;
-                gpu.memset_zero(xp.ptr(), xp.bytes())?;
-                launch!(gpu, "pad1_bf16", ew(x.len()), B256, 0; xp.ptr(), x, h, w, c)?;
-                (xp, 2)
-            }
-            None => {
-                let xp = gpu.alloc_bytes(rows * c * 4)?;
-                gpu.memset_zero(xp.ptr(), xp.bytes())?;
-                launch!(gpu, "pad1", ew(x.len()), B256, 0; xp.ptr(), x, h, w, c)?;
-                (xp, 4)
-            }
-        };
+        let xp = gpu.alloc_bytes(rows * c * 4)?;
+        gpu.memset_zero(xp.ptr(), xp.bytes())?;
+        launch!(gpu, "pad1", ew(x.len()), B256, 0; xp.ptr(), x, h, w, c)?;
         let yp = gpu.empty(&[h * wp, o])?;
         for t in 0..9 {
             let (dy, dx) = (t / 3, t % 3);
-            let input = Mat::new(xp.ptr() + ((dy * wp + dx) * c * elem) as u64, c);
-            let (input, weight) = match &self.w16 {
-                Some(w16) => (input.bf16(), Mat::new(w16.ptr() + (t * o * c * 2) as u64, c).t().bf16()),
-                None => (input, Mat::new(self.w.at(t * o * c), c).t()),
-            };
+            let input = Mat::new(xp.ptr() + ((dy * wp + dx) * c * 4) as u64, c);
+            let weight = Mat::new(self.w.at(t * o * c), c).t();
             gpu.gemm(h * wp, o, c, input, weight, Mat::new(yp.ptr(), o), 1, 1.0, if t == 0 { 0.0 } else { 1.0 })?;
         }
         let y = gpu.empty(&[h * w, o])?;
         launch!(gpu, "crop_bias", ew(y.len()), B256, 0; &y, &yp, &self.b, h, w, o)?;
+        Ok(y)
+    }
+
+    /// One K = 9C GEMM per chunk of output pixels, instead of nine GEMMs that each read
+    /// and rewrite the whole FP32 output
+    fn forward_im2col(&self, gpu: &Gpu, x: &Tensor, w16: &Buf, h: usize, w: usize) -> Result<Tensor> {
+        let (o, c) = (self.w.shape()[1], self.w.shape()[2]);
+        assert!(c.is_multiple_of(8), "im2col copies 8 channels at a time");
+        let (pixels, k) = (h * w, 9 * c);
+        let y = gpu.empty(&[pixels, o])?;
+        let cols = gpu.alloc_bytes(pixels.min(IM2COL_ROWS) * k * 2)?;
+        for p0 in (0..pixels).step_by(IM2COL_ROWS) {
+            let n = IM2COL_ROWS.min(pixels - p0);
+            launch!(gpu, "im2col3x3_bf16", ew(n * 9 * c / 8), B256, 0;
+                cols.ptr(), x, h, w, c, p0 as u64, n as u64)?;
+            let out = (y.at(p0 * o), false);
+            gpu.linear_bf16((n, o, k), cols.ptr(), k, w16.ptr(), out, 0.0, self.b.ptr(), Epilogue::Bias)?;
+        }
         Ok(y)
     }
 }

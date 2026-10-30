@@ -324,8 +324,34 @@ DEV void pad1_impl(T* xp, const float* x, int h, int w, int c) {
 
 extern "C" __global__ void pad1(float* xp, const float* x, int h, int w, int c) { pad1_impl(xp, x, h, w, c); }
 
-extern "C" __global__ void pad1_bf16(__nv_bfloat16* xp, const float* x, int h, int w, int c) {
-    pad1_impl(xp, x, h, w, c);
+
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+
+// 3x3, padding 1 im2col to BF16 for output pixels [p0, p0 + n): out[p - p0, t * C + ic]
+// is x at pixel p shifted by tap t = dy * 3 + dx (offsets dy - 1, dx - 1), zero outside
+// the image, so the conv is one GEMM with K = 9C. C must be a multiple of 8
+extern "C" __global__ void im2col3x3_bf16(__nv_bfloat16* out, const float* x, int h, int w, int c, long long p0,
+                                          long long n) {
+    int c8 = c / 8;
+    long long total = n * 9 * c8;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        int ch = (int)(i % c8) * 8;
+        long long r = i / c8;
+        int t = (int)(r % 9);
+        long long p = p0 + r / 9;
+        int yy = (int)(p / w) + t / 3 - 1, xx = (int)(p % w) + t % 3 - 1;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (yy >= 0 && yy < h && xx >= 0 && xx < w) {
+            const float4* src = reinterpret_cast<const float4*>(x + ((long long)yy * w + xx) * c + ch);
+            float4 a = src[0], b = src[1];
+            v = make_uint4(pack_bf16(a.x, a.y), pack_bf16(a.z, a.w), pack_bf16(b.x, b.y), pack_bf16(b.z, b.w));
+        }
+        *reinterpret_cast<uint4*>(out + r * c + ch) = v;
+    }
 }
 
 // yp [H*(W+2), O] (3x3 conv over padded rows) -> y [H*W, O] + bias
@@ -604,11 +630,6 @@ extern "C" __global__ void clamp(float* x, long long n, float lo, float hi) {
 constexpr int FA_WARPS = 4;
 constexpr int FA_BM = 16 * FA_WARPS;
 constexpr int FA_BN = 64;
-
-__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
-    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<uint32_t*>(&v);
-}
 
 __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint32_t* b) {
     asm volatile(
