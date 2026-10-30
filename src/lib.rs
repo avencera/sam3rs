@@ -30,6 +30,8 @@ mod blaslt;
 mod detector;
 mod gpu;
 #[cfg(feature = "online")]
+mod hf;
+#[cfg(feature = "online")]
 mod hub;
 mod image;
 mod nvtx;
