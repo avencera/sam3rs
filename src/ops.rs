@@ -129,11 +129,32 @@ impl Linear {
             }
             return Ok(out);
         }
+        let (epilogue, fused) = self.epilogue(act);
+        let bias = self.b.as_ref().map_or(0, Tensor::ptr);
+        let mnk = (rows, self.out_features(), self.in_features());
+        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w.ptr(), out.ptr(), 0.0, bias, epilogue)? {
+            if !fused {
+                bias_act(gpu, &out, None, act)?;
+            }
+            return Ok(out);
+        }
         self.forward_raw(gpu, x.ptr(), x.cols(), rows, out.ptr(), 0.0)?;
         if self.b.is_some() || act != ACT_NONE {
             bias_act(gpu, &out, self.b.as_ref(), act)?;
         }
         Ok(out)
+    }
+
+    /// The cuBLASLt epilogue for this layer's bias and `act`, and whether it applies
+    /// `act`; if not, only the bias is fused
+    fn epilogue(&self, act: i32) -> (Epilogue, bool) {
+        let has_bias = self.b.is_some();
+        match act {
+            ACT_NONE => (if has_bias { Epilogue::Bias } else { Epilogue::None }, true),
+            ACT_RELU => (if has_bias { Epilogue::ReluBias } else { Epilogue::Relu }, true),
+            ACT_GELU_TANH => (if has_bias { Epilogue::GeluBias } else { Epilogue::Gelu }, true),
+            _ => (if has_bias { Epilogue::Bias } else { Epilogue::None }, false),
+        }
     }
 
     /// `residual += x @ W^T + b`
@@ -142,6 +163,12 @@ impl Linear {
         assert_eq!(x.rows(), residual.rows());
         if self.w16.is_some() {
             self.forward_bf16(gpu, x, residual.ptr(), 1.0, ACT_NONE)?;
+            return Ok(());
+        }
+        let (epilogue, _) = self.epilogue(ACT_NONE);
+        let bias = self.b.as_ref().map_or(0, Tensor::ptr);
+        let mnk = (x.rows(), self.out_features(), self.in_features());
+        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w.ptr(), residual.ptr(), 1.0, bias, epilogue)? {
             return Ok(());
         }
         self.forward_raw(gpu, x.ptr(), x.cols(), x.rows(), residual.ptr(), 1.0)?;
@@ -181,13 +208,7 @@ impl Linear {
         assert_eq!(x16.cols, self.in_features());
         let (m, n, k) = (x16.rows, self.out_features(), self.in_features());
         let bias = if out.1 { self.b16.as_ref().map_or(0, Buf::ptr) } else { self.b.as_ref().map_or(0, Tensor::ptr) };
-        let has_bias = self.b.is_some();
-        let (epilogue, fused) = match act {
-            ACT_NONE => (if has_bias { Epilogue::Bias } else { Epilogue::None }, true),
-            ACT_RELU => (if has_bias { Epilogue::ReluBias } else { Epilogue::Relu }, true),
-            ACT_GELU_TANH => (if has_bias { Epilogue::GeluBias } else { Epilogue::Gelu }, true),
-            _ => (if has_bias { Epilogue::Bias } else { Epilogue::None }, false),
-        };
+        let (epilogue, fused) = self.epilogue(act);
         gpu.linear_bf16((m, n, k), x16.buf.ptr(), k, w16.ptr(), out, beta, bias, epilogue)?;
         Ok(fused)
     }

@@ -19,7 +19,7 @@ use cudarc::driver::sys::{self as cu, CUdeviceptr, CUfunction, CUmemoryPool, CUm
 use cudarc::driver::{CudaContext, CudaStream, result as cur};
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 
-use crate::blaslt::{BlasLt, Epilogue};
+use crate::blaslt::{BlasLt, Epilogue, Operands};
 
 /// Kernels from `kernels/sam3.cu` as PTX for compute capability 8.0, the first with the
 /// BF16 `mma.sync` the attention kernel uses. The driver JIT-compiles it for the GPU it
@@ -258,6 +258,8 @@ pub struct Gpu {
     blas: blas::cublasHandle_t,
     /// compute type of GEMMs with FP32 inputs
     fp32_compute: blas::cublasComputeType_t,
+    /// the same for cuBLASLt linears with FP32 inputs
+    fp32_operands: Operands,
     precision: Precision,
     /// host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
@@ -312,6 +314,11 @@ impl Gpu {
             Precision::Fp32 | Precision::Tf32 => None,
             Precision::Bf16 => Some(BlasLt::new()?),
         };
+        let fp32_operands = match fp32_compute {
+            blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => Operands::F32FastTf32,
+            blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF => Operands::F32Fast16Bf,
+            _ => Operands::F32,
+        };
 
         Ok(Self {
             lt,
@@ -320,6 +327,7 @@ impl Gpu {
             functions: RefCell::new(HashMap::new()),
             blas: handle,
             fp32_compute,
+            fp32_operands,
             precision,
             pending: RefCell::new(Vec::new()),
             pending_bytes: Cell::new(0),
@@ -496,7 +504,27 @@ impl Gpu {
         epilogue: Epilogue,
     ) -> Result<()> {
         let lt = self.lt.as_ref().ok_or_else(|| eyre!("cuBLASLt linears need Precision::Bf16"))?;
-        lt.linear(self.cu_stream(), mnk, x, x_ld, w, out, beta, bias, epilogue)
+        lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
+    }
+
+    /// [`Self::linear_bf16`] for FP32 `x`, `w` and `out`, with this precision's FP32
+    /// compute type. Returns false without launching anything when there is no cuBLASLt
+    /// handle (FP32 and TF32 modes), so the caller falls back to [`Self::gemm`]
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_f32(
+        &self,
+        mnk: (usize, usize, usize),
+        x: u64,
+        x_ld: usize,
+        w: u64,
+        out: u64,
+        beta: f32,
+        bias: u64,
+        epilogue: Epilogue,
+    ) -> Result<bool> {
+        let Some(lt) = &self.lt else { return Ok(false) };
+        lt.linear(self.cu_stream(), self.fp32_operands, mnk, x, x_ld, w, (out, false), beta, bias, epilogue)?;
+        Ok(true)
     }
 
     /// Row-major `C[m,n] = alpha * op(A)[m,k] @ op(B)[k,n] + beta * C`, batched by stride

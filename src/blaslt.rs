@@ -1,5 +1,6 @@
-//! cuBLASLt matmuls for the BF16 linears: BF16 operands, FP32 output, with the bias and
-//! activation fused into the GEMM epilogue instead of a separate pass over the output
+//! cuBLASLt matmuls for the linears of the BF16 precision mode: BF16 operands with FP32
+//! or BF16 output, or FP32 operands and output, with the bias and activation fused into
+//! the GEMM epilogue instead of a separate pass over the output
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,6 +47,37 @@ impl Epilogue {
     }
 }
 
+/// Operand types and the compute type of a matmul
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Operands {
+    /// BF16 x and w, FP32 accumulation
+    Bf16,
+    /// FP32 x, w and output with plain FP32 compute
+    F32,
+    /// FP32 x, w and output on TF32 tensor cores
+    F32FastTf32,
+    /// FP32 x, w and output on BF16 tensor cores
+    F32Fast16Bf,
+}
+
+impl Operands {
+    fn compute(self) -> lt::cublasComputeType_t {
+        use lt::cublasComputeType_t::{CUBLAS_COMPUTE_32F, CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_COMPUTE_32F_FAST_TF32};
+        match self {
+            Self::Bf16 | Self::F32 => CUBLAS_COMPUTE_32F,
+            Self::F32FastTf32 => CUBLAS_COMPUTE_32F_FAST_TF32,
+            Self::F32Fast16Bf => CUBLAS_COMPUTE_32F_FAST_16BF,
+        }
+    }
+
+    fn input(self) -> lt::cudaDataType_t {
+        match self {
+            Self::Bf16 => lt::cudaDataType_t::CUDA_R_16BF,
+            Self::F32 | Self::F32FastTf32 | Self::F32Fast16Bf => lt::cudaDataType_t::CUDA_R_32F,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
     m: usize,
@@ -53,6 +85,7 @@ struct Key {
     k: usize,
     x_ld: usize,
     epilogue: Epilogue,
+    operands: Operands,
     out_bf16: bool,
 }
 
@@ -83,12 +116,14 @@ impl BlasLt {
         Ok(Self { handle, workspace, plans: RefCell::new(HashMap::new()) })
     }
 
-    /// Row-major `out[m, n] = epilogue(x[m, k] @ w[n, k]^T + beta * out)` with BF16 `x`
-    /// (row stride `x_ld`) and `w`, and FP32 or BF16 `out` and `bias[n]`
+    /// Row-major `out[m, n] = epilogue(x[m, k] @ w[n, k]^T + beta * out)` with `x` (row
+    /// stride `x_ld`) and `w` of the operand type, and `out` and `bias[n]` FP32, or BF16
+    /// for BF16 operands
     #[allow(clippy::too_many_arguments)]
     pub fn linear(
         &self,
         stream: CUstream,
+        operands: Operands,
         (m, n, k): (usize, usize, usize),
         x: u64,
         x_ld: usize,
@@ -98,7 +133,10 @@ impl BlasLt {
         bias: u64,
         epilogue: Epilogue,
     ) -> Result<()> {
-        let key = Key { m, n, k, x_ld, epilogue, out_bf16 };
+        if out_bf16 && operands != Operands::Bf16 {
+            bail!("BF16 output needs BF16 operands");
+        }
+        let key = Key { m, n, k, x_ld, epilogue, operands, out_bf16 };
         let mut plans = self.plans.borrow_mut();
         let plan = match plans.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -140,14 +178,10 @@ impl BlasLt {
 
     /// Column-major view of the row-major problem: out^T[n, m] = w[n, k] (w^T stored) @ x^T
     fn plan(&self, key: Key) -> Result<Plan> {
-        let Key { m, n, k, x_ld, epilogue, out_bf16 } = key;
+        let Key { m, n, k, x_ld, epilogue, operands, out_bf16 } = key;
         unsafe {
             let mut desc = std::ptr::null_mut();
-            check(lt::cublasLtMatmulDescCreate(
-                &mut desc,
-                lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                lt::cudaDataType_t::CUDA_R_32F,
-            ))?;
+            check(lt::cublasLtMatmulDescCreate(&mut desc, operands.compute(), lt::cudaDataType_t::CUDA_R_32F))?;
             let set =
                 |attr, value: *const c_void, size| check(lt::cublasLtMatmulDescSetAttribute(desc, attr, value, size));
             use lt::cublasLtMatmulDescAttributes_t::{
@@ -174,8 +208,8 @@ impl BlasLt {
                 check(lt::cublasLtMatrixLayoutCreate(&mut l, ty, rows as u64, cols as u64, ld as i64))?;
                 Ok(l)
             };
-            let w = layout(lt::cudaDataType_t::CUDA_R_16BF, k, n, k)?;
-            let x = layout(lt::cudaDataType_t::CUDA_R_16BF, k, m, x_ld)?;
+            let w = layout(operands.input(), k, n, k)?;
+            let x = layout(operands.input(), k, m, x_ld)?;
             let out = layout(out_ty, n, m, n)?;
 
             let mut pref = std::ptr::null_mut();
