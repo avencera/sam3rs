@@ -187,7 +187,7 @@ impl Neck {
             };
             levels.push(Level {
                 scale,
-                proj1: Linear::load(gpu, wts, &format!("{l}.proj1"))?,
+                proj1: Linear::load(gpu, wts, &format!("{l}.proj1"))?.bf16(gpu)?,
                 proj2: Conv3x3::load(gpu, wts, &format!("{l}.proj2"))?,
             });
         }

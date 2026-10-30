@@ -151,11 +151,18 @@ pub struct Mat {
     pub ld: usize,
     pub stride: usize,
     pub trans: bool,
+    /// BF16 elements instead of FP32 (both GEMM inputs must agree; C stays FP32)
+    pub bf16: bool,
 }
 
 impl Mat {
     pub fn new(ptr: u64, ld: usize) -> Self {
-        Self { ptr, ld, stride: 0, trans: false }
+        Self { ptr, ld, stride: 0, trans: false, bf16: false }
+    }
+
+    pub fn bf16(mut self) -> Self {
+        self.bf16 = true;
+        self
     }
 
     pub fn t(mut self) -> Self {
@@ -417,6 +424,13 @@ impl Gpu {
         beta: f32,
     ) -> Result<()> {
         let op = |t: bool| if t { blas::cublasOperation_t::CUBLAS_OP_T } else { blas::cublasOperation_t::CUBLAS_OP_N };
+        assert_eq!(a.bf16, b.bf16, "gemm inputs must share a type");
+        assert!(!c.bf16, "gemm output is FP32");
+        let (ty, compute) = if a.bf16 {
+            (blas::cudaDataType::CUDA_R_16BF, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F)
+        } else {
+            (blas::cudaDataType::CUDA_R_32F, self.compute)
+        };
         let status = unsafe {
             blas::cublasGemmStridedBatchedEx(
                 self.blas,
@@ -427,11 +441,11 @@ impl Gpu {
                 k as i32,
                 (&alpha as *const f32).cast(),
                 b.ptr as *const c_void,
-                blas::cudaDataType::CUDA_R_32F,
+                ty,
                 b.ld as i32,
                 b.stride as i64,
                 a.ptr as *const c_void,
-                blas::cudaDataType::CUDA_R_32F,
+                ty,
                 a.ld as i32,
                 a.stride as i64,
                 (&beta as *const f32).cast(),
@@ -440,7 +454,7 @@ impl Gpu {
                 c.ld as i32,
                 c.stride as i64,
                 batch as i32,
-                self.compute,
+                compute,
                 blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
         };

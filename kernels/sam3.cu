@@ -299,14 +299,21 @@ extern "C" __global__ void convt2x2_scatter(float* y, const float* g, const floa
 
 // x [H*W, C] -> zero-padded xp [(H+2)*(W+2) + 2, C]; xp must be zeroed first. With the
 // padded row width, the input of every 3x3 tap is one contiguous matrix at a fixed offset
-extern "C" __global__ void pad1(float* xp, const float* x, int h, int w, int c) {
+template <typename T>
+DEV void pad1_impl(T* xp, const float* x, int h, int w, int c) {
     long long n = (long long)h * w * c;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
         int ch = i % c;
         long long p = i / c;
         int yy = p / w, xx = p % w;
-        xp[((long long)(yy + 1) * (w + 2) + xx + 1) * c + ch] = x[i];
+        store(xp + ((long long)(yy + 1) * (w + 2) + xx + 1) * c + ch, x[i]);
     }
+}
+
+extern "C" __global__ void pad1(float* xp, const float* x, int h, int w, int c) { pad1_impl(xp, x, h, w, c); }
+
+extern "C" __global__ void pad1_bf16(__nv_bfloat16* xp, const float* x, int h, int w, int c) {
+    pad1_impl(xp, x, h, w, c);
 }
 
 // yp [H*(W+2), O] (3x3 conv over padded rows) -> y [H*W, O] + bias

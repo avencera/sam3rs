@@ -382,6 +382,8 @@ pub struct Conv3x3 {
     /// `[9, O, C]`
     pub w: Tensor,
     pub b: Tensor,
+    /// BF16 copy of `w` in BF16 mode
+    w16: Option<Buf>,
 }
 
 impl Conv3x3 {
@@ -397,29 +399,40 @@ impl Conv3x3 {
                 }
             }
         }
-        Ok(Self { w: gpu.upload(&taps, &[9, o, c])?, b: wts.get(gpu, &format!("{prefix}.bias"))? })
+        let w = gpu.upload(&taps, &[9, o, c])?;
+        let w16 = bf16_weights(gpu, &w)?;
+        Ok(Self { w, b: wts.get(gpu, &format!("{prefix}.bias"))?, w16 })
     }
 
     pub fn forward(&self, gpu: &Gpu, x: &Tensor, h: usize, w: usize) -> Result<Tensor> {
         let (o, c) = (self.w.shape()[1], self.w.shape()[2]);
         assert_eq!(x.shape(), &[h * w, c]);
         let wp = w + 2;
-        let xp = gpu.zeros(&[(h + 2) * wp + 2, c])?;
-        launch!(gpu, "pad1", ew(x.len()), B256, 0; &xp, x, h, w, c)?;
+        let rows = (h + 2) * wp + 2;
+        // BF16 mode pads straight into BF16, so the nine GEMMs run on tensor cores
+        let (xp, elem) = match &self.w16 {
+            Some(_) => {
+                let xp = gpu.alloc_bytes(rows * c * 2)?;
+                gpu.memset_zero(xp.ptr(), xp.bytes())?;
+                launch!(gpu, "pad1_bf16", ew(x.len()), B256, 0; xp.ptr(), x, h, w, c)?;
+                (xp, 2)
+            }
+            None => {
+                let xp = gpu.alloc_bytes(rows * c * 4)?;
+                gpu.memset_zero(xp.ptr(), xp.bytes())?;
+                launch!(gpu, "pad1", ew(x.len()), B256, 0; xp.ptr(), x, h, w, c)?;
+                (xp, 4)
+            }
+        };
         let yp = gpu.empty(&[h * wp, o])?;
         for t in 0..9 {
             let (dy, dx) = (t / 3, t % 3);
-            gpu.gemm(
-                h * wp,
-                o,
-                c,
-                Mat::new(xp.at((dy * wp + dx) * c), c),
-                Mat::new(self.w.at(t * o * c), c).t(),
-                Mat::new(yp.ptr(), o),
-                1,
-                1.0,
-                if t == 0 { 0.0 } else { 1.0 },
-            )?;
+            let input = Mat::new(xp.ptr() + ((dy * wp + dx) * c * elem) as u64, c);
+            let (input, weight) = match &self.w16 {
+                Some(w16) => (input.bf16(), Mat::new(w16.ptr() + (t * o * c * 2) as u64, c).t().bf16()),
+                None => (input, Mat::new(self.w.at(t * o * c), c).t()),
+            };
+            gpu.gemm(h * wp, o, c, input, weight, Mat::new(yp.ptr(), o), 1, 1.0, if t == 0 { 0.0 } else { 1.0 })?;
         }
         let y = gpu.empty(&[h * w, o])?;
         launch!(gpu, "crop_bias", ew(y.len()), B256, 0; &y, &yp, &self.b, h, w, o)?;
@@ -432,6 +445,8 @@ pub struct ConvT2x2 {
     /// `[C, O * 4]`, PyTorch's `[C, O, 2, 2]` as is
     pub w: Tensor,
     pub b: Tensor,
+    /// BF16 copy of `w` in BF16 mode
+    w16: Option<Buf>,
 }
 
 impl ConvT2x2 {
@@ -439,7 +454,9 @@ impl ConvT2x2 {
         let w = wts.get(gpu, &format!("{prefix}.weight"))?;
         let c = w.shape()[0];
         let n = w.len() / c;
-        Ok(Self { w: w.reshape(&[c, n]), b: wts.get(gpu, &format!("{prefix}.bias"))? })
+        let w = w.reshape(&[c, n]);
+        let w16 = bf16_weights(gpu, &w)?;
+        Ok(Self { w, b: wts.get(gpu, &format!("{prefix}.bias"))?, w16 })
     }
 
     pub fn out_channels(&self) -> usize {
@@ -450,7 +467,14 @@ impl ConvT2x2 {
         let (c, n) = (self.w.shape()[0], self.w.shape()[1]);
         assert_eq!(x.shape(), &[h * w, c]);
         let g = gpu.empty(&[h * w, n])?;
-        gpu.gemm(h * w, n, c, Mat::new(x.ptr(), c), Mat::new(self.w.ptr(), n), Mat::new(g.ptr(), n), 1, 1.0, 0.0)?;
+        match &self.w16 {
+            Some(w16) => {
+                let x16 = Bf16::from_f32(gpu, x)?;
+                let (input, weight) = (Mat::new(x16.buf.ptr(), c).bf16(), Mat::new(w16.ptr(), n).bf16());
+                gpu.gemm(h * w, n, c, input, weight, Mat::new(g.ptr(), n), 1, 1.0, 0.0)?;
+            }
+            None => gpu.gemm(h * w, n, c, Mat::new(x.ptr(), c), Mat::new(self.w.ptr(), n), Mat::new(g.ptr(), n), 1, 1.0, 0.0)?,
+        }
         let o = n / 4;
         let y = gpu.empty(&[4 * h * w, o])?;
         launch!(gpu, "convt2x2_scatter", ew(y.len()), B256, 0; &y, &g, &self.b, h, w, o)?;
@@ -527,6 +551,14 @@ pub fn concat_rows(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     gpu.copy_dtod(a.ptr(), out.ptr(), a.len() * 4)?;
     gpu.copy_dtod(b.ptr(), out.at(a.len()), b.len() * 4)?;
     Ok(out)
+}
+
+/// BF16 copy of a weight tensor in BF16 mode, for the conv layers in the necks
+fn bf16_weights(gpu: &Gpu, w: &Tensor) -> Result<Option<Buf>> {
+    Ok(match gpu.precision() {
+        Precision::Fp32 => None,
+        Precision::Bf16 => Some(to_bf16(gpu, w.ptr(), w.len(), 1, w.len())?),
+    })
 }
 
 /// `rows` rows of `cols` floats (row stride `ld`) -> contiguous BF16 `[rows, cols]`
