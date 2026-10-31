@@ -407,10 +407,10 @@ pub fn attention(
 }
 
 /// The fused kernel covers BF16 mode for FP32 q/k/v with head dims 32 and 64, which it
-/// rounds to BF16 for `mma.sync`, and BF16 q/k/v with head dim 64, without additive bias
-/// or causal masking, except the box RPB, which it fuses for FP32 q/k/v with head dim 32
-/// and no key padding. It loads q/k/v in 16-byte chunks and stores float2. BF16 q/k/v
-/// must use it, since the materialized path reads FP32
+/// rounds to BF16 (q, k) and FP16 (v) for `mma.sync`, and BF16 q/k/v with head dim 64,
+/// without additive bias or causal masking, except the box RPB, which it fuses for FP32
+/// q/k/v with head dim 32 and no key padding. It loads q/k/v in 16-byte chunks and stores
+/// float2. BF16 q/k/v must use it, since the materialized path reads FP32
 fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
     let aligned = |m: &Mat, elems: usize, size: usize| {
         !m.trans

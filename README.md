@@ -26,7 +26,7 @@ There is also a Python package with numpy in and out; see
   the text encoder, the fusion encoder, detector and point decoder keep FP32 ones, and
   cuBLAS may round their GEMM inputs to BF16, though on an RTX 5090 it picks TF32
   kernels for most of them. Their unmasked attention, and the detector's box-biased
-  cross-attention, also run the fused kernel, which rounds q, k and v to BF16.
+  cross-attention, also run the fused kernel, which rounds q and k to BF16 and v to FP16.
 - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
   ONNX Runtime's CUDA provider runs FP32 models by default. FP32 weights and
   activations, materialized attention.

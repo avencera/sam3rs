@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #define DEV __device__ __forceinline__
 
@@ -642,10 +643,11 @@ extern "C" __global__ void clamp(float* x, long long n, float lo, float hi) {
 // ---------------------------------------------------------------------------------------
 // fused attention (FlashAttention-2 style) for the BF16 precision mode
 //
-// FP32 q/k/v are rounded to BF16 as they are staged in shared memory, scores and the
-// softmax run in FP32 with an online max, and P @ V uses BF16 tensor cores with FP32
-// accumulation. Each warp owns 16 query rows; a block walks all keys in tiles of 64,
-// so the [lq, lk] score matrix never reaches global memory
+// FP32 q/k/v are rounded to BF16 (V to FP16) as they are staged in shared memory, scores
+// and the softmax run in FP32 with an online max, and P @ V runs on FP16 tensor cores,
+// accumulating each 64-key tile in FP16 before adding it to FP32 totals. Each warp owns
+// 16 query rows; a block walks all keys in tiles of 64, so the [lq, lk] score matrix
+// never reaches global memory
 
 constexpr int FA_WARPS = 4;
 constexpr int FA_BM = 16 * FA_WARPS;
@@ -657,6 +659,19 @@ __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint
         "{%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// FP16 inputs and FP16 accumulation: twice the FP32-accumulate rate on GeForce parts
+__device__ __forceinline__ void mma_f16(uint32_t* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ uint32_t pack_f16(float lo, float hi) {
+    __half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&v);
 }
 
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p) {
@@ -689,6 +704,35 @@ __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const __nv
     }
 }
 
+// the same into FP16, for V
+template <int D>
+__device__ __forceinline__ void fa_stage(__half* dst, int lds, const float* src, long long ld, int valid) {
+    for (int i = threadIdx.x; i < 64 * D / 4; i += blockDim.x) {
+        int r = i / (D / 4), c = (i % (D / 4)) * 4;
+        float4 x = r < valid ? *reinterpret_cast<const float4*>(src + r * ld + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+        uint32_t* d = reinterpret_cast<uint32_t*>(dst + r * lds + c);
+        d[0] = pack_f16(x.x, x.y);
+        d[1] = pack_f16(x.z, x.w);
+    }
+}
+
+template <int D>
+__device__ __forceinline__ void fa_stage(__half* dst, int lds, const __nv_bfloat16* src, long long ld, int valid) {
+    for (int i = threadIdx.x; i < 64 * D / 8; i += blockDim.x) {
+        int r = i / (D / 8), c = (i % (D / 8)) * 8;
+        uint4 x = r < valid ? *reinterpret_cast<const uint4*>(src + r * ld + c) : make_uint4(0, 0, 0, 0);
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&x);
+        uint4 y;
+        uint32_t* yy = reinterpret_cast<uint32_t*>(&y);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 f = __bfloat1622float2(h[j]);
+            yy[j] = pack_f16(f.x, f.y);
+        }
+        *reinterpret_cast<uint4*>(dst + r * lds + c) = y;
+    }
+}
+
 // Batch entry blockIdx.y reads q + y * q_stride etc.; row i of each view starts at
 // i * ld. scale_log2 = log2(e) / sqrt(D). Keys with key_pad[j] != 0 are skipped; rows
 // with no valid key produce zeros, like the softmax kernel
@@ -710,7 +754,7 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
     constexpr int LDS = D + 8;  // padding keeps fragment loads bank-conflict free
     __shared__ __align__(16) __nv_bfloat16 qs[FA_BM * LDS];
     __shared__ __align__(16) __nv_bfloat16 ks[FA_BN * LDS];
-    __shared__ __align__(16) __nv_bfloat16 vs[FA_BN * LDS];
+    __shared__ __align__(16) __half vs[FA_BN * LDS];
 
     int b = blockIdx.y, q0 = blockIdx.x * FA_BM;
     q += b * q_stride + q0 * q_ld;
@@ -818,21 +862,33 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
             acc[dj][3] *= corr[1];
         }
 
-        // the score fragments of two adjacent 8-key tiles form the A fragment of P
+        // the score fragments of two adjacent 8-key tiles form the A fragment of P. P @ V
+        // runs in FP16 with FP16 accumulation over this tile's 64 keys (p <= 1, so the
+        // partial sums stay within 64 |v|), then joins the FP32 accumulator
+        uint32_t pacc[D / 8][2] = {};
 #pragma unroll
         for (int kk = 0; kk < FA_BN / 16; kk++) {
-            uint32_t pa[4] = {pack_bf16(s[2 * kk][0], s[2 * kk][1]), pack_bf16(s[2 * kk][2], s[2 * kk][3]),
-                              pack_bf16(s[2 * kk + 1][0], s[2 * kk + 1][1]),
-                              pack_bf16(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+            uint32_t pa[4] = {pack_f16(s[2 * kk][0], s[2 * kk][1]), pack_f16(s[2 * kk][2], s[2 * kk][3]),
+                              pack_f16(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                              pack_f16(s[2 * kk + 1][2], s[2 * kk + 1][3])};
 #pragma unroll
             for (int dj = 0; dj < D / 8; dj += 2) {
                 int mi = lane / 8, ri = lane % 8;
-                const __nv_bfloat16* p = vs + (kk * 16 + (mi & 1) * 8 + ri) * LDS + (dj + mi / 2) * 8;
+                const __half* p = vs + (kk * 16 + (mi & 1) * 8 + ri) * LDS + (dj + mi / 2) * 8;
                 uint32_t bf[4];
                 ldmatrix_x4_trans(bf, p);
-                mma_bf16(acc[dj], pa, bf);
-                mma_bf16(acc[dj + 1], pa, bf + 2);
+                mma_f16(pacc[dj], pa, bf);
+                mma_f16(pacc[dj + 1], pa, bf + 2);
             }
+        }
+#pragma unroll
+        for (int dj = 0; dj < D / 8; dj++) {
+            float2 lo = __half22float2(*reinterpret_cast<__half2*>(&pacc[dj][0]));
+            float2 hi = __half22float2(*reinterpret_cast<__half2*>(&pacc[dj][1]));
+            acc[dj][0] += lo.x;
+            acc[dj][1] += lo.y;
+            acc[dj][2] += hi.x;
+            acc[dj][3] += hi.y;
         }
     }
 
