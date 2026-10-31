@@ -119,20 +119,20 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **94.8** | **2.2** | **24.5** | **24.6** | **24.4** |
+| **sam3rs `tf32`** | **94.7** | **2.1** | **22.3** | **22.3** | **23.8** |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.6 | 35.8 | 21.1 | 21.4 | 20.5 |
-| **sam3rs `bf16`** | **35.4** | **2.1** | **9.2** | **9.2** | **9.2** |
+| **sam3rs `bf16`** | **34.4** | **2.0** | **5.8** | **5.8** | **7.2** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.2 | 23.8 | 33.4 | 33.7 | 31.8 |
-| sam3rs `fp32` | 147.4 | 2.4 | 30.6 | 30.8 | 30.6 |
+| sam3rs `fp32` | 146.9 | 2.3 | 27.8 | 28.1 | 30.1 |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
-- `tf32` against osam, both FP32 with TF32 matmuls: 1.4x on encode, 8.9x on points and
-  1.4-1.45x on box and text prompts.
-- `bf16` against PyTorch BF16: 1.12x on encode, 17x on points and 2.2-2.3x on box and
-  text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 14% faster. sam3rs is 9.9x
-  faster on points and 1.04-1.09x on box and text prompts.
+- `tf32` against osam, both FP32 with TF32 matmuls: 1.4x on encode, 9.4x on points and
+  1.5x on box and text prompts.
+- `bf16` against PyTorch BF16: 1.15x on encode, 18x on points, 3.7x on box prompts and
+  2.8x on text prompts.
+- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 14% faster. sam3rs is 10x
+  faster on points, 1.2x on box prompts and 1.06x on text prompts.
 
 The sam3rs rows come from one queued session, three runs each, reporting the median of
 each column. The osam and PyTorch rows come from earlier sessions on the same machine.
@@ -145,7 +145,10 @@ Where the time goes:
 - The point path is small kernels plus hole filling on the host. PyTorch spends about
   17 ms of each point prompt filling holes with GPU connected components.
 - PyTorch's box and text prompts launch about 2.8k kernels each and keep the GPU 46%
-  busy. sam3rs launches about 0.9k.
+  busy. sam3rs issues about 0.6k GPU operations for a box prompt and 0.95k for a text
+  prompt, and keeps the GPU about 91% busy. A BF16 box prompt spends about 1.8 ms in the
+  fusion encoder, 1.6 ms in the mask head and 1.2 ms in the DETR decoder, then about
+  0.3 ms per kept mask copying it to the host.
 - Encode is GEMM-bound. The backbone MLP and qkv GEMMs run at 195-210 TFLOPS, close to
   the card's dense BF16 rate with FP32 accumulation, so the margin over PyTorch BF16 is
   small. The rest is fused bias and GELU epilogues, BF16 activations fed straight into
@@ -172,7 +175,7 @@ Worst case over 43 checks:
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
 | `tf32` | 0.0051 | 0.18 px | 0.9987 |
-| `bf16` | 0.0062 | 1.02 px | 0.9964 |
+| `bf16` | 0.0052 | 0.72 px | 0.9964 |
 
 ```sh
 cargo test --release --test parity -- --nocapture
@@ -198,7 +201,7 @@ boxes, mask logits) for one fixture.
 - Timings use one image and one prompt of each kind. Scaling with many box exemplars
   or long text prompts hasn't been measured.
 - Parity covers four images and 13 prompts, and the BF16 worst score delta is within
-  about 0.004 of the 0.01 gate.
+  about 0.005 of the 0.01 gate.
 
 ## License
 
