@@ -3,7 +3,7 @@
 
 use eyre::{Result, WrapErr, ensure};
 
-use crate::gpu::{Gpu, Tensor, launch};
+use crate::gpu::{Gpu, Precision, Tensor, launch};
 use crate::nvtx::range;
 use crate::ops::{
     ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm,
@@ -95,22 +95,37 @@ struct EncoderLayer {
     norm3: LayerNorm,
     fc1: Linear,
     fc2: Linear,
+    /// the FFN runs in BF16 end to end (see [`EncoderLayer::load`])
+    ffn16: bool,
 }
 
 impl EncoderLayer {
-    fn load(gpu: &Gpu, wts: &Weights, p: &str) -> Result<Self> {
+    /// `ffn16` puts the FFN on BF16 cuBLASLt in BF16 mode: the fusion encoder's FFN runs
+    /// 5184 tokens through 1M weights per layer, at the TF32 rate otherwise
+    fn load(gpu: &Gpu, wts: &Weights, p: &str, ffn16: bool) -> Result<Self> {
+        let ffn16 = ffn16 && gpu.precision() == Precision::Bf16;
+        let fc = |name: &str| -> Result<Linear> {
+            let fc = Linear::load(gpu, wts, &format!("{p}.mlp.{name}"))?;
+            if ffn16 { fc.bf16(gpu) } else { Ok(fc) }
+        };
         Ok(Self {
             norm1: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm1"), 1e-5)?,
             self_attn: Attention::load(gpu, wts, &format!("{p}.self_attn"), HEADS)?,
             norm2: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm2"), 1e-5)?,
             cross_attn: Attention::load(gpu, wts, &format!("{p}.cross_attn"), HEADS)?,
             norm3: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm3"), 1e-5)?,
-            fc1: Linear::load(gpu, wts, &format!("{p}.mlp.fc1"))?,
-            fc2: Linear::load(gpu, wts, &format!("{p}.mlp.fc2"))?,
+            fc1: fc("fc1")?,
+            fc2: fc("fc2")?,
+            ffn16,
         })
     }
 
     fn ffn(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
+        if self.ffn16 {
+            let h = self.norm3.forward16(gpu, x)?;
+            let hidden = self.fc1.forward16_act16(gpu, &h, ACT_RELU)?;
+            return self.fc2.forward16_residual(gpu, &hidden, x);
+        }
         let h = self.norm3.forward(gpu, x)?;
         let hidden = self.fc1.forward_act(gpu, &h, ACT_RELU)?;
         self.fc2.forward_residual(gpu, &hidden, x)
@@ -182,11 +197,13 @@ impl Detector {
             cls: wts.get(gpu, &format!("{g}.cls_embed.weight"))?,
             final_proj: Linear::load(gpu, wts, &format!("{g}.final_proj"))?,
             prompt_norm: LayerNorm::load(gpu, wts, &format!("{g}.prompt_layer_norm"), 1e-5)?,
-            layers: (0..3).map(|i| EncoderLayer::load(gpu, wts, &format!("{g}.layers.{i}"))).collect::<Result<_>>()?,
+            layers: (0..3)
+                .map(|i| EncoderLayer::load(gpu, wts, &format!("{g}.layers.{i}"), false))
+                .collect::<Result<_>>()?,
             out_norm: LayerNorm::load(gpu, wts, &format!("{g}.output_layer_norm"), 1e-5)?,
         };
         let encoder = (0..6)
-            .map(|i| EncoderLayer::load(gpu, wts, &format!("{p}.detr_encoder.layers.{i}")))
+            .map(|i| EncoderLayer::load(gpu, wts, &format!("{p}.detr_encoder.layers.{i}"), true))
             .collect::<Result<_>>()?;
         let dd = format!("{p}.detr_decoder");
         let mut decoder = Vec::new();

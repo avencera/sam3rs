@@ -59,13 +59,13 @@ tinted = sam3rs.overlay(sam3rs.load_image("dogs.jpg"), dogs.masks)
 An embedding works only with the model that made it, and costs nothing to reuse, so
 encode once and run as many prompts as you need against it.
 
-`precision="bf16"` (the default) runs the vision backbone and the text encoder's MLP
-in BF16 with fused attention, and every other matrix multiply on tensor cores with
-BF16 or TF32 inputs. `precision="tf32"` keeps FP32 weights and activations but runs
-the matrix multiplies on TF32 tensor cores, as ONNX Runtime does for FP32 models.
-`precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image
-takes about 35 ms in BF16, 95 ms in TF32 and 147 ms in FP32; a point prompt 2.1 to
-2.4 ms, and a text or box prompt 9, 25 and 31 ms.
+`precision="bf16"` (the default) runs the vision backbone, the text encoder's MLP and
+the fusion encoder's feed-forward layers in BF16 with fused attention, and every other
+matrix multiply on tensor cores with BF16 or TF32 inputs. `precision="tf32"` keeps FP32
+weights and activations but runs the matrix multiplies on TF32 tensor cores, as ONNX
+Runtime does for FP32 models. `precision="fp32"` is the strict FP32 reference path. On
+an RTX 5090, encoding an image takes about 35 ms in BF16, 95 ms in TF32 and 147 ms in
+FP32; a point prompt 2.1 to 2.4 ms, and a text or box prompt 9, 25 and 31 ms.
 
 Calls release the GIL while the GPU works. Calls on one model from several threads
 take turns.

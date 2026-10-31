@@ -22,11 +22,12 @@ There is also a Python package with numpy in and out; see
 
 - `bf16` (default): tensor-core GEMMs with FP32 accumulation everywhere, bias and
   activations fused into cuBLASLt epilogues, and a fused flash-attention kernel. The
-  backbone, necks and text encoder MLP keep BF16 weights and activations. The rest of
-  the text encoder, the fusion encoder, detector and point decoder keep FP32 ones, and
-  cuBLAS may round their GEMM inputs to BF16, though on an RTX 5090 it picks TF32
-  kernels for most of them. Their unmasked attention, and the detector's box-biased
-  cross-attention, also run the fused kernel, which rounds q and k to BF16 and v to FP16.
+  backbone, necks, text encoder MLP and fusion encoder FFN keep BF16 weights and
+  activations. The rest of the text encoder and fusion encoder, the detector and the
+  point decoder keep FP32 ones, and cuBLAS may round their GEMM inputs to BF16, though
+  on an RTX 5090 it picks TF32 kernels for most of them. Their unmasked attention, and
+  the detector's box-biased cross-attention, also run the fused kernel, which rounds q
+  and k to BF16 and v to FP16.
 - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
   ONNX Runtime's CUDA provider runs FP32 models by default. FP32 weights and
   activations, materialized attention.

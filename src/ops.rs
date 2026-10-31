@@ -76,9 +76,9 @@ impl Linear {
     }
 
     /// In BF16 mode, keeps only a BF16 copy of the weights and runs this linear through
-    /// BF16 cuBLASLt. The vision backbone opts in for its FLOPs and the text encoder's
-    /// MLP for its weight reads (32 tokens over 800 MB of FP32 weights); the detector
-    /// heads keep FP32 activations and weights
+    /// BF16 cuBLASLt. The vision backbone and the fusion encoder's FFN opt in for their
+    /// FLOPs and the text encoder's MLP for its weight reads (32 tokens over 800 MB of
+    /// FP32 weights); the other detector layers keep FP32 activations and weights
     pub fn bf16(mut self, gpu: &Gpu) -> Result<Self> {
         if gpu.precision() == Precision::Bf16
             && let Some(w) = self.w.take()
