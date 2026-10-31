@@ -651,7 +651,6 @@ extern "C" __global__ void clamp(float* x, long long n, float lo, float hi) {
 // never reaches global memory
 
 constexpr int FA_WARPS = 4;
-constexpr int FA_BM = 16 * FA_WARPS;
 constexpr int FA_BN = 64;
 
 __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint32_t* b) {
@@ -695,11 +694,11 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p) {
                  : "r"(addr));
 }
 
-// rows [0, 64) of a [64, D] tile -> bf16 smem with row stride lds; rows past `valid`
-// are zero. FP32 sources are rounded here; BF16 sources copy 16 bytes at a time
-template <int D>
+// rows [0, ROWS) of a [ROWS, D] tile -> bf16 smem with row stride lds; rows past `valid`
+// are zero. FP32 sources are rounded here; 16-bit sources copy 16 bytes at a time
+template <int D, int ROWS = 64>
 __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const float* src, long long ld, int valid) {
-    for (int i = threadIdx.x; i < 64 * D / 4; i += blockDim.x) {
+    for (int i = threadIdx.x; i < ROWS * D / 4; i += blockDim.x) {
         int r = i / (D / 4), c = (i % (D / 4)) * 4;
         float4 x = r < valid ? *reinterpret_cast<const float4*>(src + r * ld + c) : make_float4(0.f, 0.f, 0.f, 0.f);
         uint32_t* d = reinterpret_cast<uint32_t*>(dst + r * lds + c);
@@ -708,10 +707,10 @@ __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const floa
     }
 }
 
-template <int D>
+template <int D, int ROWS = 64>
 __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const __nv_bfloat16* src, long long ld,
                                          int valid) {
-    for (int i = threadIdx.x; i < 64 * D / 8; i += blockDim.x) {
+    for (int i = threadIdx.x; i < ROWS * D / 8; i += blockDim.x) {
         int r = i / (D / 8), c = (i % (D / 8)) * 8;
         uint4 x = r < valid ? *reinterpret_cast<const uint4*>(src + r * ld + c) : make_uint4(0, 0, 0, 0);
         *reinterpret_cast<uint4*>(dst + r * lds + c) = x;
@@ -719,9 +718,9 @@ __device__ __forceinline__ void fa_stage(__nv_bfloat16* dst, int lds, const __nv
 }
 
 // the same into FP16, for V
-template <int D>
+template <int D, int ROWS = 64>
 __device__ __forceinline__ void fa_stage(__half* dst, int lds, const float* src, long long ld, int valid) {
-    for (int i = threadIdx.x; i < 64 * D / 4; i += blockDim.x) {
+    for (int i = threadIdx.x; i < ROWS * D / 4; i += blockDim.x) {
         int r = i / (D / 4), c = (i % (D / 4)) * 4;
         float4 x = r < valid ? *reinterpret_cast<const float4*>(src + r * ld + c) : make_float4(0.f, 0.f, 0.f, 0.f);
         uint32_t* d = reinterpret_cast<uint32_t*>(dst + r * lds + c);
@@ -730,9 +729,9 @@ __device__ __forceinline__ void fa_stage(__half* dst, int lds, const float* src,
     }
 }
 
-template <int D>
+template <int D, int ROWS = 64>
 __device__ __forceinline__ void fa_stage(__half* dst, int lds, const __nv_bfloat16* src, long long ld, int valid) {
-    for (int i = threadIdx.x; i < 64 * D / 8; i += blockDim.x) {
+    for (int i = threadIdx.x; i < ROWS * D / 8; i += blockDim.x) {
         int r = i / (D / 8), c = (i % (D / 8)) * 8;
         uint4 x = r < valid ? *reinterpret_cast<const uint4*>(src + r * ld + c) : make_uint4(0, 0, 0, 0);
         const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&x);
@@ -744,6 +743,15 @@ __device__ __forceinline__ void fa_stage(__half* dst, int lds, const __nv_bfloat
             yy[j] = pack_f16(f.x, f.y);
         }
         *reinterpret_cast<uint4*>(dst + r * lds + c) = y;
+    }
+}
+
+template <int D, int ROWS = 64>
+__device__ __forceinline__ void fa_stage(__half* dst, int lds, const __half* src, long long ld, int valid) {
+    for (int i = threadIdx.x; i < ROWS * D / 8; i += blockDim.x) {
+        int r = i / (D / 8), c = (i % (D / 8)) * 8;
+        uint4 x = r < valid ? *reinterpret_cast<const uint4*>(src + r * ld + c) : make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4*>(dst + r * lds + c) = x;
     }
 }
 
@@ -759,19 +767,22 @@ __device__ __forceinline__ void fa_stage(__half* dst, int lds, const __nv_bfloat
 // With `part`, block z covers keys [z * kv_chunk, (z + 1) * kv_chunk) only and writes its
 // unnormalized accumulators, row max and row sum to part[z][batch][row][D + 2] for
 // flash_combine, so few query rows over many keys still fill the GPU
-template <int D, typename T, bool RPB = false>
+//
+// WARPS sets the query rows per block, 16 per warp: every block re-reads all of K and V,
+// so taller blocks cut that traffic. TK and TV let K and V arrive already in 16 bits
+template <int D, typename T, bool RPB = false, int WARPS = FA_WARPS, typename TK = T, typename TV = T>
 __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T* q, long long q_ld,
-                           long long q_stride, const T* k, long long k_ld, long long k_stride, const T* v,
+                           long long q_stride, const TK* k, long long k_ld, long long k_stride, const TV* v,
                            long long v_ld, long long v_stride, int lq, int lk, float scale_log2,
                            const uint8_t* key_pad, const float* rpb_dx = nullptr, const float* rpb_dy = nullptr,
                            int side = 0, float* part = nullptr, int kv_chunk = 0) {
-    static_assert(FA_BM == 64, "fa_stage assumes 64-row tiles");
+    constexpr int BM = 16 * WARPS;
     constexpr int LDS = D + 8;  // padding keeps fragment loads bank-conflict free
-    __shared__ __align__(16) __nv_bfloat16 qs[FA_BM * LDS];
+    __shared__ __align__(16) __nv_bfloat16 qs[BM * LDS];
     __shared__ __align__(16) __nv_bfloat16 ks[FA_BN * LDS];
     __shared__ __align__(16) __half vs[FA_BN * LDS];
 
-    int b = blockIdx.y, q0 = blockIdx.x * FA_BM;
+    int b = blockIdx.y, q0 = blockIdx.x * BM;
     q += b * q_stride + q0 * q_ld;
     k += b * k_stride;
     v += b * v_stride;
@@ -779,7 +790,7 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int g = lane / 4, t = lane % 4, wr = warp * 16;
 
-    fa_stage<D>(qs, LDS, q, q_ld, lq - q0);
+    fa_stage<D, BM>(qs, LDS, q, q_ld, lq - q0);
     __syncthreads();
     uint32_t qa[D / 16][4];
 #pragma unroll
@@ -1011,6 +1022,36 @@ extern "C" __global__ void __launch_bounds__(FA_WARPS * 32)
                        int side, float* part, int kv_chunk) {
     flash_attn<32, float, true>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,
                                 scale_log2, nullptr, rpb_dx, rpb_dy, side, part, kv_chunk);
+}
+
+// FP32 q with K and V converted once by kv_to_16, in 128-row blocks
+extern "C" __global__ void __launch_bounds__(256)
+    flash_attn_kv16_d32(float* o, long long o_ld, long long o_stride, const float* q, long long q_ld, long long q_stride,
+                        const __nv_bfloat16* k, long long k_ld, long long k_stride, const __half* v, long long v_ld,
+                        long long v_stride, int lq, int lk, float scale_log2, const uint8_t* key_pad) {
+    flash_attn<32, float, false, 8, __nv_bfloat16, __half>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v,
+                                                           v_ld, v_stride, lq, lk, scale_log2, key_pad);
+}
+
+// batch strided FP32 views k and v [batch][lk, hd] -> contiguous kd (BF16) and vd (FP16)
+// [lk, batch * hd], 8 values per thread, for flash_attn_kv16: rounding them once instead
+// of in every query block
+extern "C" __global__ void kv_to_16(__nv_bfloat16* kd, __half* vd, const float* k, long long k_ld, long long k_stride,
+                                    const float* v, long long v_ld, long long v_stride, int lk, int batch, int hd) {
+    long long n = (long long)lk * batch * hd / 8;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        long long e = i * 8;
+        int d = e % hd, b = (e / hd) % batch;
+        long long row = e / ((long long)hd * batch);
+        const float* ks = k + b * k_stride + row * k_ld + d;
+        const float* vs = v + b * v_stride + row * v_ld + d;
+        float4 k0 = *reinterpret_cast<const float4*>(ks), k1 = *reinterpret_cast<const float4*>(ks + 4);
+        float4 v0 = *reinterpret_cast<const float4*>(vs), v1 = *reinterpret_cast<const float4*>(vs + 4);
+        *reinterpret_cast<uint4*>(kd + e) = make_uint4(pack_bf16(k0.x, k0.y), pack_bf16(k0.z, k0.w),
+                                                       pack_bf16(k1.x, k1.y), pack_bf16(k1.z, k1.w));
+        *reinterpret_cast<uint4*>(vd + e) = make_uint4(pack_f16(v0.x, v0.y), pack_f16(v0.z, v0.w),
+                                                       pack_f16(v1.x, v1.y), pack_f16(v1.z, v1.w));
+    }
 }
 
 // merges the key splits of a split flash_attn: one warp per (batch, row), lane d < D

@@ -332,6 +332,12 @@ const SPLIT_UNDER_BLOCKS: usize = 64;
 const SPLIT_BLOCKS: usize = 256;
 const SPLIT_MIN_KEYS: usize = 1024;
 
+/// FP32 head-dim-32 attentions with at least this many queries and keys round K and V to
+/// 16 bits once up front and run in 128-row blocks: each block re-reads all of K and V,
+/// which made the fusion encoder's self-attention L2-bound. The BF16 encoder's global
+/// attention measured slower in 128-row blocks
+const TALL_MIN: usize = 512;
+
 /// Box relative position bias in factored form: for head `h`, query row `1 + q` and key
 /// `y * side + x`, the bias is `dy[h, q, y] + dx[h, q, x]`, and row 0 gets none. The
 /// fused kernel adds it per score instead of reading a `[heads, lq, side^2]` tensor
@@ -368,8 +374,23 @@ pub fn attention(
             _ => "flash_attn_d64",
         };
         let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
-        let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
         let view = |m: Mat| [Arg::from(m.ptr), Arg::from(m.ld as u64), Arg::from(m.stride as u64)];
+        if !q.bf16 && hd == 32 && mask.rpb.is_none() && lq >= TALL_MIN && lk >= TALL_MIN {
+            // K as BF16 and V as FP16 [lk, batch * hd], exactly as the kernel would round
+            // them while staging
+            let kd = gpu.alloc_bytes(lk * batch * hd * 2)?;
+            let vd = gpu.alloc_bytes(lk * batch * hd * 2)?;
+            launch!(gpu, "kv_to_16", ew(lk * batch * hd / 8), B256, 0;
+                kd.ptr(), vd.ptr(), k.ptr, k.ld as u64, k.stride as u64, v.ptr, v.ld as u64, v.stride as u64,
+                lk, batch, hd)?;
+            let packed = |ptr: u64| Mat::new(ptr, batch * hd).stride(hd);
+            let tail = [Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2), Arg::from(mask.key_pad)];
+            let args = [out, q, packed(kd.ptr()), packed(vd.ptr())].into_iter().flat_map(view).chain(tail).collect();
+            let grid = (lq.div_ceil(128) as u32, batch as u32, 1);
+            return gpu.launch("flash_attn_kv16_d32", grid, (256, 1, 1), 0, args);
+        }
+
+        let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
         let mut args = Vec::with_capacity(16);
         for m in [out, q, k, v] {
             args.extend(view(m));
