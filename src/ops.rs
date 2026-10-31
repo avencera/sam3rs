@@ -648,10 +648,13 @@ impl Attention {
 /// GroupNorm over channels-last `[hw, c]` in place, with a fused activation
 pub fn group_norm(gpu: &Gpu, x: &Tensor, groups: usize, w: &Tensor, b: &Tensor, eps: f32, act: i32) -> Result<()> {
     let (hw, c) = (x.rows(), x.cols());
-    let stats = gpu.zeros(&[groups, 2])?;
     let chunk = 256usize;
-    launch!(gpu, "group_stats", (hw.div_ceil(chunk) as u32, groups as u32, 1), (32, 1, 1), 0;
-        &stats, x, hw as u64, c, groups, chunk)?;
+    let blocks = hw.div_ceil(chunk);
+    let part = gpu.empty(&[groups * blocks, 2])?;
+    launch!(gpu, "group_stats", (blocks as u32, groups as u32, 1), (32, 1, 1), 0;
+        &part, x, hw as u64, c, groups, chunk)?;
+    let stats = gpu.empty(&[groups, 2])?;
+    launch!(gpu, "group_stats_reduce", (groups as u32, 1, 1), B256, 0; &stats, &part, blocks)?;
     launch!(gpu, "group_norm_apply", ew(x.len()), B256, 0; x, &stats, w, b, hw as u64, c, groups, eps, act)
 }
 

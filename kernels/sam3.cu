@@ -518,9 +518,9 @@ extern "C" __global__ void dot_scores(float* scores, const float* hs, const floa
     if (lane == 0) scores[q] = fminf(fmaxf(s * scale, -clampv), clampv);
 }
 
-// GroupNorm statistics for channels-last x [hw, c]: one block per (group, chunk) adds
-// partial sums into stats[group * 2 + {0, 1}] (zeroed first)
-extern "C" __global__ void group_stats(float* stats, const float* x, long long hw, int c, int groups, int chunk) {
+// GroupNorm statistics for channels-last x [hw, c]: one block per (group, chunk) writes
+// its partial sums to part[(group * gridDim.x + chunk) * 2 + {0, 1}]
+extern "C" __global__ void group_stats(float* part, const float* x, long long hw, int c, int groups, int chunk) {
     __shared__ float scratch[32];
     int g = blockIdx.y;
     int cg = c / groups;
@@ -537,8 +537,28 @@ extern "C" __global__ void group_stats(float* stats, const float* x, long long h
     s = block_sum(s, scratch);
     s2 = block_sum(s2, scratch);
     if (threadIdx.x == 0) {
-        atomicAdd(&stats[g * 2], s);
-        atomicAdd(&stats[g * 2 + 1], s2);
+        long long i = ((long long)g * gridDim.x + blockIdx.x) * 2;
+        part[i] = s;
+        part[i + 1] = s2;
+    }
+}
+
+// Sums group_stats' partials into stats[group * 2 + {0, 1}], one block per group. A fixed
+// order instead of atomics, so the statistics don't change with block scheduling: atomic
+// adds flipped mask pixels between runs whose only difference was timing
+extern "C" __global__ void group_stats_reduce(float* stats, const float* part, int blocks) {
+    __shared__ float scratch[32];
+    const float* p = part + (long long)blockIdx.x * blocks * 2;
+    float s = 0.f, s2 = 0.f;
+    for (int i = threadIdx.x; i < blocks; i += blockDim.x) {
+        s += p[i * 2];
+        s2 += p[i * 2 + 1];
+    }
+    s = block_sum(s, scratch);
+    s2 = block_sum(s2, scratch);
+    if (threadIdx.x == 0) {
+        stats[blockIdx.x * 2] = s;
+        stats[blockIdx.x * 2 + 1] = s2;
     }
 }
 
