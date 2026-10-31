@@ -97,7 +97,8 @@ fn main() -> Result<()> {
 
     let names: Vec<&str> = prompts.iter().map(|(n, _)| *n).collect();
     println!("| Runtime | Encode | {} |", names.join(" | "));
-    let cells: Vec<String> = row.iter().map(|ms| format!("{ms:.1}")).collect();
+    // two decimals: at one, a 7 ms prompt moves in 1.4% steps, coarser than the run-to-run noise
+    let cells: Vec<String> = row.iter().map(|ms| format!("{ms:.2}")).collect();
     println!("| sam3rs {:?} | {} |", args.precision, cells.join(" | "));
     Ok(())
 }
