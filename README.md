@@ -14,6 +14,10 @@ runs the whole image path on one CUDA stream without ONNX Runtime or PyTorch:
 Image features stay on the GPU between prompts. Kernels that cuBLAS doesn't cover are
 CUDA C++ in `kernels/sam3.cu`, built by `build.rs` with nvcc.
 
+Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
+blocking client with rustls and the shared Python Hugging Face cache. The `online`
+feature enables downloads; local model loading works without it.
+
 ## Precision modes
 
 - `bf16` (default): BF16 tensor-core GEMMs with FP32 accumulation for the backbone,
