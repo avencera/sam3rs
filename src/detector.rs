@@ -411,12 +411,18 @@ impl Detector {
     }
 
     /// Box relative position bias for the image cross-attention in factored form, `dx`
-    /// and `dy` as `[200, 72, 8]` (see [`BoxRpb`])
+    /// and `dy` as `[8, 200, 72]` (see [`BoxRpb`])
     fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor) -> Result<[Tensor; 2]> {
         let delta = |axis: i32, mlp: &Mlp| -> Result<Tensor> {
             let d = gpu.empty(&[QUERIES * GRID, 2])?;
             launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, QUERIES, GRID, axis)?;
-            mlp.forward(gpu, &d)
+            // the MLP gives [200 * 72, heads]; head-major rows let the attention kernel
+            // read a query's biases contiguously instead of one float per 32-byte sector
+            let per_pos = mlp.forward(gpu, &d)?;
+            let heads = per_pos.cols();
+            let out = gpu.empty(&[heads, QUERIES * GRID])?;
+            launch!(gpu, "transpose", ew(out.len()), B256, 0; &out, &per_pos, per_pos.rows() as u64, heads)?;
+            Ok(out)
         };
         Ok([delta(0, &self.rpb_x)?, delta(1, &self.rpb_y)?])
     }

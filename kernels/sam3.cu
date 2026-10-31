@@ -451,7 +451,7 @@ extern "C" __global__ void rpb_deltas(float* out, const float* boxes, int nq, in
 }
 
 // attention bias [heads, 1 + nq, side * side]: row 0 (presence token) is zero, row 1 + q
-// is dy[q, y, h] + dx[q, x, h]
+// is dy[h, q, y] + dx[h, q, x]
 extern "C" __global__ void rpb_combine(float* bias, const float* dx, const float* dy, int nq, int side, int heads) {
     long long hw = (long long)side * side;
     long long n = (long long)heads * (nq + 1) * hw;
@@ -463,7 +463,8 @@ extern "C" __global__ void rpb_combine(float* bias, const float* dx, const float
             bias[i] = 0.f;
         } else {
             int q = row - 1, y = p / side, x = p % side;
-            bias[i] = dy[((long long)q * side + y) * heads + h] + dx[((long long)q * side + x) * heads + h];
+            long long base = ((long long)h * nq + q) * side;
+            bias[i] = dy[base + y] + dx[base + x];
         }
     }
 }
@@ -752,7 +753,8 @@ __device__ __forceinline__ void fa_stage(__half* dst, int lds, const __nv_bfloat
 //
 // With RPB, the box relative position bias of the DETR decoder's image cross-attention is
 // added to the scores without materializing it: for head h = blockIdx.y, query row 1 + q
-// and key y * side + x it is dy[q, y, h] + dx[q, x, h], and row 0 (presence token) gets none
+// and key y * side + x it is dy[h, q, y] + dx[h, q, x], and row 0 (presence token) gets
+// none. side must be even, so each thread's key pair shares a grid row
 //
 // With `part`, block z covers keys [z * kv_chunk, (z + 1) * kv_chunk) only and writes its
 // unnormalized accumulators, row max and row sum to part[z][batch][row][D + 2] for
@@ -796,12 +798,11 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
     const float* rdx[2] = {nullptr, nullptr};
     const float* rdy[2] = {nullptr, nullptr};
     if constexpr (RPB) {
-        int heads = gridDim.y;
 #pragma unroll
         for (int r = 0; r < 2; r++) {
             int row = q0 + wr + g + r * 8;
             if (row >= 1 && row < lq) {
-                long long base = (long long)(row - 1) * side * heads + b;
+                long long base = ((long long)b * (lq - 1) + row - 1) * side;
                 rdx[r] = rpb_dx + base;
                 rdy[r] = rpb_dy + base;
             }
@@ -864,19 +865,35 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
             }
         } else {
             float mx[2] = {m[0], m[1]};
+            // the grid position (gy, gx) of this thread's first key pair, k0 + j * 8 + t * 2,
+            // tracked as j advances instead of dividing per score
+            int gy = 0, gx = 0;
+            if constexpr (RPB) {
+                gy = k0 / side;
+                gx = k0 - gy * side + t * 2;
+                while (gx >= side) gx -= side, gy++;
+            }
 #pragma unroll
             for (int j = 0; j < FA_BN / 8; j++) {
+                float2 bias[2] = {};
+                if constexpr (RPB) {
+#pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        if (rdx[r] && k0 + j * 8 + t * 2 < lk) {
+                            float dy = __ldg(rdy[r] + gy);
+                            float2 dx = __ldg(reinterpret_cast<const float2*>(rdx[r] + gx));
+                            bias[r] = make_float2(dy + dx.x, dy + dx.y);
+                        }
+                    }
+                    gx += 8;
+                    while (gx >= side) gx -= side, gy++;
+                }
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int col = k0 + j * 8 + t * 2 + (e & 1);
                     float x = s[j][e] * scale_log2;
-                    if constexpr (RPB) {
-                        const float* dx = rdx[e / 2];
-                        if (dx && col < lk) {
-                            int y = col / side, xx = col - y * side, heads = gridDim.y;
-                            x += (__ldg(rdy[e / 2] + y * heads) + __ldg(dx + xx * heads)) * 1.4426950408889634f;
-                        }
-                    }
+                    // scaled here rather than with the loads, so it contracts into the same FMA
+                    if constexpr (RPB) x += (e & 1 ? bias[e / 2].y : bias[e / 2].x) * 1.4426950408889634f;
                     if (col >= k_end || (key_pad && key_pad[col])) x = -INFINITY;
                     s[j][e] = x;
                     mx[e / 2] = fmaxf(mx[e / 2], x);

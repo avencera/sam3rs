@@ -333,14 +333,15 @@ const SPLIT_BLOCKS: usize = 256;
 const SPLIT_MIN_KEYS: usize = 1024;
 
 /// Box relative position bias in factored form: for head `h`, query row `1 + q` and key
-/// `y * side + x`, the bias is `dy[q, y, h] + dx[q, x, h]`, and row 0 gets none. The
+/// `y * side + x`, the bias is `dy[h, q, y] + dx[h, q, x]`, and row 0 gets none. The
 /// fused kernel adds it per score instead of reading a `[heads, lq, side^2]` tensor
 #[derive(Clone, Copy)]
 pub struct BoxRpb {
-    /// `[lq - 1, side, heads]`
+    /// `[heads, lq - 1, side]`, head-major so each query row's biases are contiguous
     pub dx: u64,
-    /// `[lq - 1, side, heads]`
+    /// `[heads, lq - 1, side]`
     pub dy: u64,
+    /// even, so the fused kernel reads each thread's key pair from one grid row
     pub side: usize,
 }
 
@@ -388,7 +389,10 @@ pub fn attention(
         let splits = lk.div_ceil(chunk);
         let part = if splits > 1 { Some(gpu.empty(&[splits, batch, lq, hd + 2])?) } else { None };
         match mask.rpb {
-            Some(r) => args.extend([Arg::from(r.dx), Arg::from(r.dy), Arg::from(r.side)]),
+            Some(r) => {
+                assert!(r.side.is_multiple_of(2), "the fused box RPB needs an even side");
+                args.extend([Arg::from(r.dx), Arg::from(r.dy), Arg::from(r.side)]);
+            }
             None => args.push(Arg::from(mask.key_pad)),
         }
         args.extend([Arg::from(part.as_ref().map_or(0, Tensor::ptr)), Arg::from(chunk)]);
