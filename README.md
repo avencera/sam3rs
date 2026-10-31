@@ -122,20 +122,20 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **94.7** | **2.1** | **22.3** | **22.3** | **23.8** |
+| **sam3rs `tf32`** | **91.9** | **2.1** | **21.8** | **21.9** | **23.3** |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.6 | 35.8 | 21.1 | 21.4 | 20.5 |
-| **sam3rs `bf16`** | **34.4** | **2.0** | **5.8** | **5.8** | **7.2** |
+| **sam3rs `bf16`** | **33.4** | **2.0** | **5.5** | **5.5** | **7.1** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.2 | 23.8 | 33.4 | 33.7 | 31.8 |
-| sam3rs `fp32` | 146.9 | 2.3 | 27.8 | 28.1 | 30.1 |
+| sam3rs `fp32` | 143.3 | 2.3 | 27.2 | 27.5 | 29.5 |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
-- `tf32` against osam, both FP32 with TF32 matmuls: 1.4x on encode, 9.4x on points and
-  1.5x on box and text prompts.
-- `bf16` against PyTorch BF16: 1.15x on encode, 18x on points, 3.7x on box prompts and
-  2.8x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 14% faster. sam3rs is 10x
-  faster on points, 1.2x on box prompts and 1.06x on text prompts.
+- `tf32` against osam, both FP32 with TF32 matmuls: 1.5x on encode, 9.5x on points,
+  1.6x on box prompts and 1.5x on text prompts.
+- `bf16` against PyTorch BF16: 1.19x on encode, 18x on points, 3.8x on box prompts and
+  2.9x on text prompts.
+- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 11% faster. sam3rs is 11x
+  faster on points, 1.2x on box prompts and 1.08x on text prompts.
 
 The sam3rs rows come from one queued session, three runs each, reporting the median of
 each column. The osam and PyTorch rows come from earlier sessions on the same machine.
@@ -196,6 +196,10 @@ boxes, mask logits) for one fixture.
 - Text cleaning lowercases and collapses whitespace but doesn't port `ftfy` or HTML
   unescaping.
 - Only the image path is implemented: no video tracking or memory bank.
+- The lowest `bf16` mask IoU (0.9914, a point prompt) comes from hole filling. A
+  rounding difference flips one low-resolution pixel, which cuts a 64-pixel background
+  region off from the rest. Hole filling turns background regions of up to 256 pixels
+  into foreground, so that region becomes part of the mask. The score is unaffected.
 
 ## Not yet verified
 
