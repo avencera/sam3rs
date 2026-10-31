@@ -1,97 +1,114 @@
-//! Elementwise kernels
+//! Elementwise kernels: one thread per output element
+//!
+//! Every kernel here writes only the element at its own thread index, so outputs are
+//! `DisjointSlice`s and the borrow checker rules out two threads writing one element.
+//! In-place kernels take the buffer once, as the output; none takes the same buffer as
+//! both input and output. Index math is 32-bit: the host launches one thread per
+//! element and keeps every buffer under 2^32 elements
 
-use cuda_device::kernel;
+use cuda_device::{DisjointSlice, kernel, launch_contract, thread};
 
-use crate::common::{Bf16, Elem, activate, grid_stride, math};
+use crate::common::{Bf16, activate, math, pack_bf16};
 
-/// `x[r, c] = act(x[r, c] + bias[c])`; `bias` may be null
-#[kernel]
-pub unsafe fn bias_act(x: *mut f32, bias: *const f32, rows: i64, cols: i32, act: i32) {
-    let n = rows * cols as i64;
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        let mut v = unsafe { *x.add(i as usize) };
-        if !bias.is_null() {
-            v += unsafe { *bias.add((i % cols as i64) as usize) };
-        }
-        unsafe { *x.add(i as usize) = activate(v, act) };
-        i += stride;
+/// `x[r, c] = act(x[r, c] + bias[c])` in place, for rows of `bias.len()`; an empty
+/// `bias` only applies the activation
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn bias_act(mut x: DisjointSlice<f32>, bias: &[f32], act: i32) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let Some(mut x) = x.element_thread32(t) else { return };
+    let mut v = x.read();
+    if !bias.is_empty() {
+        v += bias[(i % bias.len() as u32) as usize];
     }
+    x.write(activate(v, act));
 }
 
 /// `out = a + b`
-#[kernel]
-pub unsafe fn add(out: *mut f32, a: *const f32, b: *const f32, n: i64) {
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        unsafe { *out.add(i as usize) = *a.add(i as usize) + *b.add(i as usize) };
-        i += stride;
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn add(mut out: DisjointSlice<f32>, a: &[f32], b: &[f32]) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get() as usize;
+    if let Some(mut out) = out.element_thread32(t) {
+        out.write(a[i] + b[i]);
     }
 }
 
-/// `out[r, c] = a[r, c] + b[c]`, `b` broadcast over rows
-#[kernel]
-pub unsafe fn add_row(out: *mut f32, a: *const f32, b: *const f32, rows: i64, cols: i32) {
-    let n = rows * cols as i64;
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        unsafe { *out.add(i as usize) = *a.add(i as usize) + *b.add((i % cols as i64) as usize) };
-        i += stride;
+/// `x += b`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn add_assign(mut x: DisjointSlice<f32>, b: &[f32]) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get() as usize;
+    if let Some(mut x) = x.element_thread32(t) {
+        x.write(x.read() + b[i]);
+    }
+}
+
+/// `x[r, c] += row[c]` in place, `row` broadcast over the rows of `x`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn add_row(mut x: DisjointSlice<f32>, row: &[f32]) {
+    let t = thread::index_1d_u32(lc);
+    let c = t.get() % row.len() as u32;
+    if let Some(mut x) = x.element_thread32(t) {
+        x.write(x.read() + row[c as usize]);
     }
 }
 
 /// `x = clamp(x, lo, hi)` in place
-#[kernel]
-pub unsafe fn clamp(x: *mut f32, n: i64, lo: f32, hi: f32) {
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        unsafe { *x.add(i as usize) = math::fminf(math::fmaxf(*x.add(i as usize), lo), hi) };
-        i += stride;
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn clamp(mut x: DisjointSlice<f32>, lo: f32, hi: f32) {
+    let t = thread::index_1d_u32(lc);
+    if let Some(mut x) = x.element_thread32(t) {
+        x.write(math::fminf(math::fmaxf(x.read(), lo), hi));
     }
 }
 
 /// `mask[i] = x[i] > threshold`
-#[kernel]
-pub unsafe fn threshold_u8(mask: *mut u8, x: *const f32, n: i64, threshold: f32) {
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        unsafe { *mask.add(i as usize) = (*x.add(i as usize) > threshold) as u8 };
-        i += stride;
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn threshold_u8(mut mask: DisjointSlice<u8>, x: &[f32], threshold: f32) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get() as usize;
+    if let Some(mut mask) = mask.element_thread32(t) {
+        mask.write((x[i] > threshold) as u8);
     }
 }
 
-/// `out[i] = src[idx[i]]` for row-major `[*, dim]` rows
-#[kernel]
-pub unsafe fn gather_rows(out: *mut f32, src: *const f32, idx: *const i32, n: i32, dim: i32) {
-    let total = n as i64 * dim as i64;
-    let (mut i, stride) = grid_stride();
-    while i < total {
-        let row = unsafe { *idx.add((i / dim as i64) as usize) } as i64;
-        unsafe { *out.add(i as usize) = *src.add((row * dim as i64 + i % dim as i64) as usize) };
-        i += stride;
+/// `out[i] = src[idx[i]]` over rows of `dim` floats
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn gather_rows(mut out: DisjointSlice<f32>, src: &[f32], idx: &[i32], dim: u32) {
+    let t = thread::index_1d_u32(lc);
+    let (i, c) = (t.get() / dim, t.get() % dim);
+    if let Some(mut out) = out.element_thread32(t) {
+        out.write(src[(idx[i as usize] as u32 * dim + c) as usize]);
     }
 }
 
-/// `x [rows, cols] -> [cols, rows]`
-#[kernel]
-pub unsafe fn transpose(out: *mut f32, x: *const f32, rows: i64, cols: i32) {
-    let n = rows * cols as i64;
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        let (c, r) = (i % cols as i64, i / cols as i64);
-        unsafe { *out.add((c * rows + r) as usize) = *x.add(i as usize) };
-        i += stride;
+/// `x [rows, cols] -> out [cols, rows]`, each thread gathering its output element
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn transpose(mut out: DisjointSlice<f32>, x: &[f32], cols: u32) {
+    let t = thread::index_1d_u32(lc);
+    let rows = x.len() as u32 / cols;
+    let (c, r) = (t.get() / rows, t.get() % rows);
+    if let Some(mut out) = out.element_thread32(t) {
+        out.write(x[(r * cols + c) as usize]);
     }
 }
 
-/// Rows of `cols` floats with row stride `ld` into contiguous BF16 `[rows, cols]`
-#[kernel]
-pub unsafe fn f32_to_bf16(dst: *mut Bf16, src: *const f32, rows: i64, cols: i32, ld: i64) {
-    let n = rows * cols as i64;
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        let v = unsafe { *src.add(((i / cols as i64) * ld + i % cols as i64) as usize) };
-        unsafe { Bf16::store(dst.add(i as usize), v) };
-        i += stride;
+/// Rows of `cols` floats at row stride `ld` in `src`, into contiguous BF16 `[rows, cols]`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn f32_to_bf16(mut dst: DisjointSlice<Bf16>, src: &[f32], cols: u32, ld: u32) {
+    let t = thread::index_1d_u32(lc);
+    let (r, c) = (t.get() / cols, t.get() % cols);
+    if let Some(mut dst) = dst.element_thread32(t) {
+        dst.write(Bf16(pack_bf16(src[(r * ld + c) as usize], 0.0) as u16));
     }
 }

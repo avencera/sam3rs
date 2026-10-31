@@ -1,43 +1,53 @@
 //! Normalizations, softmax and row reductions
+//!
+//! Kernels where a block owns a row (`layernorm`, `softmax`, the group statistics) keep
+//! the port's block geometry and its reduction order, so numerics don't move: inputs are
+//! `&[T]` and outputs `DisjointSlice`s, with writes through `get_unchecked_mut` where the
+//! block's row, not a thread index, is what makes them disjoint. In-place kernels take the
+//! buffer once, as the output; none takes the same buffer as both input and output. Row
+//! lengths come from slice lengths and the grid: the host launches one block per row, and
+//! a launch whose buffers don't fit its grid does nothing instead of reading out of bounds
 
 use core::ptr::addr_of_mut;
 
 use cuda_device::thread::{blockDim_x, blockIdx_x, blockIdx_y, gridDim_x, threadIdx_x};
-use cuda_device::{SharedArray, kernel};
+use cuda_device::view::MatrixView32;
+use cuda_device::{DisjointSlice, SharedArray, kernel, launch_contract, thread, warp};
 
-use crate::common::{Bf16, Elem, activate, block_max, block_sum, grid_stride, math, warp_sum};
+use crate::common::{Bf16, Elem, activate, block_max, block_sum, math};
 
-/// LayerNorm of row `blockIdx.x`: one block per row
+/// LayerNorm of one row: the block's threads take columns `tid, tid + blockDim, ...`
+///
+/// `load` and `store` read and write column `c` of the row. An empty `w` skips the affine
+/// step and an empty `b` skips the shift
 ///
 /// # Safety
 /// Every thread of the block calls it; `scratch` holds 32 shared floats
 #[inline(always)]
-unsafe fn layernorm_row<T: Elem>(
-    out: *mut T,
-    x: *const f32,
-    w: *const f32,
-    b: *const f32,
-    cols: i32,
+unsafe fn layernorm_row(
+    cols: u32,
     eps: f32,
+    w: &[f32],
+    b: &[f32],
     scratch: *mut f32,
+    load: impl Fn(u32) -> f32,
+    mut store: impl FnMut(u32, f32),
 ) {
-    let row = blockIdx_x() as usize;
-    let xr = unsafe { x.add(row * cols as usize) };
-    let yr = unsafe { out.add(row * cols as usize) };
-    let (tid, block) = (threadIdx_x() as i32, blockDim_x() as i32);
+    let (tid, block) = (threadIdx_x(), blockDim_x());
 
     let mut s = 0.0;
     let mut c = tid;
     while c < cols {
-        s += unsafe { *xr.add(c as usize) };
+        s += load(c);
         c += block;
     }
+    // SAFETY: the caller's contract, which every block-wide call below shares
     let mean = unsafe { block_sum(s, scratch) } / cols as f32;
 
     let mut v = 0.0;
     c = tid;
     while c < cols {
-        let d = unsafe { *xr.add(c as usize) } - mean;
+        let d = load(c) - mean;
         v += d * d;
         c += block;
     }
@@ -45,73 +55,127 @@ unsafe fn layernorm_row<T: Elem>(
 
     c = tid;
     while c < cols {
-        let y = (unsafe { *xr.add(c as usize) } - mean) * rstd;
-        let y = if w.is_null() {
-            y
-        } else {
-            y * unsafe { *w.add(c as usize) } + if b.is_null() { 0.0 } else { unsafe { *b.add(c as usize) } }
-        };
-        unsafe { T::store(yr.add(c as usize), y) };
+        let y = (load(c) - mean) * rstd;
+        let y = if w.is_empty() { y } else { y * w[c as usize] + if b.is_empty() { 0.0 } else { b[c as usize] } };
+        store(c, y);
         c += block;
     }
 }
 
-/// LayerNorm over the last dim, one block per row; `out` may alias `x`, and `w`/`b` may
-/// be null
+/// LayerNorm of row `blockIdx.x` of `x` into the same row of `out`
+///
+/// # Safety
+/// As [`layernorm_row`]
+#[inline(always)]
+unsafe fn layernorm_into<T: Elem>(
+    out: &mut DisjointSlice<T>,
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    eps: f32,
+    scratch: *mut f32,
+) {
+    let cols = x.len() as u32 / gridDim_x();
+    // the checks are block-uniform, so a block that fails them never reaches a barrier
+    let Some(xr) = MatrixView32::new(x, cols).row(blockIdx_x(), cols) else { return };
+    if out.len() < x.len() {
+        return;
+    }
+    let base = blockIdx_x() * cols;
+
+    let store = |c: u32, y: f32| {
+        // SAFETY: `row` checked that `base + c` is inside `x`, which `out` covers; column
+        // `c` is only visited by thread `c % blockDim` of this block
+        *unsafe { out.get_unchecked_mut((base + c) as usize) } = T::narrow(y);
+    };
+    // SAFETY: the caller's contract
+    unsafe { layernorm_row(cols, eps, w, b, scratch, |c| xr.get(c).unwrap_or(0.0), store) }
+}
+
+/// LayerNorm over the last dim, one block per row; an empty `w` or `b` is skipped
+///
+/// `x` is `[rows, cols]` for a grid of `rows` blocks. Use [`layernorm_inplace`] to
+/// normalize a buffer over itself
 #[kernel]
-pub unsafe fn layernorm(out: *mut f32, x: *const f32, w: *const f32, b: *const f32, cols: i32, eps: f32) {
+pub fn layernorm(mut out: DisjointSlice<f32>, x: &[f32], w: &[f32], b: &[f32], eps: f32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
-    unsafe { layernorm_row(out, x, w, b, cols, eps, addr_of_mut!(SCRATCH) as *mut f32) };
+    // SAFETY: every thread of the block runs this, and SCRATCH is used by nothing else
+    unsafe { layernorm_into(&mut out, x, w, b, eps, addr_of_mut!(SCRATCH) as *mut f32) };
 }
 
 /// [`layernorm`] into BF16, to feed a BF16 GEMM directly
 #[kernel]
-pub unsafe fn layernorm_bf16(out: *mut Bf16, x: *const f32, w: *const f32, b: *const f32, cols: i32, eps: f32) {
+pub fn layernorm_bf16(mut out: DisjointSlice<Bf16>, x: &[f32], w: &[f32], b: &[f32], eps: f32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
-    unsafe { layernorm_row(out, x, w, b, cols, eps, addr_of_mut!(SCRATCH) as *mut f32) };
+    // SAFETY: as in `layernorm`
+    unsafe { layernorm_into(&mut out, x, w, b, eps, addr_of_mut!(SCRATCH) as *mut f32) };
+}
+
+/// [`layernorm`] over `x` itself
+#[kernel]
+pub fn layernorm_inplace(mut x: DisjointSlice<f32>, w: &[f32], b: &[f32], eps: f32) {
+    static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
+    let cols = x.len() as u32 / gridDim_x();
+    if cols == 0 {
+        return;
+    }
+    let row = x.as_mut_ptr().wrapping_add((blockIdx_x() * cols) as usize);
+
+    // SAFETY, for both closures: `blockIdx.x < gridDim.x` and `c < cols` keep `row + c`
+    // inside `x`, and column `c` is only visited by thread `c % blockDim` of this block,
+    // so each access is to a location no other thread touches
+    let load = |c: u32| unsafe { *row.add(c as usize) };
+    let store = |c: u32, y: f32| unsafe { *row.add(c as usize) = y };
+    // SAFETY: SCRATCH is used by nothing else, and every thread of the block runs this
+    unsafe { layernorm_row(cols, eps, w, b, addr_of_mut!(SCRATCH) as *mut f32, load, store) };
 }
 
 /// Row softmax over `x [rows, n]` in place, one block per row
 ///
 /// Row `r` is query `q = r % lq` of batch `g = r / lq`. Optional additive
 /// `bias[g / bias_div][q][j]`, a key mask (nonzero = masked) shared by all rows, and
-/// causal masking (`j > q`). Fully masked rows become zeros
+/// causal masking (`j > q`); an empty `bias` or `key_mask` is skipped. Fully masked rows
+/// become zeros
 #[kernel]
-pub unsafe fn softmax(x: *mut f32, n: i32, lq: i32, bias: *const f32, bias_div: i32, key_mask: *const u8, causal: i32) {
+pub fn softmax(mut x: DisjointSlice<f32>, lq: u32, bias: &[f32], bias_div: u32, key_mask: &[u8], causal: i32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
     let scratch = addr_of_mut!(SCRATCH) as *mut f32;
-    let r = blockIdx_x() as i64;
-    let q = (r % lq as i64) as i32;
-    let g = r / lq as i64;
-    let xr = unsafe { x.add((r * n as i64) as usize) };
-    let br = if bias.is_null() {
-        bias
-    } else {
-        unsafe { bias.add((((g / bias_div as i64) * lq as i64 + q as i64) * n as i64) as usize) }
-    };
-    let (tid, block) = (threadIdx_x() as i32, blockDim_x() as i32);
+    let r = blockIdx_x();
+    let n = x.len() as u32 / gridDim_x();
+    let (q, g) = (r % lq, r / lq);
+    // an empty `bias` or `key_mask` is skipped
+    let br = if bias.is_empty() { bias } else { &bias[(((g / bias_div) * lq + q) * n) as usize..][..n as usize] };
+    let km = if key_mask.is_empty() { key_mask } else { &key_mask[..n as usize] };
+    let (tid, block) = (threadIdx_x(), blockDim_x());
+    let base = r * n;
 
+    // SAFETY, for every `get_unchecked_mut` below: `r < gridDim.x` and `j < n` keep
+    // `base + j` inside `x`, and column `j` of this row is only visited by thread
+    // `j % blockDim` of this block
     let mut m = f32::NEG_INFINITY;
     let mut j = tid;
     while j < n {
-        let mut v = unsafe { *xr.add(j as usize) };
-        if !br.is_null() {
-            v += unsafe { *br.add(j as usize) };
+        let xj = unsafe { x.get_unchecked_mut((base + j) as usize) };
+        let mut v = *xj;
+        if !br.is_empty() {
+            v += br[j as usize];
         }
-        if (!key_mask.is_null() && unsafe { *key_mask.add(j as usize) } != 0) || (causal != 0 && j > q) {
+        if (!km.is_empty() && km[j as usize] != 0) || (causal != 0 && j > q) {
             v = f32::NEG_INFINITY;
         }
-        unsafe { *xr.add(j as usize) = v };
+        *xj = v;
         m = math::fmaxf(m, v);
         j += block;
     }
+    // SAFETY: every thread of the block calls it, and SCRATCH is used by nothing else
     m = unsafe { block_max(m, scratch) };
 
     let mut s = 0.0;
     j = tid;
     while j < n {
-        let e = if m == f32::NEG_INFINITY { 0.0 } else { math::fast_expf(unsafe { *xr.add(j as usize) } - m) };
-        unsafe { *xr.add(j as usize) = e };
+        let xj = unsafe { x.get_unchecked_mut((base + j) as usize) };
+        let e = if m == f32::NEG_INFINITY { 0.0 } else { math::fast_expf(*xj - m) };
+        *xj = e;
         s += e;
         j += block;
     }
@@ -120,7 +184,7 @@ pub unsafe fn softmax(x: *mut f32, n: i32, lq: i32, bias: *const f32, bias_div: 
     let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
     j = tid;
     while j < n {
-        unsafe { *xr.add(j as usize) *= inv };
+        *unsafe { x.get_unchecked_mut((base + j) as usize) } *= inv;
         j += block;
     }
 }
@@ -132,29 +196,30 @@ pub unsafe fn softmax(x: *mut f32, n: i32, lq: i32, bias: *const f32, bias_div: 
 /// ...` and lanes the group's channels, so every load is one coalesced row segment and
 /// each block keeps several in flight
 #[kernel]
-pub unsafe fn group_stats(part: *mut f32, x: *const f32, hw: i64, c: i32, groups: i32, chunk: i32) {
+pub fn group_stats(mut part: DisjointSlice<f32>, x: &[f32], c: u32, groups: u32, chunk: u32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
     let scratch = addr_of_mut!(SCRATCH) as *mut f32;
-    let g = blockIdx_y() as i32;
+    let g = blockIdx_y();
     let cg = c / groups;
+    let hw = x.len() as u32 / c;
     let (warp, lane, warps) = (threadIdx_x() / 32, threadIdx_x() % 32, blockDim_x() / 32);
-    let start = blockIdx_x() as i64 * chunk as i64;
-    let end = (start + chunk as i64).min(hw);
+    let start = blockIdx_x() * chunk;
+    let end = (start + chunk).min(hw);
+    // the group's channels start at column `g * cg` of every pixel row
+    let x = &x[(g * cg) as usize..];
 
     let (mut s, mut s2) = (0.0f32, 0.0f32);
-    let step = warps as i64;
-    let mut p = start + warp as i64;
+    let step = warps;
+    let mut p = start + warp;
     // four pixels per pass keep four loads in flight; #[unroll(4)] can't take this loop,
     // whose step is not a constant
     while p + 3 * step < end {
-        let row = unsafe { x.add((p * c as i64 + (g * cg) as i64) as usize) };
-        let mut k = lane as i32;
+        let pitch = step * c;
+        let mut k = lane;
         while k < cg {
-            let (v0, v1, v2, v3) = unsafe {
-                let r = row.add(k as usize);
-                let pitch = step as usize * c as usize;
-                (*r, *r.add(pitch), *r.add(2 * pitch), *r.add(3 * pitch))
-            };
+            let at = p * c + k;
+            let (v0, v1, v2, v3) =
+                (x[at as usize], x[(at + pitch) as usize], x[(at + 2 * pitch) as usize], x[(at + 3 * pitch) as usize]);
             s += v0;
             s2 += v0 * v0;
             s += v1;
@@ -168,24 +233,26 @@ pub unsafe fn group_stats(part: *mut f32, x: *const f32, hw: i64, c: i32, groups
         p += 4 * step;
     }
     while p < end {
-        let row = unsafe { x.add((p * c as i64 + (g * cg) as i64) as usize) };
-        let mut k = lane as i32;
+        let mut k = lane;
         while k < cg {
-            let v = unsafe { *row.add(k as usize) };
+            let v = x[(p * c + k) as usize];
             s += v;
             s2 += v * v;
             k += 32;
         }
         p += step;
     }
+    // SAFETY: every thread of the block calls it, and SCRATCH is used by nothing else
     s = unsafe { block_sum(s, scratch) };
     s2 = unsafe { block_sum(s2, scratch) };
 
-    if threadIdx_x() == 0 {
-        let i = ((g as i64 * gridDim_x() as i64 + blockIdx_x() as i64) * 2) as usize;
+    let i = ((g * gridDim_x() + blockIdx_x()) * 2) as usize;
+    if threadIdx_x() == 0 && i + 1 < part.len() {
+        // SAFETY: `i + 1` is inside `part`, and only thread 0 of the block for this
+        // (group, chunk) pair writes the two floats at `i`
         unsafe {
-            *part.add(i) = s;
-            *part.add(i + 1) = s2;
+            *part.get_unchecked_mut(i) = s;
+            *part.get_unchecked_mut(i + 1) = s2;
         }
     }
 }
@@ -194,105 +261,130 @@ pub unsafe fn group_stats(part: *mut f32, x: *const f32, hw: i64, c: i32, groups
 ///
 /// A fixed order instead of atomics, so the statistics don't change with block
 /// scheduling: atomic adds flipped mask pixels between runs whose only difference was
-/// timing
+/// timing. `part` holds `blocks` partial pairs per group, `blocks` being its length over
+/// twice the grid
 #[kernel]
-pub unsafe fn group_stats_reduce(stats: *mut f32, part: *const f32, blocks: i32) {
+pub fn group_stats_reduce(mut stats: DisjointSlice<f32>, part: &[f32]) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
     let scratch = addr_of_mut!(SCRATCH) as *mut f32;
-    let p = unsafe { part.add(blockIdx_x() as usize * blocks as usize * 2) };
+    let blocks = part.len() as u32 / (2 * gridDim_x());
+    let g = blockIdx_x();
+    // the checks are block-uniform, so a block that fails them never reaches a barrier
+    let Some(pairs) = MatrixView32::new(part, 2 * blocks).row(g, 2 * blocks) else { return };
 
     let (mut s, mut s2) = (0.0f32, 0.0f32);
-    let mut i = threadIdx_x() as i32;
+    let mut i = threadIdx_x();
     while i < blocks {
-        unsafe {
-            s += *p.add(i as usize * 2);
-            s2 += *p.add(i as usize * 2 + 1);
-        }
-        i += blockDim_x() as i32;
+        s += pairs.get(i * 2).unwrap_or(0.0);
+        s2 += pairs.get(i * 2 + 1).unwrap_or(0.0);
+        i += blockDim_x();
     }
+    // SAFETY: every thread of the block calls it, and SCRATCH is used by nothing else
     s = unsafe { block_sum(s, scratch) };
     s2 = unsafe { block_sum(s2, scratch) };
 
-    if threadIdx_x() == 0 {
-        let i = blockIdx_x() as usize * 2;
+    let i = (g * 2) as usize;
+    if threadIdx_x() == 0 && i + 1 < stats.len() {
+        // SAFETY: `i + 1` is inside `stats`, and only thread 0 of group `g`'s block writes
+        // the two floats at `i`
         unsafe {
-            *stats.add(i) = s;
-            *stats.add(i + 1) = s2;
+            *stats.get_unchecked_mut(i) = s;
+            *stats.get_unchecked_mut(i + 1) = s2;
         }
     }
 }
 
-/// Mean and variance of group `g` from its summed statistics over `count` values
+/// Mean and variance from a group's summed statistics over `count` values
 #[inline(always)]
-pub unsafe fn group_moments(stats: *const f32, g: i32, count: f32) -> (f32, f32) {
-    let mean = unsafe { *stats.add(g as usize * 2) } / count;
-    let var = math::fmaxf(unsafe { *stats.add(g as usize * 2 + 1) } / count - mean * mean, 0.0);
-    (mean, var)
+fn moments(sum: f32, sum_sq: f32, count: f32) -> (f32, f32) {
+    let mean = sum / count;
+    (mean, math::fmaxf(sum_sq / count - mean * mean, 0.0))
 }
 
 /// GroupNorm with affine weights and an activation, in place, from [`group_stats_reduce`]
-#[kernel]
-pub unsafe fn group_norm_apply(
-    x: *mut f32,
-    stats: *const f32,
-    w: *const f32,
-    b: *const f32,
-    hw: i64,
-    c: i32,
-    groups: i32,
+///
+/// `x` is `[hw, c]`; `stats` is `[groups, 2]`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn group_norm_apply(
+    mut x: DisjointSlice<f32>,
+    stats: &[f32],
+    w: &[f32],
+    b: &[f32],
+    c: u32,
+    groups: u32,
     eps: f32,
     act: i32,
 ) {
-    let n = hw * c as i64;
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let hw = x.len() as u32 / c;
+    let Some(mut x) = x.element_thread32(t) else { return };
+    let ch = i % c;
     let cg = c / groups;
-    let count = (hw * cg as i64) as f32;
-    let (mut i, stride) = grid_stride();
-    while i < n {
-        let ch = (i % c as i64) as i32;
-        let (mean, var) = unsafe { group_moments(stats, ch / cg, count) };
-        let v = unsafe {
-            (*x.add(i as usize) - mean) * math::rsqrtf(var + eps) * *w.add(ch as usize) + *b.add(ch as usize)
-        };
-        unsafe { *x.add(i as usize) = activate(v, act) };
-        i += stride;
-    }
+    let count = (hw * cg) as f32;
+
+    let g = (ch / cg) as usize;
+    let (mean, var) = moments(stats[g * 2], stats[g * 2 + 1], count);
+    let v = (x.read() - mean) * math::rsqrtf(var + eps) * w[ch as usize] + b[ch as usize];
+    x.write(activate(v, act));
 }
 
 /// Masked mean over the rows of `x [len, dim]` (mask nonzero = padding) into `out [dim]`
-#[kernel]
-pub unsafe fn masked_mean(out: *mut f32, x: *const f32, mask: *const u8, len: i32, dim: i32) {
-    let d = (blockIdx_x() * blockDim_x() + threadIdx_x()) as i32;
-    if d >= dim {
-        return;
-    }
+///
+/// `len` is `x.len() / out.len()`; `mask` may be longer than `len`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn masked_mean(mut out: DisjointSlice<f32>, x: &[f32], mask: &[u8]) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let dim = out.len() as u32;
+    let Some(mut out) = out.element_thread32(t) else { return };
+    let len = x.len() as u32 / dim;
 
     let (mut s, mut cnt) = (0.0f32, 0.0f32);
-    for t in 0..len {
-        if unsafe { *mask.add(t as usize) } == 0 {
-            s += unsafe { *x.add((t as i64 * dim as i64 + d as i64) as usize) };
-            cnt += 1.0;
+    // `col` is `None` only for an empty `x`, whose mean is zero
+    if let Some(col) = MatrixView32::new(x, dim).col(i, len) {
+        let mask = &mask[..len as usize];
+        let mut t = 0;
+        while t < len {
+            if mask[t as usize] == 0 {
+                s += col.get(t).unwrap_or(0.0);
+                cnt += 1.0;
+            }
+            t += 1;
         }
     }
-    unsafe { *out.add(d as usize) = s / math::fmaxf(cnt, 1.0) };
+    out.write(s / math::fmaxf(cnt, 1.0));
 }
 
 /// `scores[q] = clamp(dot(hs[q], p) * scale, -clampv, clampv)`, one warp per query
-#[kernel]
-pub unsafe fn dot_scores(scores: *mut f32, hs: *const f32, p: *const f32, nq: i32, dim: i32, scale: f32, clampv: f32) {
-    let q = (blockIdx_x() * (blockDim_x() / 32) + threadIdx_x() / 32) as i32;
-    let lane = (threadIdx_x() & 31) as i32;
-    if q >= nq {
+///
+/// `hs` is `[scores.len(), p.len()]`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn dot_scores(mut scores: DisjointSlice<f32, thread::WarpIndex>, hs: &[f32], p: &[f32], scale: f32, clampv: f32) {
+    let q = blockIdx_x() * (blockDim_x() / 32) + threadIdx_x() / 32;
+    let lane = threadIdx_x() & 31;
+    let dim = p.len() as u32;
+    // the whole warp leaves together, so the shuffles below never see a partial warp
+    let (Some(hs_row), Some(p_row)) = (MatrixView32::new(hs, dim).row(q, dim), MatrixView32::new(p, dim).row(0, dim))
+    else {
         return;
-    }
+    };
 
     let mut s = 0.0;
     let mut d = lane;
     while d < dim {
-        s += unsafe { *hs.add((q as i64 * dim as i64 + d as i64) as usize) * *p.add(d as usize) };
+        s += hs_row.get(d).unwrap_or(0.0) * p_row.get(d).unwrap_or(0.0);
         d += 32;
     }
-    s = warp_sum(s);
-    if lane == 0 {
-        unsafe { *scores.add(q as usize) = math::fminf(math::fmaxf(s * scale, -clampv), clampv) };
+    s = warp::reduce_sum_f32(s);
+
+    // `warp_index` hands lane 0 alone the slot for this warp
+    if let Some(slot) = thread::warp_index()
+        && let Some(score) = scores.get_mut(slot)
+    {
+        *score = math::fminf(math::fmaxf(s * scale, -clampv), clampv);
     }
 }

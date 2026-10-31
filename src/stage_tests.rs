@@ -46,7 +46,7 @@ fn compare(name: &str, got: &[f32], want: &[f32]) {
 /// `[rows, cols]` -> `[cols, rows]`
 fn transpose(gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
     let out = gpu.empty(&[x.cols(), x.rows()])?;
-    launch!(gpu, "transpose", ew(x.len()), B256, 0; &out, x, x.rows() as u64, x.cols())?;
+    launch!(gpu, "transpose", ew(out.len()), B256, 0; &out, x, x.cols())?;
     Ok(out)
 }
 

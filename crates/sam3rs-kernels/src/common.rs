@@ -1,8 +1,10 @@
 //! Helpers shared by every kernel: math through libdevice, grid-stride loops, warp and
 //! block reductions, activations, 16-bit packing and wide global accesses
 
+use core::marker::PhantomData;
+
 use cuda_device::convert::{bf16_to_f32, cvt_bf16x2_f32, cvt_f16x2_f32};
-use cuda_device::thread::{blockDim_x, blockIdx_x, gridDim_x, sync_threads, threadIdx_x};
+use cuda_device::thread::{blockDim_x, sync_threads, threadIdx_x};
 use cuda_device::{ptx_asm, warp};
 
 // the CUDA C++ math library calls these same libdevice functions, so results match what
@@ -106,13 +108,6 @@ pub mod math {
     }
 }
 
-/// First index and stride of a 1D grid-stride loop
-#[inline(always)]
-pub fn grid_stride() -> (i64, i64) {
-    let block = blockDim_x() as i64;
-    (blockIdx_x() as i64 * block + threadIdx_x() as i64, gridDim_x() as i64 * block)
-}
-
 #[inline(always)]
 pub fn warp_sum(mut v: f32) -> f32 {
     let mut o = 16;
@@ -210,38 +205,49 @@ pub struct Bf16(pub u16);
 #[derive(Clone, Copy)]
 pub struct F16(pub u16);
 
-/// An element type kernels load as and store from FP32
+/// An element type kernels widen to FP32 to compute in and narrow results back to, so one
+/// body serves FP32 and BF16 activations
 pub trait Elem: Copy {
-    /// # Safety
-    /// `p` is valid for a read
-    unsafe fn load(p: *const Self) -> f32;
+    fn widen(self) -> f32;
 
-    /// # Safety
-    /// `p` is valid for a write
-    unsafe fn store(p: *mut Self, v: f32);
+    /// Rounds to nearest even
+    fn narrow(v: f32) -> Self;
 }
 
 impl Elem for f32 {
     #[inline(always)]
-    unsafe fn load(p: *const Self) -> f32 {
-        unsafe { *p }
+    fn widen(self) -> f32 {
+        self
     }
 
     #[inline(always)]
-    unsafe fn store(p: *mut Self, v: f32) {
-        unsafe { *p = v };
+    fn narrow(v: f32) -> Self {
+        v
     }
 }
 
 impl Elem for Bf16 {
     #[inline(always)]
-    unsafe fn load(p: *const Self) -> f32 {
-        bf16_to_f32(unsafe { (*p).0 })
+    fn widen(self) -> f32 {
+        bf16_to_f32(self.0)
     }
 
     #[inline(always)]
-    unsafe fn store(p: *mut Self, v: f32) {
-        unsafe { *p = Bf16(pack_bf16(v, 0.0) as u16) };
+    fn narrow(v: f32) -> Self {
+        Bf16(pack_bf16(v, 0.0) as u16)
+    }
+}
+
+/// Eight 16-bit `T` in one 16-byte word, so a thread's eight values move in one vector
+/// access: as a `DisjointSlice` element it stores with one `st.global.v4`
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct Packed8<T>(pub [u32; 4], pub PhantomData<T>);
+
+impl<T> Packed8<T> {
+    #[inline(always)]
+    pub fn new(words: [u32; 4]) -> Self {
+        Self(words, PhantomData)
     }
 }
 
@@ -265,6 +271,17 @@ pub unsafe fn ldg4(p: *const f32) -> [f32; 4] {
     [a, b, c, d]
 }
 
+/// Floats `[i, i + 8)` of `x` as two 16-byte loads, or `None` past its end; `i` is a
+/// multiple of 8
+#[inline(always)]
+pub fn ldg8(x: &[f32], i: usize) -> Option<[f32; 8]> {
+    let p = x.get(i..i + 8)?.as_ptr();
+    // SAFETY: the range check put all 8 floats in bounds; i is a multiple of 8 and
+    // buffers are 256-byte aligned, so both loads are 16-byte aligned
+    let (a, b) = unsafe { (ldg4(p), ldg4(p.add(4))) };
+    Some([a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]])
+}
+
 /// Sixteen bytes from a 16-byte aligned global address
 ///
 /// # Safety
@@ -283,25 +300,6 @@ pub unsafe fn ldg_u4<T>(p: *const T) -> [u32; 4] {
         );
     }
     [a, b, c, d]
-}
-
-/// Sixteen bytes to a 16-byte aligned global address
-///
-/// # Safety
-/// `p` is 16-byte aligned and valid for a 16-byte write
-#[inline(always)]
-pub unsafe fn stg_u4<T>(p: *mut T, v: [u32; 4]) {
-    unsafe {
-        ptx_asm!(
-            "{ .reg .u64 g; cvta.to.global.u64 g, %0; st.global.v4.u32 [g], {%1, %2, %3, %4}; }",
-            in("l") p as u64,
-            in("r") v[0],
-            in("r") v[1],
-            in("r") v[2],
-            in("r") v[3],
-            clobber("memory"),
-        );
-    }
 }
 
 /// Two floats to an 8-byte aligned global address

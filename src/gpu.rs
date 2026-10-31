@@ -81,8 +81,11 @@ impl Buf {
         self.ptr
     }
 
-    pub fn bytes(&self) -> usize {
-        self.bytes
+    /// The whole buffer as a kernel slice of `T`, the element type the kernel declares
+    /// for it (`u16` for BF16 or FP16, `[u16; 8]` for packed groups of eight)
+    pub fn slice<T>(&self) -> Arg {
+        debug_assert!(self.bytes.is_multiple_of(size_of::<T>()));
+        Arg::slice(self.ptr, self.bytes / size_of::<T>())
     }
 }
 
@@ -140,15 +143,40 @@ impl Tensor {
 }
 
 /// A kernel argument, kept alive until the launch call returns
+///
+/// The kernels are cuda-oxide functions: each `&[T]` or `DisjointSlice<T>` parameter
+/// lowers to two PTX params, the address then the length in elements of `T`, which is
+/// [`Arg::Slice`]. Sizes are `u32` and the rest are 32-bit scalars. There is no bare
+/// pointer kind, since no kernel takes one
+#[derive(Clone, Copy, Debug)]
 pub enum Arg {
-    U64(u64),
+    /// Address and length in elements of the kernel's slice type
+    Slice(u64, u64),
+    U32(u32),
     I32(i32),
     F32(f32),
 }
 
-impl From<u64> for Arg {
-    fn from(v: u64) -> Self {
-        Arg::U64(v)
+impl Arg {
+    /// An empty slice, for an optional input the kernel skips when it is empty. The
+    /// address is never read; it is non-null and aligned because a Rust slice's must be,
+    /// even when empty
+    pub const EMPTY: Arg = Arg::Slice(256, 0);
+
+    /// `len` elements of the kernel's slice type at `ptr`, for sub-views, offsets and
+    /// buffers that aren't a [`Tensor`]
+    pub fn slice(ptr: u64, len: usize) -> Self {
+        Arg::Slice(ptr, len as u64)
+    }
+
+    /// The PTX params this argument fills, in order
+    fn params(&self) -> &'static [Param] {
+        match self {
+            Arg::Slice(..) => &[Param::Ptr, Param::U64],
+            // the PTX declares i32 params as .u32 too
+            Arg::U32(_) | Arg::I32(_) => &[Param::U32],
+            Arg::F32(_) => &[Param::F32],
+        }
     }
 }
 
@@ -160,7 +188,7 @@ impl From<i32> for Arg {
 
 impl From<usize> for Arg {
     fn from(v: usize) -> Self {
-        Arg::I32(i32::try_from(v).expect("kernel int argument overflows i32"))
+        Arg::U32(u32::try_from(v).expect("kernel size argument overflows u32"))
     }
 }
 
@@ -170,19 +198,22 @@ impl From<f32> for Arg {
     }
 }
 
+/// The whole tensor as an f32 slice
 impl From<&Tensor> for Arg {
     fn from(t: &Tensor) -> Self {
-        Arg::U64(t.ptr())
+        Arg::slice(t.ptr(), t.len())
     }
 }
 
 impl From<&mut Tensor> for Arg {
     fn from(t: &mut Tensor) -> Self {
-        Arg::U64(t.ptr())
+        Arg::slice(t.ptr(), t.len())
     }
 }
 
-/// Launches a kernel from the sam3rs module: `launch!(gpu, "name", grid, block, smem; args...)`
+/// Launches a kernel from the sam3rs module: `launch!(gpu, "name", grid, block, smem;
+/// args...)`, each argument converted with `Arg::from`: a [`Tensor`] is its f32 slice, a
+/// `usize` a `u32` size. Use [`Arg::slice`] or [`Buf::slice`] for other slices
 macro_rules! launch {
     ($gpu:expr, $name:expr, $grid:expr, $block:expr, $smem:expr; $($arg:expr),* $(,)?) => {
         $gpu.launch($name, $grid, $block, $smem, vec![$($crate::gpu::Arg::from($arg)),*])
@@ -259,7 +290,9 @@ pub struct Gpu {
     lt: Option<BlasLt>,
     device: Arc<Device>,
     module: CUmodule,
-    functions: RefCell<HashMap<&'static str, CUfunction>>,
+    /// the PTX `module` was loaded from, which the launch guard reads params from
+    ptx: &'static str,
+    functions: RefCell<HashMap<&'static str, Kernel>>,
     blas: blas::cublasHandle_t,
     /// compute type of GEMMs with FP32 inputs
     fp32_compute: blas::cublasComputeType_t,
@@ -330,6 +363,7 @@ impl Gpu {
             lt,
             device,
             module,
+            ptx,
             functions: RefCell::new(HashMap::new()),
             blas: handle,
             fp32_compute,
@@ -464,16 +498,25 @@ impl Gpu {
         Ok(out)
     }
 
-    fn function(&self, name: &'static str) -> Result<CUfunction> {
-        if let Some(f) = self.functions.borrow().get(name) {
-            return Ok(*f);
+    /// The kernel `name`, once its PTX params match `args`. The params are read from
+    /// the loaded PTX on first use and cached with the function, so later launches only
+    /// compare them
+    fn function(&self, name: &'static str, args: &[Arg]) -> Result<CUfunction> {
+        if let Some(k) = self.functions.borrow().get(name) {
+            k.check(name, args)?;
+            return Ok(k.f);
         }
         let f = unsafe { cur::module::get_function(self.module, CString::new(name)?) }
             .wrap_err_with(|| format!("kernel {name} missing from the PTX"))?;
-        self.functions.borrow_mut().insert(name, f);
+        let k = Kernel { f, params: entry_params(self.ptx, name)? };
+        k.check(name, args)?;
+        self.functions.borrow_mut().insert(name, k);
         Ok(f)
     }
 
+    /// Launches `name` with one PTX param per scalar and two per slice. Fails without
+    /// launching if `args` don't match the kernel's PTX params in count and type, which
+    /// the driver would otherwise accept and misread
     pub fn launch(
         &self,
         name: &'static str,
@@ -482,15 +525,20 @@ impl Gpu {
         smem: u32,
         args: Vec<Arg>,
     ) -> Result<()> {
-        let f = self.function(name)?;
-        let mut params: Vec<*mut c_void> = args
-            .iter()
-            .map(|a| match a {
-                Arg::U64(v) => v as *const u64 as *mut c_void,
-                Arg::I32(v) => v as *const i32 as *mut c_void,
-                Arg::F32(v) => v as *const f32 as *mut c_void,
-            })
-            .collect();
+        let f = self.function(name, &args)?;
+        // the 32-bit thread index of the elementwise kernels is exact only up to here
+        ensure!(grid.0 as u64 * block.0 as u64 <= 1 << 32, "launch {name}: more than 2^32 threads along x");
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(2 * args.len());
+        for a in &args {
+            match a {
+                Arg::Slice(ptr, len) => {
+                    params.extend([ptr as *const u64 as *mut c_void, len as *const u64 as *mut c_void]);
+                }
+                Arg::U32(v) => params.push(v as *const u32 as *mut c_void),
+                Arg::I32(v) => params.push(v as *const i32 as *mut c_void),
+                Arg::F32(v) => params.push(v as *const f32 as *mut c_void),
+            }
+        }
         if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
             return Ok(());
         }
@@ -614,6 +662,72 @@ impl Drop for Gpu {
     }
 }
 
+/// A PTX kernel param as the host fills it: slices are a `.u64 .ptr` address then a
+/// `.u64` length
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Param {
+    Ptr,
+    U64,
+    U32,
+    F32,
+}
+
+/// A loaded kernel and its PTX params
+struct Kernel {
+    f: CUfunction,
+    params: Vec<Param>,
+}
+
+impl Kernel {
+    /// Checks that `args` fill this kernel's params exactly: `cuLaunchKernel` reads each
+    /// param at the size the PTX declares, so a missing slice length or a dropped
+    /// scalar would shift every later argument silently, and a float passed for a size
+    /// would be read as its bits
+    fn check(&self, name: &str, args: &[Arg]) -> Result<()> {
+        let mut host = args.iter().flat_map(Arg::params);
+        for (i, &ptx) in self.params.iter().enumerate() {
+            match host.next() {
+                Some(&param) if param == ptx => {}
+                Some(&param) => bail!("kernel {name} param {i}: the PTX declares {ptx:?}, the host passes {param:?}"),
+                None => bail!("kernel {name} takes {} params, the host passes {i}", self.params.len()),
+            }
+        }
+        let extra = host.count();
+        ensure!(
+            extra == 0,
+            "kernel {name} takes {} params, the host passes {}",
+            self.params.len(),
+            self.params.len() + extra
+        );
+        Ok(())
+    }
+}
+
+/// The params of kernel `name` in `ptx`, in order. Read from the PTX text rather than the
+/// driver: `cuFuncGetParamCount` needs a newer driver than sam3rs supports, and probing
+/// `cuFuncGetParamInfo` past the last param is an API error that compute-sanitizer
+/// reports on every kernel
+fn entry_params(ptx: &str, name: &str) -> Result<Vec<Param>> {
+    let entry = format!(".entry {name}(");
+    let start = ptx.find(&entry).ok_or_else(|| eyre!("kernel {name} missing from the PTX"))? + entry.len();
+    let end = ptx[start..].find(')').ok_or_else(|| eyre!("kernel {name}: unterminated PTX param list"))?;
+    ptx[start..start + end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let ty = line.strip_prefix(".param ").and_then(|rest| rest.split_whitespace().next());
+            match (ty, line.contains(" .ptr ")) {
+                (Some(".u64"), true) => Ok(Param::Ptr),
+                (Some(".u64"), false) => Ok(Param::U64),
+                (Some(".u32"), false) => Ok(Param::U32),
+                (Some(".f32"), false) => Ok(Param::F32),
+                _ => Err(eyre!("kernel {name}: unexpected PTX param `{line}`")),
+            }
+        })
+        .collect()
+}
+
 /// A pool of our own instead of the device default, so keeping freed blocks cached
 /// doesn't change the default pool's behavior for other CUDA users in the process
 fn create_pool(ctx: &CudaContext) -> Result<CUmemoryPool> {
@@ -681,4 +795,28 @@ fn check_blas(status: blas::cublasStatus_t) -> Result<()> {
 /// Grid size for `n` items with `block` threads each
 pub fn blocks(n: usize, block: u32) -> u32 {
     u32::try_from(n.div_ceil(block as usize)).expect("grid too large")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PTX_SM80, PTX_SM120, entry_params};
+
+    /// The launch guard reads every kernel's params from the PTX text, so a cuda-oxide or
+    /// LLVM upgrade that changes the param syntax must fail here, not at a launch
+    #[test]
+    fn ptx_params_parse() {
+        let names: Vec<&str> = PTX_SM120
+            .match_indices(".entry ")
+            .map(|(i, m)| {
+                let rest = &PTX_SM120[i + m.len()..];
+                &rest[..rest.find('(').unwrap()]
+            })
+            .collect();
+        assert!(names.len() > 40, "found {} entries", names.len());
+        for name in names {
+            let params = entry_params(PTX_SM120, name).unwrap();
+            assert!(!params.is_empty(), "{name} has no params");
+            assert_eq!(params, entry_params(PTX_SM80, name).unwrap(), "{name} differs between the tiers");
+        }
+    }
 }

@@ -3,7 +3,7 @@
 
 use eyre::{Result, WrapErr, ensure};
 
-use crate::gpu::{Gpu, Precision, Tensor, launch};
+use crate::gpu::{Gpu, Precision, Tensor, blocks, launch};
 use crate::nvtx::range;
 use crate::ops::{
     ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm_stats,
@@ -289,7 +289,7 @@ impl Detector {
             let xyxy = gpu.upload(xyxy, &[n, 4])?;
             let pooled = gpu.empty(&[n, D * ROI * ROI])?;
             launch!(gpu, "roi_align", ew(pooled.len()), B256, 0;
-                &pooled, &img.fpn2_normed, &xyxy, n, GRID, GRID, D, ROI)?;
+                &pooled, &img.fpn2_normed, &xyxy, GRID, GRID, D, ROI)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
             let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh)).collect();
@@ -299,7 +299,7 @@ impl Detector {
             let labels: Vec<i32> = boxes.iter().map(|b| b.positive as i32).collect();
             let labels = upload_i32(gpu, labels)?;
             let label = gpu.empty(&[n, D])?;
-            launch!(gpu, "gather_rows", ew(n * D), B256, 0; &label, &g.label, labels.ptr(), n, D)?;
+            launch!(gpu, "gather_rows", ew(label.len()), B256, 0; &label, &g.label, labels.slice::<i32>(), D)?;
             crate::ops::add_assign(gpu, &x, &label)?;
             concat_rows(gpu, &x, &g.cls)?
         };
@@ -343,7 +343,7 @@ impl Detector {
             let _r = range(c"decoder");
             self.decode(gpu, &memory, &prompt, prompt_mask)?
         };
-        let logits = self.score(gpu, &hs, &prompt, &pad, prompt.rows())?;
+        let logits = self.score(gpu, &hs, &prompt, &pad)?;
         let masks = {
             let _r = range(c"seg_head");
             self.segment(gpu, img, &memory, &hs, &prompt, prompt_mask)?
@@ -386,7 +386,7 @@ impl Detector {
 
         for (i, l) in self.decoder.iter().enumerate() {
             let sine = gpu.empty(&[QUERIES, 2 * D])?;
-            launch!(gpu, "box_sine_embed", ew(sine.len()), B256, 0; &sine, &boxes, QUERIES)?;
+            launch!(gpu, "box_sine_embed", ew(sine.len()), B256, 0; &sine, &boxes)?;
             let pos = self.ref_point_head.forward(gpu, &sine)?;
             gpu.copy_dtod(pos.ptr(), qpos.at(D), pos.len() * 4)?;
             let [dx, dy] = self.box_rpb(gpu, &boxes)?;
@@ -413,7 +413,7 @@ impl Detector {
             let normed = self.out_norm.forward(gpu, &queries)?;
             let delta = self.box_head.forward(gpu, &normed)?;
             let refined = gpu.empty(&[QUERIES, 4])?;
-            launch!(gpu, "box_refine", ew(QUERIES * 4), B256, 0; &refined, &boxes, &delta, QUERIES)?;
+            launch!(gpu, "box_refine", ew(refined.len()), B256, 0; &refined, &boxes, &delta)?;
             boxes = refined;
 
             if i == self.decoder.len() - 1 {
@@ -430,31 +430,32 @@ impl Detector {
     /// Box relative position bias for the image cross-attention in factored form, `dx`
     /// and `dy` as `[8, 200, 72]` (see [`BoxRpb`])
     fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor) -> Result<[Tensor; 2]> {
-        let delta = |axis: i32, mlp: &Mlp| -> Result<Tensor> {
+        let delta = |axis: usize, mlp: &Mlp| -> Result<Tensor> {
             let d = gpu.empty(&[QUERIES * GRID, 2])?;
-            launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, QUERIES, GRID, axis)?;
+            launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, GRID, axis)?;
             // the MLP gives [200 * 72, heads]; head-major rows let the attention kernel
             // read a query's biases contiguously instead of one float per 32-byte sector
             let per_pos = mlp.forward(gpu, &d)?;
             let heads = per_pos.cols();
             let out = gpu.empty(&[heads, QUERIES * GRID])?;
-            launch!(gpu, "transpose", ew(out.len()), B256, 0; &out, &per_pos, per_pos.rows() as u64, heads)?;
+            launch!(gpu, "transpose", ew(out.len()), B256, 0; &out, &per_pos, heads)?;
             Ok(out)
         };
         Ok([delta(0, &self.rpb_x)?, delta(1, &self.rpb_y)?])
     }
 
-    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf, len: usize) -> Result<Tensor> {
+    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf) -> Result<Tensor> {
         let p = self.text_mlp.forward(gpu, prompt)?;
         crate::ops::add_assign(gpu, &p, prompt)?;
         self.text_mlp_norm.forward_inplace(gpu, &p)?;
         let pooled = gpu.empty(&[1, D])?;
-        launch!(gpu, "masked_mean", (1, 1, 1), B256, 0; &pooled, &p, pad.ptr(), len, D)?;
+        // one thread per output column; the kernel takes the prompt length from p's rows
+        launch!(gpu, "masked_mean", (blocks(D, 256), 1, 1), B256, 0; &pooled, &p, pad.slice::<u8>())?;
         let pp = self.text_proj.forward(gpu, &pooled)?;
         let ph = self.query_proj.forward(gpu, hs)?;
         let scores = gpu.empty(&[QUERIES])?;
         let scale = 1.0 / (D as f32).sqrt();
-        launch!(gpu, "dot_scores", ((QUERIES as u32).div_ceil(8), 1, 1), B256, 0; &scores, &ph, &pp, QUERIES, D, scale, 12.0f32)?;
+        launch!(gpu, "dot_scores", ((QUERIES as u32).div_ceil(8), 1, 1), B256, 0; &scores, &ph, &pp, scale, 12.0f32)?;
         Ok(scores)
     }
 

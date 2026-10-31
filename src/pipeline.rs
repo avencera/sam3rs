@@ -212,12 +212,12 @@ impl Sam3 {
         let idx: Vec<i32> = kept.iter().map(|(i, _)| *i as i32).collect();
         let idx = upload_i32(gpu, idx)?;
         let picked = gpu.empty(&[kept.len(), side])?;
-        launch!(gpu, "gather_rows", ew(picked.len()), B256, 0; &picked, &out.masks, idx.ptr(), kept.len(), side)?;
+        launch!(gpu, "gather_rows", ew(picked.len()), B256, 0; &picked, &out.masks, idx.slice::<i32>(), side)?;
         let up = gpu.empty(&[kept.len(), h * w])?;
-        launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &picked, kept.len(), LOW_RES, LOW_RES, h, w)?;
+        launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &picked, LOW_RES, LOW_RES, h, w)?;
         // sigmoid(x) > 0.5 is x > 0
         let mask = gpu.alloc_bytes(up.len())?;
-        launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.ptr(), &up, up.len() as u64, 0.0f32)?;
+        launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
         let mut masks = join(spare)?;
         masks.truncate(kept.len());
         // calloc per mask: cloning one zeroed Vec would touch every page up front

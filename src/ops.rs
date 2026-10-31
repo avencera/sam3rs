@@ -13,29 +13,38 @@ pub const ACT_GELU: i32 = 2;
 pub const ACT_GELU_TANH: i32 = 3;
 pub const ACT_SIGMOID: i32 = 4;
 
-/// Grid for grid-stride elementwise kernels
+/// Grid for an elementwise kernel over `n` outputs: one thread each, in blocks of 256.
+/// The kernels have no grid-stride loop, so the grid can't be capped
 pub fn ew(n: usize) -> (u32, u32, u32) {
-    (blocks(n, 256).min(65535 * 8), 1, 1)
+    // their thread index is 32-bit, which the rounded-up grid must not overflow
+    assert!(n.next_multiple_of(256) <= 1 << 32, "{n} elements exceed the 2^32 threads of a 32-bit thread index");
+    (blocks(n, 256), 1, 1)
 }
 
 pub const B256: (u32, u32, u32) = (256, 1, 1);
 
 pub fn bias_act(gpu: &Gpu, x: &Tensor, bias: Option<&Tensor>, act: i32) -> Result<()> {
-    let b = bias.map_or(0, Tensor::ptr);
-    launch!(gpu, "bias_act", ew(x.len()), B256, 0; x, b, x.rows() as u64, x.cols(), act)
+    // the kernel takes the bias length as the row width
+    assert!(
+        bias.is_none_or(|b| b.len() == x.cols()),
+        "bias of {} for rows of {}",
+        bias.map_or(0, Tensor::len),
+        x.cols()
+    );
+    launch!(gpu, "bias_act", ew(x.len()), B256, 0; x, bias.map_or(Arg::EMPTY, Arg::from), act)
 }
 
 pub fn add(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     assert_eq!(a.len(), b.len());
     let out = gpu.empty(a.shape())?;
-    launch!(gpu, "add", ew(a.len()), B256, 0; &out, a, b, a.len() as u64)?;
+    launch!(gpu, "add", ew(a.len()), B256, 0; &out, a, b)?;
     Ok(out)
 }
 
 /// `a += b` in place
 pub fn add_assign(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<()> {
     assert_eq!(a.len(), b.len());
-    launch!(gpu, "add", ew(a.len()), B256, 0; a, a, b, a.len() as u64)
+    launch!(gpu, "add_assign", ew(a.len()), B256, 0; a, b)
 }
 
 /// A row-major BF16 activation matrix
@@ -51,7 +60,14 @@ impl Bf16 {
     }
 
     pub fn from_f32(gpu: &Gpu, x: &Tensor) -> Result<Self> {
-        Ok(Self { buf: to_bf16(gpu, x.ptr(), x.cols(), x.rows(), x.cols())?, rows: x.rows(), cols: x.cols() })
+        Ok(Self { buf: to_bf16(gpu, x, x.cols(), x.rows(), x.cols())?, rows: x.rows(), cols: x.cols() })
+    }
+}
+
+/// The whole matrix as a BF16 slice
+impl From<&Bf16> for Arg {
+    fn from(x: &Bf16) -> Self {
+        x.buf.slice::<u16>()
     }
 }
 
@@ -83,9 +99,9 @@ impl Linear {
         if gpu.precision() == Precision::Bf16
             && let Some(w) = self.w.take()
         {
-            self.w16 = Some(to_bf16(gpu, w.ptr(), w.cols(), w.rows(), w.cols())?);
+            self.w16 = Some(to_bf16(gpu, &w, w.cols(), w.rows(), w.cols())?);
             if let Some(b) = &self.b {
-                self.b16 = Some(to_bf16(gpu, b.ptr(), b.len(), 1, b.len())?);
+                self.b16 = Some(to_bf16(gpu, b, b.len(), 1, b.len())?);
             }
         }
         Ok(self)
@@ -292,7 +308,8 @@ impl LayerNorm {
     }
 
     pub fn forward_inplace(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
-        self.forward_into(gpu, x, x)
+        assert_eq!(x.cols(), self.w.len());
+        launch!(gpu, "layernorm_inplace", (x.rows() as u32, 1, 1), B256, 0; x, &self.w, &self.b, self.eps)
     }
 
     /// Normalized rows in BF16, as the input of a BF16 linear
@@ -300,13 +317,13 @@ impl LayerNorm {
         assert_eq!(x.cols(), self.w.len());
         let out = Bf16::empty(gpu, x.rows(), x.cols())?;
         launch!(gpu, "layernorm_bf16", (x.rows() as u32, 1, 1), B256, 0;
-            out.buf.ptr(), x, &self.w, &self.b, x.cols(), self.eps)?;
+            &out, x, &self.w, &self.b, self.eps)?;
         Ok(out)
     }
 
     fn forward_into(&self, gpu: &Gpu, x: &Tensor, out: &Tensor) -> Result<()> {
         assert_eq!(x.cols(), self.w.len());
-        launch!(gpu, "layernorm", (x.rows() as u32, 1, 1), B256, 0; out, x, &self.w, &self.b, x.cols(), self.eps)
+        launch!(gpu, "layernorm", (x.rows() as u32, 1, 1), B256, 0; out, x, &self.w, &self.b, self.eps)
     }
 }
 
@@ -316,7 +333,7 @@ pub struct Mask {
     /// additive bias `[batch / bias_div, lq, lk]`
     pub bias: u64,
     pub bias_div: usize,
-    /// u8 per key, nonzero means the key is padding
+    /// u8 per key, nonzero means the key is padding: `lk` bytes, or 0 for none
     pub key_pad: u64,
     pub causal: bool,
     pub rpb: Option<BoxRpb>,
@@ -366,6 +383,20 @@ pub fn attention(
     hd: usize,
     mask: Mask,
 ) -> Result<()> {
+    // Mat views carry no allocation size, so each one's slice is the extent its geometry
+    // addresses: `batch` entries of `rows` rows of `hd` values
+    let extent = |m: Mat, rows: usize| match batch * rows {
+        0 => 0,
+        _ => (batch - 1) * m.stride + (rows - 1) * m.ld + hd,
+    };
+    // u8 per key, `lk` of them, or none
+    let key_pad = match mask.key_pad {
+        0 => Arg::EMPTY,
+        p => Arg::slice(p, lk),
+    };
+    // the box RPB's dx and dy are `[heads, lq - 1, side]` each, heads being the batch
+    let rpb_len = |r: BoxRpb| batch * (lq - 1) * r.side;
+
     if flash_ok(gpu, &[q, k, v, out], hd, &mask) {
         let kernel = match (q.bf16, hd, mask.rpb) {
             (true, _, _) => "flash_attn_bf16_d64",
@@ -374,28 +405,33 @@ pub fn attention(
             _ => "flash_attn_d64",
         };
         let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
-        let view = |m: Mat| [Arg::from(m.ptr), Arg::from(m.ld as u64), Arg::from(m.stride as u64)];
+        let view = |(m, rows): (Mat, usize)| [Arg::slice(m.ptr, extent(m, rows)), Arg::from(m.ld), Arg::from(m.stride)];
         if !q.bf16 && hd == 32 && mask.rpb.is_none() && lq >= TALL_MIN && lk >= TALL_MIN {
-            // K and V as FP16 [lk, batch * hd], exactly as the kernel would round them while
-            // staging
-            let kd = gpu.alloc_bytes(lk * batch * hd * 2)?;
-            let vd = gpu.alloc_bytes(lk * batch * hd * 2)?;
-            launch!(gpu, "kv_to_16", ew(lk * batch * hd / 8), B256, 0;
-                kd.ptr(), vd.ptr(), k.ptr, k.ld as u64, k.stride as u64, v.ptr, v.ld as u64, v.stride as u64,
-                lk, batch, hd)?;
-            let packed = |ptr: u64| Mat::new(ptr, batch * hd).stride(hd);
-            let tail = [Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2), Arg::from(mask.key_pad)];
-            let args = [out, q, packed(kd.ptr()), packed(vd.ptr())].into_iter().flat_map(view).chain(tail).collect();
+            // K then V as FP16 [lk, batch * hd] each in one buffer, exactly as the kernel
+            // would round them while staging; one output slice lets each thread own one
+            // 8-value group of it
+            let n = lk * batch * hd;
+            let kv = gpu.alloc_bytes(2 * n * 2)?;
+            launch!(gpu, "kv_to_16", ew(2 * n / 8), B256, 0;
+                kv.slice::<[u16; 8]>(), Arg::slice(k.ptr, extent(k, lk)), k.ld, k.stride,
+                Arg::slice(v.ptr, extent(v, lk)), v.ld, v.stride, batch, hd)?;
+            let packed = |ptr: u64| (Mat::new(ptr, batch * hd).stride(hd), lk);
+            let tail = [Arg::from(lq), Arg::from(lk), Arg::from(scale_log2), key_pad];
+            let args = [(out, lq), (q, lq), packed(kv.ptr()), packed(kv.ptr() + (n * 2) as u64)]
+                .into_iter()
+                .flat_map(view)
+                .chain(tail)
+                .collect();
             let grid = (lq.div_ceil(128) as u32, batch as u32, 1);
             return gpu.launch("flash_attn_kv16_d32", grid, (256, 1, 1), 0, args);
         }
 
         let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
         let mut args = Vec::with_capacity(16);
-        for m in [out, q, k, v] {
+        for m in [(out, lq), (q, lq), (k, lk), (v, lk)] {
             args.extend(view(m));
         }
-        args.extend([Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2)]);
+        args.extend([Arg::from(lq), Arg::from(lk), Arg::from(scale_log2)]);
 
         // the decoder has 201 queries over 5184 keys and the geometry encoder a few: one
         // block per 64 queries and head would leave most SMs idle, so split the keys and
@@ -412,37 +448,40 @@ pub fn attention(
         match mask.rpb {
             Some(r) => {
                 assert!(r.side.is_multiple_of(2), "the fused box RPB needs an even side");
-                args.extend([Arg::from(r.dx), Arg::from(r.dy), Arg::from(r.side)]);
+                args.extend([Arg::slice(r.dx, rpb_len(r)), Arg::slice(r.dy, rpb_len(r)), Arg::from(r.side)]);
             }
-            None => args.push(Arg::from(mask.key_pad)),
+            None => args.push(key_pad),
         }
-        args.extend([Arg::from(part.as_ref().map_or(0, Tensor::ptr)), Arg::from(chunk)]);
+        args.extend([part.as_ref().map_or(Arg::EMPTY, Arg::from), Arg::from(chunk)]);
         gpu.launch(kernel, (grid.0, grid.1, splits as u32), (128, 1, 1), 0, args)?;
         let Some(part) = part else { return Ok(()) };
+        // the kernel takes the split count from the length of `part`
         let warps = batch * lq;
         return launch!(gpu, "flash_combine_d32", (blocks(warps * 32, 256), 1, 1), B256, 0;
-            out.ptr, out.ld as u64, out.stride as u64, &part, splits, batch, lq);
+            Arg::slice(out.ptr, extent(out, lq)), out.ld, out.stride, &part, batch, lq);
     }
 
-    let mut mask = mask;
-    let _bias = match mask.rpb {
+    let (bias, bias_div) = match mask.rpb {
         Some(r) => {
             assert!(mask.bias == 0 && lk == r.side * r.side, "box RPB covers a side x side key grid");
             let bias = gpu.empty(&[batch, lq, lk])?;
             launch!(gpu, "rpb_combine", ew(bias.len()), B256, 0;
-                &bias, r.dx, r.dy, lq - 1, r.side, batch)?;
-            mask.bias = bias.ptr();
-            mask.bias_div = 1;
-            Some(bias)
+                &bias, Arg::slice(r.dx, rpb_len(r)), Arg::slice(r.dy, rpb_len(r)), lq - 1, r.side)?;
+            (Some(bias), 1)
         }
-        None => None,
+        None => (None, mask.bias_div.max(1)),
+    };
+    let bias_arg = match (&bias, mask.bias) {
+        (Some(b), _) => Arg::from(b),
+        (None, 0) => Arg::EMPTY,
+        (None, p) => Arg::slice(p, batch.div_ceil(bias_div) * lq * lk),
     };
     let scores = gpu.empty(&[batch, lq, lk])?;
     let scale = 1.0 / (hd as f32).sqrt();
     let s = Mat::new(scores.ptr(), lk).stride(lq * lk);
     gpu.gemm(lq, lk, hd, q, k.t(), s, batch, scale, 0.0)?;
     launch!(gpu, "softmax", ((batch * lq) as u32, 1, 1), B256, 0;
-        &scores, lk, lq, mask.bias, mask.bias_div.max(1), mask.key_pad, mask.causal as i32)?;
+        &scores, lq, bias_arg, bias_div, key_pad, mask.causal as i32)?;
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
 }
 
@@ -542,7 +581,7 @@ impl Conv3x3 {
                     }
                 }
                 let rows = gpu.upload(rows, &[o, 9 * c])?;
-                Some(to_bf16(gpu, rows.ptr(), rows.len(), 1, rows.len())?)
+                Some(to_bf16(gpu, &rows, rows.len(), 1, rows.len())?)
             }
         };
         let w = gpu.upload(taps, &[9, o, c])?;
@@ -559,8 +598,8 @@ impl Conv3x3 {
         let wp = w + 2;
         let rows = (h + 2) * wp + 2;
         let xp = gpu.alloc_bytes(rows * c * 4)?;
-        gpu.memset_zero(xp.ptr(), xp.bytes())?;
-        launch!(gpu, "pad1", ew(x.len()), B256, 0; xp.ptr(), x, h, w, c)?;
+        // writes every element of xp, the padding as zeros
+        launch!(gpu, "pad1", ew(rows * c), B256, 0; xp.slice::<f32>(), x, w, c)?;
         let yp = gpu.empty(&[h * wp, o])?;
         for t in 0..9 {
             let (dy, dx) = (t / 3, t % 3);
@@ -569,7 +608,7 @@ impl Conv3x3 {
             gpu.gemm(h * wp, o, c, input, weight, Mat::new(yp.ptr(), o), 1, 1.0, if t == 0 { 0.0 } else { 1.0 })?;
         }
         let y = gpu.empty(&[h * w, o])?;
-        launch!(gpu, "crop_bias", ew(y.len()), B256, 0; &y, &yp, &self.b, h, w, o)?;
+        launch!(gpu, "crop_bias", ew(y.len()), B256, 0; &y, &yp, &self.b, w, o)?;
         Ok(y)
     }
 
@@ -594,36 +633,43 @@ impl Conv3x3 {
                 norm.apply(gpu, coarse)?;
             }
             let up = gpu.empty(&[h * w, c])?;
-            launch!(gpu, "upsample2_add", ew(up.len()), B256, 0; &up, fine, coarse, h / 2, w / 2, c)?;
+            launch!(gpu, "upsample2_add", ew(up.len()), B256, 0; &up, fine, coarse, w / 2, c)?;
             return self.forward(gpu, &up, h, w);
         };
 
         assert!(norm.is_none_or(|n| (c / n.groups).is_multiple_of(8)), "im2col normalizes 8 channels of one group");
-        let (stats, gw, gb) = norm.map_or((0, 0, 0), |n| (n.stats.ptr(), n.w.ptr(), n.b.ptr()));
+        // empty stats mean no norm
+        let (stats, gw, gb) = norm
+            .map_or((Arg::EMPTY, Arg::EMPTY, Arg::EMPTY), |n| (Arg::from(&n.stats), Arg::from(n.w), Arg::from(n.b)));
         let (groups, eps, act) = norm.map_or((1, 0.0, ACT_NONE), |n| (n.groups, n.eps, n.act));
         self.im2col_gemm(gpu, w16, h, w, |cols, p0, n| {
             launch!(gpu, "im2col3x3_up_bf16", ew(n * 9 * c / 8), B256, 0;
-                cols, fine, coarse, stats, gw, gb, groups, eps, act, h, w, c, p0 as u64, n as u64)
+                cols, fine, coarse, stats, gw, gb, groups, eps, act, w, c, p0)
         })
     }
 
     fn forward_im2col(&self, gpu: &Gpu, x: &Tensor, w16: &Buf, h: usize, w: usize) -> Result<Tensor> {
         let c = self.w.shape()[2];
-        self.im2col_gemm(gpu, w16, h, w, |cols, p0, n| {
-            launch!(gpu, "im2col3x3_bf16", ew(n * 9 * c / 8), B256, 0; cols, x, h, w, c, p0 as u64, n as u64)
-        })
+        self.im2col_gemm(
+            gpu,
+            w16,
+            h,
+            w,
+            |cols, p0, n| launch!(gpu, "im2col3x3_bf16", ew(n * 9 * c / 8), B256, 0; cols, x, w, c, p0),
+        )
     }
 
     /// One K = 9C GEMM per chunk of output pixels, instead of nine GEMMs that each read
     /// and rewrite the whole FP32 output. `im2col(cols, p0, n)` writes the BF16 rows of
-    /// output pixels `[p0, p0 + n)`
+    /// output pixels `[p0, p0 + n)` into `cols`, a slice of exactly their `n * 9C / 8`
+    /// groups of eight values
     fn im2col_gemm(
         &self,
         gpu: &Gpu,
         w16: &Buf,
         h: usize,
         w: usize,
-        im2col: impl Fn(u64, usize, usize) -> Result<()>,
+        im2col: impl Fn(Arg, usize, usize) -> Result<()>,
     ) -> Result<Tensor> {
         let (o, c) = (self.w.shape()[1], self.w.shape()[2]);
         assert!(c.is_multiple_of(8), "im2col copies 8 channels at a time");
@@ -632,7 +678,8 @@ impl Conv3x3 {
         let cols = gpu.alloc_bytes(pixels.min(IM2COL_ROWS) * k * 2)?;
         for p0 in (0..pixels).step_by(IM2COL_ROWS) {
             let n = IM2COL_ROWS.min(pixels - p0);
-            im2col(cols.ptr(), p0, n)?;
+            // the kernel writes the whole slice, so it is the chunk's rows, not the buffer
+            im2col(Arg::slice(cols.ptr(), n * k / 8), p0, n)?;
             let out = (y.at(p0 * o), false);
             gpu.linear_bf16((n, o, k), cols.ptr(), k, w16.ptr(), out, 0.0, self.b.ptr(), Epilogue::Bias)?;
         }
@@ -683,7 +730,7 @@ impl ConvT2x2 {
         }
         let o = n / 4;
         let y = gpu.empty(&[4 * h * w, o])?;
-        launch!(gpu, "convt2x2_scatter", ew(y.len()), B256, 0; &y, &g, &self.b, h, w, o)?;
+        launch!(gpu, "convt2x2_scatter", ew(y.len()), B256, 0; &y, &g, &self.b, w, o)?;
         Ok(y)
     }
 }
@@ -750,9 +797,9 @@ pub fn group_norm_stats<'a>(
     let blocks = hw.div_ceil(chunk);
     let part = gpu.empty(&[groups * blocks, 2])?;
     launch!(gpu, "group_stats", (blocks as u32, groups as u32, 1), B256, 0;
-        &part, x, hw as u64, c, groups, chunk)?;
+        &part, x, c, groups, chunk)?;
     let stats = gpu.empty(&[groups, 2])?;
-    launch!(gpu, "group_stats_reduce", (groups as u32, 1, 1), B256, 0; &stats, &part, blocks)?;
+    launch!(gpu, "group_stats_reduce", (groups as u32, 1, 1), B256, 0; &stats, &part)?;
     Ok(PendingNorm { stats, w, b, groups, eps, act })
 }
 
@@ -770,9 +817,8 @@ pub struct PendingNorm<'a> {
 impl PendingNorm<'_> {
     /// Normalizes `x`, the tensor the statistics came from, in place
     pub fn apply(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
-        let (hw, c) = (x.rows(), x.cols());
         launch!(gpu, "group_norm_apply", ew(x.len()), B256, 0;
-            x, &self.stats, self.w, self.b, hw as u64, c, self.groups, self.eps, self.act)
+            x, &self.stats, self.w, self.b, x.cols(), self.groups, self.eps, self.act)
     }
 }
 
@@ -789,14 +835,14 @@ pub fn concat_rows(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<Tensor> {
 fn bf16_weights(gpu: &Gpu, w: &Tensor) -> Result<Option<Buf>> {
     Ok(match gpu.precision() {
         Precision::Fp32 | Precision::Tf32 => None,
-        Precision::Bf16 => Some(to_bf16(gpu, w.ptr(), w.len(), 1, w.len())?),
+        Precision::Bf16 => Some(to_bf16(gpu, w, w.len(), 1, w.len())?),
     })
 }
 
-/// `rows` rows of `cols` floats (row stride `ld`) -> contiguous BF16 `[rows, cols]`
-pub fn to_bf16(gpu: &Gpu, src: u64, cols: usize, rows: usize, ld: usize) -> Result<Buf> {
+/// `rows` rows of `cols` floats of `src` (row stride `ld`) -> contiguous BF16 `[rows, cols]`
+pub fn to_bf16(gpu: &Gpu, src: &Tensor, cols: usize, rows: usize, ld: usize) -> Result<Buf> {
     let out = gpu.alloc_bytes(rows * cols * 2)?;
-    launch!(gpu, "f32_to_bf16", ew(rows * cols), B256, 0; out.ptr(), src, rows as u64, cols, ld as u64)?;
+    launch!(gpu, "f32_to_bf16", ew(rows * cols), B256, 0; out.slice::<u16>(), src, cols, ld)?;
     Ok(out)
 }
 

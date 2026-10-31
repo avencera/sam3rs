@@ -67,7 +67,7 @@ impl TextEncoder {
     pub fn forward(&self, gpu: &Gpu, tokens: &[u32; CONTEXT]) -> Result<TextFeatures> {
         let ids = gpu.upload_buf(tokens.map(|t| t as i32).to_vec())?;
         let x = gpu.empty(&[CONTEXT, WIDTH])?;
-        launch!(gpu, "text_embed", ew(x.len()), B256, 0; &x, &self.tok, &self.pos, ids.ptr(), CONTEXT, WIDTH)?;
+        launch!(gpu, "text_embed", ew(x.len()), B256, 0; &x, &self.tok, &self.pos, ids.slice::<i32>())?;
 
         // causal attention only: padding positions come after EOT, so causal masking
         // already keeps real tokens from seeing them
