@@ -111,7 +111,9 @@ Milliseconds on an RTX 5090 (driver 595.99, CUDA 13.2), following the osam bench
 protocol: `dogs.jpg` (2560x1600), one warm-up, then the median of 5. Model load and JPEG
 decoding are excluded. Prompts are one point (1439, 504), one box
 (1233, 376, 1649, 691), that box plus a negative box (1400, 500, 1500, 600), and the text
-"dog". Each prompt returns full-resolution masks on the host.
+"dog". Each prompt returns full-resolution masks on the host. The text prompt runs the
+text encoder on every call. Box prompts use the fixed text "visual", whose features
+sam3rs encodes once and reuses, while osam and PyTorch encode it again on every call.
 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|

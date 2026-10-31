@@ -1,6 +1,7 @@
 //! End-to-end SAM 3 image inference: encode an image once, then answer text, box and
 //! point prompts against the cached features
 
+use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,7 +13,7 @@ use crate::image::{RgbImage, preprocess};
 use crate::nvtx::range;
 use crate::ops::{B256, ew, upload_i32};
 use crate::point::{LOW_RES, PointDecoder, PointImage, PointPrompt, clamped_mask, full_res_masks};
-use crate::text::TextEncoder;
+use crate::text::{TextEncoder, TextFeatures};
 use crate::tokenizer::Tokenizer;
 use crate::vision::{Backbone, Neck};
 use crate::weights::Weights;
@@ -82,6 +83,9 @@ pub struct Sam3 {
     text: TextEncoder,
     detector: Detector,
     point: PointDecoder,
+    /// Text features of [`VISUAL_PROMPT`], encoded on first use: every box-only prompt
+    /// would otherwise run the 24-layer text encoder on the same string
+    visual: OnceCell<TextFeatures>,
     // last, so the layers free their weights before the GPU handles go
     gpu: Gpu,
 }
@@ -119,6 +123,7 @@ impl Sam3 {
             text: TextEncoder::load(&gpu, &wts)?,
             detector: Detector::load(&gpu, &wts)?,
             point: PointDecoder::load(&gpu, &wts)?,
+            visual: OnceCell::new(),
             gpu,
         };
         model.gpu.synchronize()?;
@@ -157,16 +162,31 @@ impl Sam3 {
     }
 
     /// Detects every instance matching `text` and the box prompts (pass [`VISUAL_PROMPT`]
-    /// for boxes alone), keeping those scoring above [`SCORE_THRESHOLD`] in query order
+    /// for boxes alone), keeping those scoring above [`SCORE_THRESHOLD`] in query order.
+    /// Each call runs the text encoder on `text`, except for [`VISUAL_PROMPT`], whose
+    /// features are encoded on the first call and reused
     pub fn detect(&self, emb: &Embedding, text: &str, boxes: &[BoxPrompt]) -> Result<Vec<Detection>> {
         self.check(emb)?;
         let gpu = &self.gpu;
         let _r = range(c"detect");
-        let feats = {
+        let encode = || {
             let _r = range(c"text");
-            self.text.forward(gpu, &self.tokenizer.tokenize(text)?)?
+            self.text.forward(gpu, &self.tokenizer.tokenize(text)?)
         };
-        let out = self.detector.forward(gpu, &emb.detector, &feats, boxes)?;
+        let encoded;
+        let feats = if text == VISUAL_PROMPT {
+            match self.visual.get() {
+                Some(feats) => feats,
+                None => {
+                    let feats = encode()?;
+                    self.visual.get_or_init(|| feats)
+                }
+            }
+        } else {
+            encoded = encode()?;
+            &encoded
+        };
+        let out = self.detector.forward(gpu, &emb.detector, feats, boxes)?;
         let _r = range(c"postprocess");
         let presence = gpu.download(&out.presence)?[0];
         let logits = gpu.download(&out.logits)?;

@@ -1,7 +1,9 @@
 //! Times sam3rs with the osam benchmark protocol: dogs.jpg, model load and JPEG decode
 //! excluded, one warm-up then the median of 5 runs for the image encoder and for each
 //! prompt (point, box, negative box, text). Every prompt call ends with full-resolution
-//! masks on the host, and detection prompts re-run the text encoder, as osam does
+//! masks on the host. The text prompt re-runs the text encoder on every call, as osam
+//! does; box prompts reuse the cached features of the "visual" text, which osam and
+//! PyTorch re-encode each time
 //!
 //!     cargo run --release --example bench -- --precision bf16
 
