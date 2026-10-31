@@ -12,8 +12,11 @@ runs the whole image path on one CUDA stream without ONNX Runtime or PyTorch:
 - SAM 2 style point decoder with the two-pass mask refinement and hole filling
 
 Image features stay on the GPU between prompts. Kernels that cuBLAS doesn't cover are
-CUDA C++ in `kernels/sam3.cu`, shipped as prebuilt PTX in `kernels/ptx` that the driver
-compiles when the model loads, so building needs no CUDA toolkit.
+Rust, written with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) in
+[crates/sam3rs-kernels](crates/sam3rs-kernels). They ship as prebuilt PTX in
+`kernels/ptx` that the driver compiles when the model loads, so building sam3rs needs no
+CUDA toolkit or cuda-oxide. `scripts/build-ptx.sh` regenerates the PTX after a kernel
+change.
 
 There is also a Python package with numpy in and out; see
 [crates/sam3rs-python](crates/sam3rs-python/README.md).
@@ -174,8 +177,8 @@ Worst case over 43 checks:
 | Mode | Max score delta | Max box delta | Min mask IoU |
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
-| `tf32` | 0.0051 | 0.18 px | 0.9987 |
-| `bf16` | 0.0052 | 0.72 px | 0.9964 |
+| `tf32` | 0.0053 | 0.19 px | 0.9987 |
+| `bf16` | 0.0046 | 0.71 px | 0.9914 |
 
 ```sh
 cargo test --release --test parity -- --nocapture

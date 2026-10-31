@@ -21,16 +21,18 @@ use eyre::{Result, WrapErr, bail, ensure, eyre};
 
 use crate::blaslt::{BlasLt, Epilogue, Operands};
 
-/// Kernels from `kernels/sam3.cu` as PTX for compute capability 8.0, the first with the
-/// BF16 `mma.sync` the attention kernel uses. The driver JIT-compiles it for the GPU it
-/// runs on; `scripts/build-ptx.sh` regenerates both tiers
+/// Kernels from the cuda-oxide crate `crates/sam3rs-kernels` as PTX for compute
+/// capability 8.0, the first with the BF16 `mma.sync` the attention kernel uses. The
+/// driver JIT-compiles it for the GPU it runs on; `scripts/build-ptx.sh` regenerates both
+/// tiers
 static PTX_SM80: &str = concat!(include_str!("../kernels/ptx/sam3.sm80.ptx"), "\0");
 
 /// The same kernels as compute_120 PTX for RTX 50 series and newer. On an RTX 5090 it
 /// encodes about 3% faster than JIT-compiling the compute_80 tier
 static PTX_SM120: &str = concat!(include_str!("../kernels/ptx/sam3.sm120.ptx"), "\0");
 
-/// Oldest driver API the PTX (ISA 9.0) and cuBLAS 13 run on, as `cuDriverGetVersion` reports it
+/// Oldest driver API cuBLAS 13 runs on, as `cuDriverGetVersion` reports it. The PTX (ISA 8.7
+/// at most) needs no newer one
 const MIN_DRIVER: i32 = 13000;
 const CUBLAS_MAJOR: i32 = 13;
 
@@ -288,8 +290,8 @@ impl Gpu {
 
         // PTX JIT-compiles forward to any newer GPU, never back to an older one
         let ptx = if major >= 12 { PTX_SM120 } else { PTX_SM80 };
-        let module = unsafe { cur::module::load_data(ptx.as_ptr().cast()) }
-            .wrap_err("JIT-compile the sam3rs kernels (PTX ISA 9.0 needs NVIDIA driver r580 or newer)")?;
+        let module =
+            unsafe { cur::module::load_data(ptx.as_ptr().cast()) }.wrap_err("JIT-compile the sam3rs kernels")?;
 
         let mut handle = std::ptr::null_mut();
         unsafe {

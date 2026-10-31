@@ -1,0 +1,4 @@
+# the toolchain cuda-oxide main pins in its own rust-toolchain.toml
+[toolchain]
+channel = "1.99.1"
+components = ["rust-src", "rustc-dev", "llvm-tools", "rustfmt", "clippy"]
