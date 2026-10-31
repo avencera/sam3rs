@@ -351,8 +351,9 @@ const SPLIT_MIN_KEYS: usize = 1024;
 
 /// FP32 head-dim-32 attentions with at least this many queries and keys round K and V to
 /// 16 bits once up front and run in 128-row blocks: each block re-reads all of K and V,
-/// which made the fusion encoder's self-attention L2-bound. The BF16 encoder's global
-/// attention measured slower in 128-row blocks
+/// which made the fusion encoder's self-attention L2-bound. TF32 mode keeps K and V in
+/// FP32 and uses its own 128-row kernel. The BF16 encoder's global attention measured
+/// slower in 128-row blocks
 const TALL_MIN: usize = 512;
 
 /// Box relative position bias in factored form: for head `h`, query row `1 + q` and key
@@ -397,16 +398,22 @@ pub fn attention(
     // the box RPB's dx and dy are `[heads, lq - 1, side]` each, heads being the batch
     let rpb_len = |r: BoxRpb| batch * (lq - 1) * r.side;
 
-    if flash_ok(gpu, &[q, k, v, out], hd, &mask) {
-        let kernel = match (q.bf16, hd, mask.rpb) {
-            (true, _, _) => "flash_attn_bf16_d64",
-            (false, 32, Some(_)) => "flash_attn_rpb_d32",
-            (false, 32, None) => "flash_attn_d32",
+    let tf32 = tf32_flash_ok(gpu, &[q, k, v, out], hd, &mask);
+    if tf32 || flash_ok(gpu, &[q, k, v, out], hd, &mask) {
+        let tall = !q.bf16 && hd == 32 && mask.rpb.is_none() && lq >= TALL_MIN && lk >= TALL_MIN;
+        let kernel = match (tf32, q.bf16, hd, mask.rpb) {
+            (true, _, 32, Some(_)) => "flash_attn_tf32_rpb_d32",
+            (true, _, 32, None) if tall => "flash_attn_tf32_tall_d32",
+            (true, _, 32, None) => "flash_attn_tf32_d32",
+            (true, _, _, _) => "flash_attn_tf32_d64",
+            (false, true, _, _) => "flash_attn_bf16_d64",
+            (false, false, 32, Some(_)) => "flash_attn_rpb_d32",
+            (false, false, 32, None) => "flash_attn_d32",
             _ => "flash_attn_d64",
         };
         let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
         let view = |(m, rows): (Mat, usize)| [Arg::slice(m.ptr, extent(m, rows)), Arg::from(m.ld), Arg::from(m.stride)];
-        if !q.bf16 && hd == 32 && mask.rpb.is_none() && lq >= TALL_MIN && lk >= TALL_MIN {
+        if tall && !tf32 {
             // K then V as FP16 [lk, batch * hd] each in one buffer, exactly as the kernel
             // would round them while staging; one output slice lets each thread own one
             // 8-value group of it
@@ -426,7 +433,9 @@ pub fn attention(
             return gpu.launch("flash_attn_kv16_d32", grid, (256, 1, 1), 0, args);
         }
 
-        let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
+        // the tall TF32 kernel takes 128 query rows a block, with 256 threads
+        let rows = if tall { 128 } else { 64 };
+        let grid = (lq.div_ceil(rows) as u32, batch as u32, 1);
         let mut args = Vec::with_capacity(16);
         for m in [(out, lq), (q, lq), (k, lk), (v, lk)] {
             args.extend(view(m));
@@ -453,7 +462,7 @@ pub fn attention(
             None => args.push(key_pad),
         }
         args.extend([part.as_ref().map_or(Arg::EMPTY, Arg::from), Arg::from(chunk)]);
-        gpu.launch(kernel, (grid.0, grid.1, splits as u32), (128, 1, 1), 0, args)?;
+        gpu.launch(kernel, (grid.0, grid.1, splits as u32), (rows as u32 * 2, 1, 1), 0, args)?;
         let Some(part) = part else { return Ok(()) };
         // the kernel takes the split count from the length of `part`
         let warps = batch * lq;
@@ -483,6 +492,27 @@ pub fn attention(
     launch!(gpu, "softmax", ((batch * lq) as u32, 1, 1), B256, 0;
         &scores, lq, bias_arg, bias_div, key_pad, mask.causal as i32)?;
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
+}
+
+/// TF32 mode fuses attention for FP32 q/k/v with head dims 32 and 64 on TF32 tensor
+/// cores, with the same masks as BF16 mode's fused kernel: key padding, or the box RPB at
+/// head dim 32 without key padding. Additive bias and causal masks stay materialized. The
+/// kernels load q/k/v in 16-byte chunks and store float2
+fn tf32_flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
+    let aligned = |m: &Mat, elems: usize| {
+        !m.trans
+            && m.ptr.is_multiple_of(elems as u64 * 4)
+            && m.ld.is_multiple_of(elems)
+            && m.stride.is_multiple_of(elems)
+    };
+    gpu.precision() == Precision::Tf32
+        && !q.bf16
+        && (hd == 32 || hd == 64)
+        && (mask.rpb.is_none() || (hd == 32 && mask.key_pad == 0))
+        && mask.bias == 0
+        && !mask.causal
+        && aligned(out, 2)
+        && [q, k, v].iter().all(|m| aligned(m, 4))
 }
 
 /// The fused kernel covers BF16 mode for FP32 q/k/v with head dims 32 and 64, which it

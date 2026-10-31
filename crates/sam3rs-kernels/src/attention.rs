@@ -27,9 +27,9 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, launch_contract, ptx_asm, 
 use crate::common::{Bf16, F16, Packed8, ldg_u4, ldg4, ldg8, math, pack_f16, stg2};
 use crate::mma::{FragA, Mma16, SharedTile, sts2, sts4};
 
-const FA_WARPS: usize = 4;
+pub(crate) const FA_WARPS: usize = 4;
 /// Keys per tile
-const FA_BN: usize = 64;
+pub(crate) const FA_BN: usize = 64;
 /// Upper bound on each thread's chunks when staging a tile, 8 for a D = 64 FP32 tile. The
 /// staging loops run to it, fully unrolled, and skip chunks past the tile, a test that folds
 /// away once inlining makes the tile size constant; a bound that is only constant after
@@ -38,19 +38,19 @@ const FA_BN: usize = 64;
 /// because the shared stores are asm with a memory clobber that no load moves above: one
 /// load round trip per chunk left BF16 encode 2.4% slower than nvcc's build, which unrolled
 /// 4x and issued the loads together
-const STAGE_MAX_ITERS: usize = 8;
+pub(crate) const STAGE_MAX_ITERS: usize = 8;
 /// Score fragments per tile: one per 8 keys
-const SJ: usize = FA_BN / 8;
+pub(crate) const SJ: usize = FA_BN / 8;
 
 #[inline(always)]
-fn ex2(x: f32) -> f32 {
+pub(crate) fn ex2(x: f32) -> f32 {
     ex2_approx_ftz_f32(x)
 }
 
 /// Traps when the host's geometry doesn't fit the buffers it passed, as a failed slice
 /// index would
 #[inline(always)]
-fn require(ok: bool) {
+pub(crate) fn require(ok: bool) {
     if !ok {
         panic!();
     }
@@ -64,13 +64,13 @@ fn require(ok: bool) {
 /// a check. The last row index goes through u32 so it widens by zero extension, one
 /// 32x32 multiply instead of a sign-extended 64x64 one
 #[inline(always)]
-fn rows_fit(len: usize, base: usize, row0: i32, rows: i32, ld: u32, width: usize) -> bool {
+pub(crate) fn rows_fit(len: usize, base: usize, row0: i32, rows: i32, ld: u32, width: usize) -> bool {
     rows <= 0 || base + (row0 + rows - 1) as u32 as usize * ld as usize + width <= len
 }
 
 /// One float through the read-only path
 #[inline(always)]
-unsafe fn ldg_nc(p: *const f32) -> f32 {
+pub(crate) unsafe fn ldg_nc(p: *const f32) -> f32 {
     let v: f32;
     unsafe {
         ptx_asm!(
@@ -84,7 +84,7 @@ unsafe fn ldg_nc(p: *const f32) -> f32 {
 
 /// Two floats from an 8-byte aligned address through the read-only path
 #[inline(always)]
-unsafe fn ldg2_nc(p: *const f32) -> (f32, f32) {
+pub(crate) unsafe fn ldg2_nc(p: *const f32) -> (f32, f32) {
     let (a, b): (f32, f32);
     unsafe {
         ptx_asm!(
@@ -100,17 +100,17 @@ unsafe fn ldg2_nc(p: *const f32) -> (f32, f32) {
 /// A batched strided matrix in a slice: batch entry `b`, row `i` starts at `b * stride + i
 /// * ld`
 #[derive(Clone, Copy)]
-struct Batched<'a, T> {
-    data: &'a [T],
-    ld: u32,
-    stride: u32,
+pub(crate) struct Batched<'a, T> {
+    pub(crate) data: &'a [T],
+    pub(crate) ld: u32,
+    pub(crate) stride: u32,
 }
 
 impl<'a, T> Batched<'a, T> {
     /// Rows `[row0, row0 + rows)` of batch entry `b`, `width` elements each, or `None` if
     /// they don't all lie in the slice
     #[inline(always)]
-    fn rows(self, b: usize, row0: i32, rows: i32, width: usize) -> Option<Rows<T>> {
+    pub(crate) fn rows(self, b: usize, row0: i32, rows: i32, width: usize) -> Option<Rows<T>> {
         let base = b * self.stride as usize;
         let ptr = self.data.as_ptr().wrapping_add(base + row0 as u32 as usize * self.ld as usize);
         rows_fit(self.data.len(), base, row0, rows, self.ld, width).then_some(Rows { ptr, ld: self.ld as usize, rows })
@@ -119,10 +119,10 @@ impl<'a, T> Batched<'a, T> {
 
 /// Rows `[0, rows)` of a strided matrix, every element of the declared width proven in
 /// bounds when it was made by [`Batched::rows`]
-struct Rows<T> {
+pub(crate) struct Rows<T> {
     ptr: *const T,
     ld: usize,
-    rows: i32,
+    pub(crate) rows: i32,
 }
 
 impl<T> Clone for Rows<T> {
@@ -137,7 +137,7 @@ impl<T> Copy for Rows<T> {}
 impl<T> Rows<T> {
     /// The rows from `r` on; `0 <= r <= rows`
     #[inline(always)]
-    fn skip(self, r: i32) -> Self {
+    pub(crate) fn skip(self, r: i32) -> Self {
         Self { ptr: self.ptr.wrapping_add(r as u32 as usize * self.ld), ld: self.ld, rows: self.rows - r }
     }
 
@@ -146,7 +146,7 @@ impl<T> Rows<T> {
     /// # Safety
     /// `r < rows` and `c` is within the width the rows were checked for
     #[inline(always)]
-    unsafe fn at(self, r: usize, c: usize) -> *const T {
+    pub(crate) unsafe fn at(self, r: usize, c: usize) -> *const T {
         unsafe { self.ptr.add(r * self.ld + c) }
     }
 }
@@ -377,10 +377,10 @@ struct Tiles<Q, const LD: usize> {
 /// `dy[h, q, y] + dx[h, q, x]`, both `[heads, lq - 1, side]`; row 0 (the presence token)
 /// gets none. `side` must be even, so each thread's key pair shares a grid row
 #[derive(Clone, Copy)]
-struct Rpb<'a> {
-    dx: &'a [f32],
-    dy: &'a [f32],
-    side: u32,
+pub(crate) struct Rpb<'a> {
+    pub(crate) dx: &'a [f32],
+    pub(crate) dy: &'a [f32],
+    pub(crate) side: u32,
 }
 
 /// The attention of one block of `16 * WARPS` query rows

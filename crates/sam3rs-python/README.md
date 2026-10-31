@@ -63,8 +63,8 @@ encode once and run as many prompts as you need against it.
 the fusion encoder's feed-forward layers in BF16 with fused attention, and every other
 matrix multiply on tensor cores with BF16 or TF32 inputs. `precision="tf32"` keeps FP32
 weights and activations but runs the matrix multiplies on TF32 tensor cores, as ONNX
-Runtime does for FP32 models. `precision="fp32"` is the strict FP32 reference path. On
-an RTX 5090, encoding an image takes about 34 ms in BF16, 95 ms in TF32 and 147 ms in
+Runtime does for FP32 models, with most attention fused on TF32 tensor cores.
+`precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image takes about 34 ms in BF16, 95 ms in TF32 and 147 ms in
 FP32; a point prompt 2.0 to 2.3 ms; a box prompt 5.8, 22 and 28 ms; and a text prompt
 7.2, 24 and 30 ms.
 
