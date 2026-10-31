@@ -32,8 +32,8 @@ There is also a Python package with numpy in and out; see
   the detector's box-biased cross-attention, also run the fused kernel, which rounds q,
   k and v to FP16 and sums scores and P @ V tiles in FP16.
 - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
-  ONNX Runtime's CUDA provider runs FP32 models by default. FP32 weights and
-  activations, materialized attention.
+  ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
+  fused into cuBLASLt epilogues. FP32 weights and activations, materialized attention.
 - `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
   is the reference path for parity checks.
 

@@ -349,9 +349,11 @@ impl Gpu {
         };
         unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
 
+        // FP32 mode stays on plain cuBLAS GEMMs as the reference; the others fuse bias and
+        // activation into cuBLASLt epilogues
         let lt = match precision {
-            Precision::Fp32 | Precision::Tf32 => None,
-            Precision::Bf16 => Some(BlasLt::new()?),
+            Precision::Fp32 => None,
+            Precision::Tf32 | Precision::Bf16 => Some(BlasLt::new()?),
         };
         let fp32_operands = match fp32_compute {
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => Operands::F32FastTf32,
@@ -570,13 +572,13 @@ impl Gpu {
         bias: u64,
         epilogue: Epilogue,
     ) -> Result<()> {
-        let lt = self.lt.as_ref().ok_or_else(|| eyre!("cuBLASLt linears need Precision::Bf16"))?;
+        let lt = self.lt.as_ref().ok_or_else(|| eyre!("BF16 cuBLASLt linears need Precision::Bf16"))?;
         lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
     }
 
     /// [`Self::linear_bf16`] for FP32 `x`, `w` and `out`, with this precision's FP32
     /// compute type. Returns false without launching anything when there is no cuBLASLt
-    /// handle (FP32 and TF32 modes), so the caller falls back to [`Self::gemm`]
+    /// handle (FP32 mode), so the caller falls back to [`Self::gemm`]
     #[allow(clippy::too_many_arguments)]
     pub fn linear_f32(
         &self,
