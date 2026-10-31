@@ -749,7 +749,7 @@ pub fn group_norm_stats<'a>(
     let chunk = 256usize;
     let blocks = hw.div_ceil(chunk);
     let part = gpu.empty(&[groups * blocks, 2])?;
-    launch!(gpu, "group_stats", (blocks as u32, groups as u32, 1), (32, 1, 1), 0;
+    launch!(gpu, "group_stats", (blocks as u32, groups as u32, 1), B256, 0;
         &part, x, hw as u64, c, groups, chunk)?;
     let stats = gpu.empty(&[groups, 2])?;
     launch!(gpu, "group_stats_reduce", (groups as u32, 1, 1), B256, 0; &stats, &part, blocks)?;

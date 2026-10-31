@@ -562,16 +562,20 @@ extern "C" __global__ void dot_scores(float* scores, const float* hs, const floa
 }
 
 // GroupNorm statistics for channels-last x [hw, c]: one block per (group, chunk) writes
-// its partial sums to part[(group * gridDim.x + chunk) * 2 + {0, 1}]
+// its partial sums to part[(group * gridDim.x + chunk) * 2 + {0, 1}]. Warp i takes pixels
+// i, i + warps, ... and lanes the group's channels, so every load is one coalesced row
+// segment and each block keeps several in flight
 extern "C" __global__ void group_stats(float* part, const float* x, long long hw, int c, int groups, int chunk) {
     __shared__ float scratch[32];
     int g = blockIdx.y;
     int cg = c / groups;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
     long long start = (long long)blockIdx.x * chunk;
     long long end = min(start + chunk, hw);
     float s = 0.f, s2 = 0.f;
-    for (long long p = start; p < end; p++) {
-        for (int k = threadIdx.x; k < cg; k += blockDim.x) {
+#pragma unroll 4
+    for (long long p = start + warp; p < end; p += warps) {
+        for (int k = lane; k < cg; k += 32) {
             float v = x[p * c + g * cg + k];
             s += v;
             s2 += v * v;
