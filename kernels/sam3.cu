@@ -674,6 +674,19 @@ __device__ __forceinline__ uint32_t pack_f16(float lo, float hi) {
     return *reinterpret_cast<uint32_t*>(&v);
 }
 
+__device__ __forceinline__ float ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t* r, const void* p) {
+    uint32_t addr = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p) {
     uint32_t addr = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -805,53 +818,86 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
         fa_stage<D>(vs, LDS, v + k0 * v_ld, v_ld, k_end - k0);
         __syncthreads();
 
-        float s[FA_BN / 8][4];
+        float s[FA_BN / 8][4] = {};
 #pragma unroll
-        for (int j = 0; j < FA_BN / 8; j++) {
-            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+        for (int j = 0; j < FA_BN / 8; j += 2) {
 #pragma unroll
             for (int kk = 0; kk < D / 16; kk++) {
-                const __nv_bfloat16* p = ks + (j * 8 + g) * LDS + kk * 16 + t * 2;
-                uint32_t bf[2] = {*reinterpret_cast<const uint32_t*>(p), *reinterpret_cast<const uint32_t*>(p + 8)};
+                // matrices: keys j*8.. at k and k+8, then keys (j+1)*8.. at k and k+8
+                int mi = lane / 8, ri = lane % 8;
+                const __nv_bfloat16* p = ks + ((j + mi / 2) * 8 + ri) * LDS + kk * 16 + (mi & 1) * 8;
+                uint32_t bf[4];
+                ldmatrix_x4(bf, p);
                 mma_bf16(s[j], qa[kk], bf);
+                mma_bf16(s[j + 1], qa[kk], bf + 2);
             }
         }
 
-        float mx[2] = {m[0], m[1]};
-#pragma unroll
-        for (int j = 0; j < FA_BN / 8; j++) {
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int col = k0 + j * 8 + t * 2 + (e & 1);
-                float x = s[j][e] * scale_log2;
-                if constexpr (RPB) {
-                    const float* dx = rdx[e / 2];
-                    if (dx && col < lk) {
-                        int y = col / side, xx = col - y * side, heads = gridDim.y;
-                        x += (__ldg(rdy[e / 2] + y * heads) + __ldg(dx + xx * heads)) * 1.4426950408889634f;
-                    }
-                }
-                if (col >= k_end || (key_pad && key_pad[col])) x = -INFINITY;
-                s[j][e] = x;
-                mx[e / 2] = fmaxf(mx[e / 2], x);
-            }
-        }
         float corr[2];
+        // a whole tile of real keys without padding or bias: the softmax needs no masking
+        // or infinity guards, and the scale folds into the exponent's FMA. A row max of
+        // -inf only comes from the first tile, where corr = ex2(-inf) = 0 is right
+        if (!RPB && !key_pad && k0 + FA_BN <= k_end) {
+            float mx[2] = {-INFINITY, -INFINITY};
 #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
-            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
-            corr[r] = mx[r] == -INFINITY ? 1.f : exp2f(m[r] - mx[r]);
-            m[r] = mx[r];
-            l[r] *= corr[r];
-        }
+            for (int j = 0; j < FA_BN / 8; j++) {
+                mx[0] = fmaxf(mx[0], fmaxf(s[j][0], s[j][1]));
+                mx[1] = fmaxf(mx[1], fmaxf(s[j][2], s[j][3]));
+            }
 #pragma unroll
-        for (int j = 0; j < FA_BN / 8; j++) {
+            for (int r = 0; r < 2; r++) {
+                mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+                mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+                mx[r] = fmaxf(m[r], mx[r] * scale_log2);
+                corr[r] = ex2(m[r] - mx[r]);
+                m[r] = mx[r];
+                l[r] *= corr[r];
+            }
 #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                float p = m[e / 2] == -INFINITY ? 0.f : exp2f(s[j][e] - m[e / 2]);
-                s[j][e] = p;
-                l[e / 2] += p;
+            for (int j = 0; j < FA_BN / 8; j++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    float p = ex2(fmaf(s[j][e], scale_log2, -m[e / 2]));
+                    s[j][e] = p;
+                    l[e / 2] += p;
+                }
+            }
+        } else {
+            float mx[2] = {m[0], m[1]};
+#pragma unroll
+            for (int j = 0; j < FA_BN / 8; j++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    int col = k0 + j * 8 + t * 2 + (e & 1);
+                    float x = s[j][e] * scale_log2;
+                    if constexpr (RPB) {
+                        const float* dx = rdx[e / 2];
+                        if (dx && col < lk) {
+                            int y = col / side, xx = col - y * side, heads = gridDim.y;
+                            x += (__ldg(rdy[e / 2] + y * heads) + __ldg(dx + xx * heads)) * 1.4426950408889634f;
+                        }
+                    }
+                    if (col >= k_end || (key_pad && key_pad[col])) x = -INFINITY;
+                    s[j][e] = x;
+                    mx[e / 2] = fmaxf(mx[e / 2], x);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+                mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+                corr[r] = mx[r] == -INFINITY ? 1.f : ex2(m[r] - mx[r]);
+                m[r] = mx[r];
+                l[r] *= corr[r];
+            }
+#pragma unroll
+            for (int j = 0; j < FA_BN / 8; j++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    float p = m[e / 2] == -INFINITY ? 0.f : ex2(s[j][e] - m[e / 2]);
+                    s[j][e] = p;
+                    l[e / 2] += p;
+                }
             }
         }
 #pragma unroll
