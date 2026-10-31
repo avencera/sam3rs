@@ -605,7 +605,11 @@ impl Conv3x3 {
             let (dy, dx) = (t / 3, t % 3);
             let input = Mat::new(xp.ptr() + ((dy * wp + dx) * c * 4) as u64, c);
             let weight = Mat::new(self.w.at(t * o * c), c).t();
-            gpu.gemm(h * wp, o, c, input, weight, Mat::new(yp.ptr(), o), 1, 1.0, if t == 0 { 0.0 } else { 1.0 })?;
+            let beta = if t == 0 { 0.0 } else { 1.0 };
+            // cuBLASLt where there is a handle (TF32 mode), for its tuned algorithm choice
+            if !gpu.linear_f32((h * wp, o, c), input.ptr, c, weight.ptr, yp.ptr(), beta, 0, Epilogue::None)? {
+                gpu.gemm(h * wp, o, c, input, weight, Mat::new(yp.ptr(), o), 1, 1.0, beta)?;
+            }
         }
         let y = gpu.empty(&[h * w, o])?;
         launch!(gpu, "crop_bias", ew(y.len()), B256, 0; &y, &yp, &self.b, w, o)?;
