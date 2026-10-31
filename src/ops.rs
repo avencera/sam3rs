@@ -376,8 +376,8 @@ pub fn attention(
         let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
         let view = |m: Mat| [Arg::from(m.ptr), Arg::from(m.ld as u64), Arg::from(m.stride as u64)];
         if !q.bf16 && hd == 32 && mask.rpb.is_none() && lq >= TALL_MIN && lk >= TALL_MIN {
-            // K as BF16 and V as FP16 [lk, batch * hd], exactly as the kernel would round
-            // them while staging
+            // K and V as FP16 [lk, batch * hd], exactly as the kernel would round them while
+            // staging
             let kd = gpu.alloc_bytes(lk * batch * hd * 2)?;
             let vd = gpu.alloc_bytes(lk * batch * hd * 2)?;
             launch!(gpu, "kv_to_16", ew(lk * batch * hd / 8), B256, 0;
@@ -447,10 +447,10 @@ pub fn attention(
 }
 
 /// The fused kernel covers BF16 mode for FP32 q/k/v with head dims 32 and 64, which it
-/// rounds to BF16 (q, k) and FP16 (v) for `mma.sync`, and BF16 q/k/v with head dim 64,
-/// without additive bias or causal masking, except the box RPB, which it fuses for FP32
-/// q/k/v with head dim 32 and no key padding. It loads q/k/v in 16-byte chunks and stores
-/// float2. BF16 q/k/v must use it, since the materialized path reads FP32
+/// rounds to FP16 for `mma.sync`, and BF16 q/k/v with head dim 64, without additive bias
+/// or causal masking, except the box RPB, which it fuses for FP32 q/k/v with head dim 32
+/// and no key padding. It loads q/k/v in 16-byte chunks and stores float2. BF16 q/k/v
+/// must use it, since the materialized path reads FP32
 fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
     let aligned = |m: &Mat, elems: usize, size: usize| {
         !m.trans

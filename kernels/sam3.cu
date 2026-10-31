@@ -689,8 +689,8 @@ extern "C" __global__ void clamp(float* x, long long n, float lo, float hi) {
 // ---------------------------------------------------------------------------------------
 // fused attention (FlashAttention-2 style) for the BF16 precision mode
 //
-// FP32 q/k/v are rounded to BF16 (V to FP16) as they are staged in shared memory, scores
-// and the softmax run in FP32 with an online max, and P @ V runs on FP16 tensor cores,
+// FP32 q/k/v are rounded to FP16 as they are staged in shared memory (see qk_type), the
+// softmax runs in FP32 with an online max, and P @ V runs on FP16 tensor cores,
 // accumulating each 64-key tile in FP16 before adding it to FP32 totals. Each warp owns
 // 16 query rows; a block walks all keys in tiles of 64, so the [lq, lk] score matrix
 // never reaches global memory
@@ -800,6 +800,20 @@ __device__ __forceinline__ void fa_stage(__half* dst, int lds, const __half* src
     }
 }
 
+// q and k as staged for QK^T: FP32 sources round to FP16, whose 3 extra mantissa bits over
+// BF16 also cover the error of summing each score's D products in FP16, at twice the
+// FP32-accumulate rate on GeForce parts. BF16 sources stay BF16, with FP32 sums
+template <typename T>
+struct qk_type {
+    using type = __half;
+    static constexpr bool f16 = true;
+};
+template <>
+struct qk_type<__nv_bfloat16> {
+    using type = __nv_bfloat16;
+    static constexpr bool f16 = false;
+};
+
 // Batch entry blockIdx.y reads q + y * q_stride etc.; row i of each view starts at
 // i * ld. scale_log2 = log2(e) / sqrt(D). Keys with key_pad[j] != 0 are skipped; rows
 // with no valid key produce zeros, like the softmax kernel
@@ -823,8 +837,9 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
                            int side = 0, float* part = nullptr, int kv_chunk = 0) {
     constexpr int BM = 16 * WARPS;
     constexpr int LDS = D + 8;  // padding keeps fragment loads bank-conflict free
-    __shared__ __align__(16) __nv_bfloat16 qs[BM * LDS];
-    __shared__ __align__(16) __nv_bfloat16 ks[FA_BN * LDS];
+    using QK = typename qk_type<T>::type;
+    __shared__ __align__(16) QK qs[BM * LDS];
+    __shared__ __align__(16) QK ks[FA_BN * LDS];
     __shared__ __align__(16) __half vs[FA_BN * LDS];
 
     int b = blockIdx.y, q0 = blockIdx.x * BM;
@@ -840,7 +855,7 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
     uint32_t qa[D / 16][4];
 #pragma unroll
     for (int kk = 0; kk < D / 16; kk++) {
-        const __nv_bfloat16* p = qs + (wr + g) * LDS + kk * 16 + t * 2;
+        const QK* p = qs + (wr + g) * LDS + kk * 16 + t * 2;
         qa[kk][0] = *reinterpret_cast<const uint32_t*>(p);
         qa[kk][1] = *reinterpret_cast<const uint32_t*>(p + 8 * LDS);
         qa[kk][2] = *reinterpret_cast<const uint32_t*>(p + 8);
@@ -876,17 +891,34 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
         __syncthreads();
 
         float s[FA_BN / 8][4] = {};
+        uint32_t sh[FA_BN / 8][2] = {};
 #pragma unroll
         for (int j = 0; j < FA_BN / 8; j += 2) {
 #pragma unroll
             for (int kk = 0; kk < D / 16; kk++) {
                 // matrices: keys j*8.. at k and k+8, then keys (j+1)*8.. at k and k+8
                 int mi = lane / 8, ri = lane % 8;
-                const __nv_bfloat16* p = ks + ((j + mi / 2) * 8 + ri) * LDS + kk * 16 + (mi & 1) * 8;
+                const QK* p = ks + ((j + mi / 2) * 8 + ri) * LDS + kk * 16 + (mi & 1) * 8;
                 uint32_t bf[4];
                 ldmatrix_x4(bf, p);
-                mma_bf16(s[j], qa[kk], bf);
-                mma_bf16(s[j + 1], qa[kk], bf + 2);
+                if constexpr (qk_type<T>::f16) {
+                    mma_f16(sh[j], qa[kk], bf);
+                    mma_f16(sh[j + 1], qa[kk], bf + 2);
+                } else {
+                    mma_bf16(s[j], qa[kk], bf);
+                    mma_bf16(s[j + 1], qa[kk], bf + 2);
+                }
+            }
+        }
+        if constexpr (qk_type<T>::f16) {
+#pragma unroll
+            for (int j = 0; j < FA_BN / 8; j++) {
+                float2 lo = __half22float2(*reinterpret_cast<__half2*>(&sh[j][0]));
+                float2 hi = __half22float2(*reinterpret_cast<__half2*>(&sh[j][1]));
+                s[j][0] = lo.x;
+                s[j][1] = lo.y;
+                s[j][2] = hi.x;
+                s[j][3] = hi.y;
             }
         }
 
@@ -1072,16 +1104,16 @@ extern "C" __global__ void __launch_bounds__(FA_WARPS * 32)
 // FP32 q with K and V converted once by kv_to_16, in 128-row blocks
 extern "C" __global__ void __launch_bounds__(256)
     flash_attn_kv16_d32(float* o, long long o_ld, long long o_stride, const float* q, long long q_ld, long long q_stride,
-                        const __nv_bfloat16* k, long long k_ld, long long k_stride, const __half* v, long long v_ld,
+                        const __half* k, long long k_ld, long long k_stride, const __half* v, long long v_ld,
                         long long v_stride, int lq, int lk, float scale_log2, const uint8_t* key_pad) {
-    flash_attn<32, float, false, 8, __nv_bfloat16, __half>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v,
+    flash_attn<32, float, false, 8, __half, __half>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v,
                                                            v_ld, v_stride, lq, lk, scale_log2, key_pad);
 }
 
-// batch strided FP32 views k and v [batch][lk, hd] -> contiguous kd (BF16) and vd (FP16)
+// batch strided FP32 views k and v [batch][lk, hd] -> contiguous FP16 kd and vd
 // [lk, batch * hd], 8 values per thread, for flash_attn_kv16: rounding them once instead
 // of in every query block
-extern "C" __global__ void kv_to_16(__nv_bfloat16* kd, __half* vd, const float* k, long long k_ld, long long k_stride,
+extern "C" __global__ void kv_to_16(__half* kd, __half* vd, const float* k, long long k_ld, long long k_stride,
                                     const float* v, long long v_ld, long long v_stride, int lk, int batch, int hd) {
     long long n = (long long)lk * batch * hd / 8;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
@@ -1092,8 +1124,8 @@ extern "C" __global__ void kv_to_16(__nv_bfloat16* kd, __half* vd, const float* 
         const float* vs = v + b * v_stride + row * v_ld + d;
         float4 k0 = *reinterpret_cast<const float4*>(ks), k1 = *reinterpret_cast<const float4*>(ks + 4);
         float4 v0 = *reinterpret_cast<const float4*>(vs), v1 = *reinterpret_cast<const float4*>(vs + 4);
-        *reinterpret_cast<uint4*>(kd + e) = make_uint4(pack_bf16(k0.x, k0.y), pack_bf16(k0.z, k0.w),
-                                                       pack_bf16(k1.x, k1.y), pack_bf16(k1.z, k1.w));
+        *reinterpret_cast<uint4*>(kd + e) = make_uint4(pack_f16(k0.x, k0.y), pack_f16(k0.z, k0.w),
+                                                       pack_f16(k1.x, k1.y), pack_f16(k1.z, k1.w));
         *reinterpret_cast<uint4*>(vd + e) = make_uint4(pack_f16(v0.x, v0.y), pack_f16(v0.z, v0.w),
                                                        pack_f16(v1.x, v1.y), pack_f16(v1.z, v1.w));
     }
