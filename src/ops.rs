@@ -573,9 +573,58 @@ impl Conv3x3 {
         Ok(y)
     }
 
-    /// One K = 9C GEMM per chunk of output pixels, instead of nine GEMMs that each read
-    /// and rewrite the whole FP32 output
+    /// The conv of `fine + up2(coarse)` over a fine map of `h` x `w` pixels, where `up2` is
+    /// nearest 2x upsampling and `norm`, if any, is still pending on `coarse`. BF16 mode
+    /// computes that input inside the im2col; the other modes apply `norm` to `coarse` in
+    /// place and materialize the sum
+    pub fn forward_up(
+        &self,
+        gpu: &Gpu,
+        fine: &Tensor,
+        coarse: &Tensor,
+        norm: Option<&PendingNorm>,
+        h: usize,
+        w: usize,
+    ) -> Result<Tensor> {
+        let c = self.w.shape()[2];
+        assert_eq!(fine.shape(), &[h * w, c]);
+        assert_eq!(coarse.shape(), &[h * w / 4, c]);
+        let Some(w16) = &self.w16 else {
+            if let Some(norm) = norm {
+                norm.apply(gpu, coarse)?;
+            }
+            let up = gpu.empty(&[h * w, c])?;
+            launch!(gpu, "upsample2_add", ew(up.len()), B256, 0; &up, fine, coarse, h / 2, w / 2, c)?;
+            return self.forward(gpu, &up, h, w);
+        };
+
+        assert!(norm.is_none_or(|n| (c / n.groups).is_multiple_of(8)), "im2col normalizes 8 channels of one group");
+        let (stats, gw, gb) = norm.map_or((0, 0, 0), |n| (n.stats.ptr(), n.w.ptr(), n.b.ptr()));
+        let (groups, eps, act) = norm.map_or((1, 0.0, ACT_NONE), |n| (n.groups, n.eps, n.act));
+        self.im2col_gemm(gpu, w16, h, w, |cols, p0, n| {
+            launch!(gpu, "im2col3x3_up_bf16", ew(n * 9 * c / 8), B256, 0;
+                cols, fine, coarse, stats, gw, gb, groups, eps, act, h, w, c, p0 as u64, n as u64)
+        })
+    }
+
     fn forward_im2col(&self, gpu: &Gpu, x: &Tensor, w16: &Buf, h: usize, w: usize) -> Result<Tensor> {
+        let c = self.w.shape()[2];
+        self.im2col_gemm(gpu, w16, h, w, |cols, p0, n| {
+            launch!(gpu, "im2col3x3_bf16", ew(n * 9 * c / 8), B256, 0; cols, x, h, w, c, p0 as u64, n as u64)
+        })
+    }
+
+    /// One K = 9C GEMM per chunk of output pixels, instead of nine GEMMs that each read
+    /// and rewrite the whole FP32 output. `im2col(cols, p0, n)` writes the BF16 rows of
+    /// output pixels `[p0, p0 + n)`
+    fn im2col_gemm(
+        &self,
+        gpu: &Gpu,
+        w16: &Buf,
+        h: usize,
+        w: usize,
+        im2col: impl Fn(u64, usize, usize) -> Result<()>,
+    ) -> Result<Tensor> {
         let (o, c) = (self.w.shape()[1], self.w.shape()[2]);
         assert!(c.is_multiple_of(8), "im2col copies 8 channels at a time");
         let (pixels, k) = (h * w, 9 * c);
@@ -583,8 +632,7 @@ impl Conv3x3 {
         let cols = gpu.alloc_bytes(pixels.min(IM2COL_ROWS) * k * 2)?;
         for p0 in (0..pixels).step_by(IM2COL_ROWS) {
             let n = IM2COL_ROWS.min(pixels - p0);
-            launch!(gpu, "im2col3x3_bf16", ew(n * 9 * c / 8), B256, 0;
-                cols.ptr(), x, h, w, c, p0 as u64, n as u64)?;
+            im2col(cols.ptr(), p0, n)?;
             let out = (y.at(p0 * o), false);
             gpu.linear_bf16((n, o, k), cols.ptr(), k, w16.ptr(), out, 0.0, self.b.ptr(), Epilogue::Bias)?;
         }
@@ -685,8 +733,18 @@ impl Attention {
     }
 }
 
-/// GroupNorm over channels-last `[hw, c]` in place, with a fused activation
-pub fn group_norm(gpu: &Gpu, x: &Tensor, groups: usize, w: &Tensor, b: &Tensor, eps: f32, act: i32) -> Result<()> {
+/// GroupNorm over channels-last `[hw, c]` with a fused activation, in two halves: this
+/// computes the per-group statistics, and the returned norm applies them later, in place
+/// or as [`Conv3x3::forward_up`] reads its input
+pub fn group_norm_stats<'a>(
+    gpu: &Gpu,
+    x: &Tensor,
+    groups: usize,
+    w: &'a Tensor,
+    b: &'a Tensor,
+    eps: f32,
+    act: i32,
+) -> Result<PendingNorm<'a>> {
     let (hw, c) = (x.rows(), x.cols());
     let chunk = 256usize;
     let blocks = hw.div_ceil(chunk);
@@ -695,7 +753,27 @@ pub fn group_norm(gpu: &Gpu, x: &Tensor, groups: usize, w: &Tensor, b: &Tensor, 
         &part, x, hw as u64, c, groups, chunk)?;
     let stats = gpu.empty(&[groups, 2])?;
     launch!(gpu, "group_stats_reduce", (groups as u32, 1, 1), B256, 0; &stats, &part, blocks)?;
-    launch!(gpu, "group_norm_apply", ew(x.len()), B256, 0; x, &stats, w, b, hw as u64, c, groups, eps, act)
+    Ok(PendingNorm { stats, w, b, groups, eps, act })
+}
+
+/// A group norm whose per-group sums are computed but not yet applied
+pub struct PendingNorm<'a> {
+    /// `[groups, 2]`: sum and sum of squares
+    stats: Tensor,
+    w: &'a Tensor,
+    b: &'a Tensor,
+    groups: usize,
+    eps: f32,
+    act: i32,
+}
+
+impl PendingNorm<'_> {
+    /// Normalizes `x`, the tensor the statistics came from, in place
+    pub fn apply(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
+        let (hw, c) = (x.rows(), x.cols());
+        launch!(gpu, "group_norm_apply", ew(x.len()), B256, 0;
+            x, &self.stats, self.w, self.b, hw as u64, c, self.groups, self.eps, self.act)
+    }
 }
 
 /// `[n, d]` rows of `a` followed by rows of `b`

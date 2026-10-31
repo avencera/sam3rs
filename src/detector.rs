@@ -6,7 +6,7 @@ use eyre::{Result, WrapErr, ensure};
 use crate::gpu::{Gpu, Precision, Tensor, launch};
 use crate::nvtx::range;
 use crate::ops::{
-    ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm,
+    ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm_stats,
     upload_i32,
 };
 use crate::posenc::box_encoding;
@@ -472,16 +472,17 @@ impl Detector {
         self.seg_attn.forward_residual(gpu, &h, prompt, prompt, prompt_mask, &enc)?;
         drop(h);
 
+        // each level's group norm is applied as the next level's conv reads it
         let mut prev = enc;
+        let mut norm = None;
         let mut side = GRID;
         for (i, fine) in [&img.fpn[1], &img.fpn[0]].into_iter().enumerate() {
-            let up = gpu.empty(&[4 * side * side, D])?;
-            launch!(gpu, "upsample2_add", ew(up.len()), B256, 0; &up, fine, &prev, side, side, D)?;
             side *= 2;
-            prev = self.pixel_convs[i].forward(gpu, &up, side, side)?;
+            prev = self.pixel_convs[i].forward_up(gpu, fine, &prev, norm.as_ref(), side, side)?;
             let (w, b) = &self.pixel_norms[i];
-            group_norm(gpu, &prev, 8, w, b, 1e-5, ACT_RELU)?;
+            norm = Some(group_norm_stats(gpu, &prev, 8, w, b, 1e-5, ACT_RELU)?);
         }
+        norm.expect("two pixel decoder levels").apply(gpu, &prev)?;
         let instance = self.instance_proj.forward(gpu, &prev)?;
         drop(prev);
         let embed = self.mask_embed.forward(gpu, hs)?;

@@ -355,6 +355,47 @@ extern "C" __global__ void im2col3x3_bf16(__nv_bfloat16* out, const float* x, in
     }
 }
 
+// im2col3x3_bf16 of fine + up2(coarse) without materializing that sum: the input at fine
+// pixel (y, x) is fine[y, x] + coarse[y / 2, x / 2], as upsample2_add computes it. With
+// stats, coarse first gets the group norm and activation group_norm_apply would apply,
+// so neither the coarse map's normalized copy nor the upsampled sum is ever written.
+// h and w are the fine map's (even) size; groups must divide C into multiples of 8
+extern "C" __global__ void im2col3x3_up_bf16(__nv_bfloat16* out, const float* fine, const float* coarse,
+                                             const float* stats, const float* gw, const float* gb, int groups,
+                                             float eps, int act, int h, int w, int c, long long p0, long long n) {
+    int c8 = c / 8, cg = c / groups;
+    float count = (float)((long long)(h / 2) * (w / 2) * cg);
+    long long total = n * 9 * c8;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        int ch = (int)(i % c8) * 8;
+        long long r = i / c8;
+        int t = (int)(r % 9);
+        long long p = p0 + r / 9;
+        int yy = (int)(p / w) + t / 3 - 1, xx = (int)(p % w) + t % 3 - 1;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (yy >= 0 && yy < h && xx >= 0 && xx < w) {
+            const float4* f = reinterpret_cast<const float4*>(fine + ((long long)yy * w + xx) * c + ch);
+            const float4* q =
+                reinterpret_cast<const float4*>(coarse + ((long long)(yy >> 1) * (w >> 1) + (xx >> 1)) * c + ch);
+            float4 f0 = f[0], f1 = f[1], q0 = q[0], q1 = q[1];
+            float a[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};
+            float u[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+            if (stats) {
+                int g = ch / cg;
+                float mean = stats[g * 2] / count;
+                float var = fmaxf(stats[g * 2 + 1] / count - mean * mean, 0.f);
+#pragma unroll
+                for (int k = 0; k < 8; k++) u[k] = activate((u[k] - mean) * rsqrtf(var + eps) * gw[ch + k] + gb[ch + k], act);
+            }
+#pragma unroll
+            for (int k = 0; k < 8; k++) a[k] = a[k] + u[k];
+            v = make_uint4(pack_bf16(a[0], a[1]), pack_bf16(a[2], a[3]), pack_bf16(a[4], a[5]), pack_bf16(a[6], a[7]));
+        }
+        *reinterpret_cast<uint4*>(out + r * c + ch) = v;
+    }
+}
+
 // yp [H*(W+2), O] (3x3 conv over padded rows) -> y [H*W, O] + bias
 extern "C" __global__ void crop_bias(float* y, const float* yp, const float* bias, int h, int w, int o) {
     long long n = (long long)h * w * o;
