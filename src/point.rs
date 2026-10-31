@@ -355,7 +355,15 @@ pub fn fill_holes(logits: &mut [f32], side: usize, max_area: usize) {
 
 /// Hole-fills `n` low-res masks `[n, 288^2]` on the host, upsamples them bilinearly to
 /// the original size and thresholds at 0, returning `[n, height * width]` 0/1 bytes
-pub fn full_res_masks(gpu: &Gpu, low_res: &Tensor, n: usize, width: usize, height: usize) -> Result<Vec<u8>> {
+/// into `out`, which must hold `n * width * height` bytes
+pub fn full_res_masks(
+    gpu: &Gpu,
+    low_res: &Tensor,
+    n: usize,
+    width: usize,
+    height: usize,
+    mut out: Vec<u8>,
+) -> Result<Vec<u8>> {
     let side = LOW_RES;
     assert_eq!(low_res.len(), n * side * side);
     let mut logits = gpu.download(low_res)?;
@@ -367,7 +375,7 @@ pub fn full_res_masks(gpu: &Gpu, low_res: &Tensor, n: usize, width: usize, heigh
     launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &filled, n, side, side, height, width)?;
     let mask = gpu.alloc_bytes(up.len())?;
     launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.ptr(), &up, up.len() as u64, 0.0f32)?;
-    let mut out = vec![0u8; up.len()];
+    ensure!(out.len() == up.len(), "mask buffer of {} bytes for {} pixels", out.len(), up.len());
     gpu.download_into(&mask, &mut out)?;
     Ok(out)
 }

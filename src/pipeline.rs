@@ -1,11 +1,12 @@
 //! End-to-end SAM 3 image inference: encode an image once, then answer text, box and
 //! point prompts against the cached features
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
-use eyre::{Result, ensure};
+use eyre::{Result, ensure, eyre};
 
 use crate::detector::{BoxPrompt, Detector, DetectorImage, QUERIES};
 use crate::gpu::{Gpu, Precision, launch};
@@ -86,6 +87,9 @@ pub struct Sam3 {
     /// Text features of [`VISUAL_PROMPT`], encoded on first use: every box-only prompt
     /// would otherwise run the 24-layer text encoder on the same string
     visual: OnceCell<TextFeatures>,
+    /// detections the last `detect` call kept, the guess for how many mask buffers to
+    /// fault in ahead of the next
+    last_kept: Cell<usize>,
     // last, so the layers free their weights before the GPU handles go
     gpu: Gpu,
 }
@@ -124,6 +128,7 @@ impl Sam3 {
             detector: Detector::load(&gpu, &wts)?,
             point: PointDecoder::load(&gpu, &wts)?,
             visual: OnceCell::new(),
+            last_kept: Cell::new(0),
             gpu,
         };
         model.gpu.synchronize()?;
@@ -169,6 +174,8 @@ impl Sam3 {
         self.check(emb)?;
         let gpu = &self.gpu;
         let _r = range(c"detect");
+        let (w, h) = (emb.width, emb.height);
+        let spare = prefault(self.last_kept.get(), w * h);
         let encode = || {
             let _r = range(c"text");
             self.text.forward(gpu, &self.tokenizer.tokenize(text)?)
@@ -196,11 +203,11 @@ impl Sam3 {
         let presence = sigmoid(presence);
         let kept: Vec<(usize, f32)> =
             (0..QUERIES).map(|i| (i, sigmoid(logits[i]) * presence)).filter(|(_, p)| *p > SCORE_THRESHOLD).collect();
+        self.last_kept.set(kept.len());
         if kept.is_empty() {
             return Ok(vec![]);
         }
 
-        let (w, h) = (emb.width, emb.height);
         let side = LOW_RES * LOW_RES;
         let idx: Vec<i32> = kept.iter().map(|(i, _)| *i as i32).collect();
         let idx = upload_i32(gpu, idx)?;
@@ -211,8 +218,10 @@ impl Sam3 {
         // sigmoid(x) > 0.5 is x > 0
         let mask = gpu.alloc_bytes(up.len())?;
         launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.ptr(), &up, up.len() as u64, 0.0f32)?;
+        let mut masks = join(spare)?;
+        masks.truncate(kept.len());
         // calloc per mask: cloning one zeroed Vec would touch every page up front
-        let mut masks: Vec<Vec<u8>> = kept.iter().map(|_| vec![0u8; h * w]).collect();
+        masks.resize_with(kept.len(), || vec![0u8; h * w]);
         gpu.download_split(&mask, &mut masks)?;
 
         Ok(kept
@@ -240,6 +249,7 @@ impl Sam3 {
         let gpu = &self.gpu;
         let _r = range(c"segment_points");
         let (w, h) = (emb.width, emb.height);
+        let spare = prefault(1, w * h);
         let first = self.point.forward(gpu, &emb.point, points, w, h, None)?;
         let mask_input = clamped_mask(gpu, &first.low_res, argmax(&first.iou))?;
         let second = self.point.forward(gpu, &emb.point, points, w, h, Some(&mask_input))?;
@@ -249,9 +259,34 @@ impl Sam3 {
         let side = LOW_RES * LOW_RES;
         let low_res = gpu.empty(&[1, side])?;
         gpu.copy_dtod(second.low_res.at(best * side), low_res.ptr(), side * 4)?;
-        let mask = full_res_masks(gpu, &low_res, 1, w, h)?;
+        let out = join(spare)?.pop().expect("one prefaulted buffer");
+        let mask = full_res_masks(gpu, &low_res, 1, w, h, out)?;
         Ok(PointMask { score: second.iou[best], mask })
     }
+}
+
+/// Makes `count` zeroed host buffers of `len` bytes with every page already faulted in, on
+/// another thread while the GPU works. The driver's pageable copy into fresh pages takes
+/// the faults itself, about 0.24 ms per full-resolution mask with the GPU idle
+fn prefault(count: usize, len: usize) -> Option<JoinHandle<Vec<Vec<u8>>>> {
+    (count > 0).then(|| {
+        std::thread::spawn(move || {
+            (0..count)
+                .map(|_| {
+                    let mut buf = vec![0u8; len];
+                    // black_box, or the compiler drops stores of zero into calloc'd memory
+                    for byte in buf.iter_mut().step_by(4096) {
+                        *std::hint::black_box(byte) = 0;
+                    }
+                    buf
+                })
+                .collect()
+        })
+    })
+}
+
+fn join(spare: Option<JoinHandle<Vec<Vec<u8>>>>) -> Result<Vec<Vec<u8>>> {
+    spare.map_or(Ok(Vec::new()), |t| t.join().map_err(|_| eyre!("mask buffer thread panicked")))
 }
 
 /// First index of the maximum, like `torch.argmax`
