@@ -126,19 +126,19 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **91.9** | **2.1** | **21.8** | **21.9** | **23.3** |
+| **sam3rs `tf32`** | **63.9** | **1.9** | **8.0** | **8.0** | **9.3** |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.6 | 35.8 | 21.1 | 21.4 | 20.5 |
-| **sam3rs `bf16`** | **33.4** | **2.0** | **5.5** | **5.5** | **7.1** |
+| **sam3rs `bf16`** | **33.3** | **2.0** | **5.5** | **5.5** | **7.0** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.2 | 23.8 | 33.4 | 33.7 | 31.8 |
-| sam3rs `fp32` | 143.3 | 2.3 | 27.2 | 27.5 | 29.5 |
+| sam3rs `fp32` | 143.1 | 2.3 | 27.2 | 27.5 | 29.5 |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
-- `tf32` against osam, both FP32 with TF32 matmuls: 1.5x on encode, 9.5x on points,
-  1.6x on box prompts and 1.5x on text prompts.
+- `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 10x on points,
+  4.3x on box prompts and 3.8x on text prompts.
 - `bf16` against PyTorch BF16: 1.19x on encode, 18x on points, 3.8x on box prompts and
   2.9x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 11% faster. sam3rs is 11x
+- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 11% faster. sam3rs is 10x
   faster on points, 1.2x on box prompts and 1.08x on text prompts.
 
 The sam3rs rows come from one queued session, three runs each, reporting the median of
@@ -181,7 +181,7 @@ Worst case over 43 checks:
 | Mode | Max score delta | Max box delta | Min mask IoU |
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
-| `tf32` | 0.0053 | 0.19 px | 0.9987 |
+| `tf32` | 0.0052 | 0.19 px | 0.9987 |
 | `bf16` | 0.0046 | 0.71 px | 0.9914 |
 
 ```sh
