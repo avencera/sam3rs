@@ -5,8 +5,9 @@
 //! `&[T]` and outputs `DisjointSlice`s, with writes through `get_unchecked_mut` where the
 //! block's row, not a thread index, is what makes them disjoint. In-place kernels take the
 //! buffer once, as the output; none takes the same buffer as both input and output. Row
-//! lengths come from slice lengths and the grid: the host launches one block per row, and
-//! a launch whose buffers don't fit its grid does nothing instead of reading out of bounds
+//! lengths come from slice lengths and the grid, except LayerNorm's, which is a param
+//! (see [`layernorm`]): the host launches one block per row, and a launch whose buffers
+//! don't fit its grid does nothing instead of reading out of bounds
 
 use core::ptr::addr_of_mut;
 
@@ -33,6 +34,10 @@ unsafe fn layernorm_row(
     load: impl Fn(u32) -> f32,
     mut store: impl FnMut(u32, f32),
 ) {
+    // block-uniform, so a block that fails it never reaches a barrier
+    if (!w.is_empty() && w.len() < cols as usize) || (!b.is_empty() && b.len() < cols as usize) {
+        return;
+    }
     let (tid, block) = (threadIdx_x(), blockDim_x());
 
     let mut s = 0.0;
@@ -56,7 +61,14 @@ unsafe fn layernorm_row(
     c = tid;
     while c < cols {
         let y = (load(c) - mean) * rstd;
-        let y = if w.is_empty() { y } else { y * w[c as usize] + if b.is_empty() { 0.0 } else { b[c as usize] } };
+        // SAFETY, for both reads: `c < cols`, and a non-empty `w` or `b` holds at least
+        // `cols` floats; each read is inside the test that its slice is non-empty
+        let y = if w.is_empty() {
+            y
+        } else {
+            let shift = if b.is_empty() { 0.0 } else { unsafe { *b.get_unchecked(c as usize) } };
+            y * unsafe { *w.get_unchecked(c as usize) } + shift
+        };
         store(c, y);
         c += block;
     }
@@ -72,10 +84,10 @@ unsafe fn layernorm_into<T: Elem>(
     x: &[f32],
     w: &[f32],
     b: &[f32],
+    cols: u32,
     eps: f32,
     scratch: *mut f32,
 ) {
-    let cols = x.len() as u32 / gridDim_x();
     // the checks are block-uniform, so a block that fails them never reaches a barrier
     let Some(xr) = MatrixView32::new(x, cols).row(blockIdx_x(), cols) else { return };
     if out.len() < x.len() {
@@ -94,35 +106,37 @@ unsafe fn layernorm_into<T: Elem>(
 
 /// LayerNorm over the last dim, one block per row; an empty `w` or `b` is skipped
 ///
-/// `x` is `[rows, cols]` for a grid of `rows` blocks. Use [`layernorm_inplace`] to
-/// normalize a buffer over itself
+/// `x` is `[rows, cols]` for a grid of `rows` blocks. `cols` is a param rather than
+/// `x.len() / rows` because that division sits before the first load of every short
+/// block: deriving it cost 2 registers and made `layernorm_bf16` 3% slower. Use
+/// [`layernorm_inplace`] to normalize a buffer over itself
 #[kernel]
-pub fn layernorm(mut out: DisjointSlice<f32>, x: &[f32], w: &[f32], b: &[f32], eps: f32) {
+pub fn layernorm(mut out: DisjointSlice<f32>, x: &[f32], w: &[f32], b: &[f32], cols: u32, eps: f32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
     // SAFETY: every thread of the block runs this, and SCRATCH is used by nothing else
-    unsafe { layernorm_into(&mut out, x, w, b, eps, addr_of_mut!(SCRATCH) as *mut f32) };
+    unsafe { layernorm_into(&mut out, x, w, b, cols, eps, addr_of_mut!(SCRATCH) as *mut f32) };
 }
 
 /// [`layernorm`] into BF16, to feed a BF16 GEMM directly
 #[kernel]
-pub fn layernorm_bf16(mut out: DisjointSlice<Bf16>, x: &[f32], w: &[f32], b: &[f32], eps: f32) {
+pub fn layernorm_bf16(mut out: DisjointSlice<Bf16>, x: &[f32], w: &[f32], b: &[f32], cols: u32, eps: f32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
     // SAFETY: as in `layernorm`
-    unsafe { layernorm_into(&mut out, x, w, b, eps, addr_of_mut!(SCRATCH) as *mut f32) };
+    unsafe { layernorm_into(&mut out, x, w, b, cols, eps, addr_of_mut!(SCRATCH) as *mut f32) };
 }
 
 /// [`layernorm`] over `x` itself
 #[kernel]
-pub fn layernorm_inplace(mut x: DisjointSlice<f32>, w: &[f32], b: &[f32], eps: f32) {
+pub fn layernorm_inplace(mut x: DisjointSlice<f32>, w: &[f32], b: &[f32], cols: u32, eps: f32) {
     static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
-    let cols = x.len() as u32 / gridDim_x();
-    if cols == 0 {
+    // block-uniform, so a block that fails it never reaches a barrier
+    if cols == 0 || (blockIdx_x() as usize + 1) * cols as usize > x.len() {
         return;
     }
     let row = x.as_mut_ptr().wrapping_add((blockIdx_x() * cols) as usize);
 
-    // SAFETY, for both closures: `blockIdx.x < gridDim.x` and `c < cols` keep `row + c`
-    // inside `x`, and column `c` is only visited by thread `c % blockDim` of this block,
+    // SAFETY, for both closures: the check above and `c < cols` keep `row + c` inside
+    // `x`, and column `c` is only visited by thread `c % blockDim` of this block,
     // so each access is to a location no other thread touches
     let load = |c: u32| unsafe { *row.add(c as usize) };
     let store = |c: u32, y: f32| unsafe { *row.add(c as usize) = y };

@@ -309,7 +309,7 @@ impl LayerNorm {
 
     pub fn forward_inplace(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
         assert_eq!(x.cols(), self.w.len());
-        launch!(gpu, "layernorm_inplace", (x.rows() as u32, 1, 1), B256, 0; x, &self.w, &self.b, self.eps)
+        launch!(gpu, "layernorm_inplace", (x.rows() as u32, 1, 1), B256, 0; x, &self.w, &self.b, x.cols(), self.eps)
     }
 
     /// Normalized rows in BF16, as the input of a BF16 linear
@@ -317,13 +317,13 @@ impl LayerNorm {
         assert_eq!(x.cols(), self.w.len());
         let out = Bf16::empty(gpu, x.rows(), x.cols())?;
         launch!(gpu, "layernorm_bf16", (x.rows() as u32, 1, 1), B256, 0;
-            &out, x, &self.w, &self.b, self.eps)?;
+            &out, x, &self.w, &self.b, x.cols(), self.eps)?;
         Ok(out)
     }
 
     fn forward_into(&self, gpu: &Gpu, x: &Tensor, out: &Tensor) -> Result<()> {
         assert_eq!(x.cols(), self.w.len());
-        launch!(gpu, "layernorm", (x.rows() as u32, 1, 1), B256, 0; out, x, &self.w, &self.b, self.eps)
+        launch!(gpu, "layernorm", (x.rows() as u32, 1, 1), B256, 0; out, x, &self.w, &self.b, x.cols(), self.eps)
     }
 }
 
