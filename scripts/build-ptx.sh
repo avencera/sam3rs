@@ -5,14 +5,15 @@
 # RTX 50 series GPUs load. Both stay at PTX ISA 9.0 or below, which any driver from r580
 # can JIT
 #
-# cargo-oxide and its codegen backend come from the cuda-rust commit that
-# crates/sam3rs-kernels/Cargo.lock pins, installed under their own CARGO_HOME so other
-# projects' cuda-oxide installs at other commits are left alone. Needs Linux, the crate's
-# rust-toolchain.toml toolchain, LLVM 21's llc (CUDA_OXIDE_LLC) with opt and llvm-link
-# (CUDA_OXIDE_OPT, CUDA_OXIDE_LLVM_LINK, beside llc by default), libclang, and a CUDA
-# toolkit's libdevice (CUDA_OXIDE_LIBDEVICE). Their versions and libdevice's hash go to
-# kernels/ptx/tools.txt, which the source manifest covers, so a rebuild with other tools
-# shows up in the diff
+# cargo-oxide and its codegen backend come from the cuda-rust repository and commit that
+# crates/sam3rs-kernels/Cargo.lock pins, installed under a CARGO_HOME of their own per
+# commit: the backend cache has one slot, so branches at other commits (and other
+# projects) would otherwise rebuild it under each other. Needs Linux, the crate's
+# rust-toolchain.toml toolchain with its llvm-tools, libclang, and a CUDA toolkit's
+# libdevice (CUDA_OXIDE_LIBDEVICE). Codegen uses the toolchain's own LLVM llc, opt and
+# llvm-link unless CUDA_OXIDE_LLC, CUDA_OXIDE_OPT or CUDA_OXIDE_LLVM_LINK names another.
+# Their versions and libdevice's hash go to kernels/ptx/tools.txt, which the source
+# manifest covers, so a rebuild with other tools shows up in the diff
 #
 #   scripts/build-ptx.sh
 set -euo pipefail
@@ -20,28 +21,31 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 crate="$root/crates/sam3rs-kernels"
 toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$crate/rust-toolchain.toml")"
-rev="$(sed -n 's|^source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#\(.*\)"|\1|p' "$crate/Cargo.lock" | sort -u)"
-if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "expected one cuda-rust commit in $crate/Cargo.lock, found: $rev" >&2
+source="$(sed -n 's|^source = "git+\(https://github.com/[^/]*/cuda-rust.git\)?branch=[^#]*#\([0-9a-f]*\)"$|\1 \2|p' "$crate/Cargo.lock" | sort -u)"
+repo="${source% *}"
+rev="${source#* }"
+if [[ ! "$rev" =~ ^[0-9a-f]{40}$ || "$repo" == "$source" ]]; then
+  echo "expected one cuda-rust repository and commit in $crate/Cargo.lock, found: $source" >&2
   exit 1
 fi
 
-export CARGO_HOME="${SAM3RS_OXIDE_HOME:-$HOME/.cache/sam3rs/cargo-oxide}"
+export CARGO_HOME="${SAM3RS_OXIDE_HOME:-$HOME/.cache/sam3rs/cargo-oxide-${rev:0:12}}"
 export PATH="$CARGO_HOME/bin:$PATH"
-export CUDA_OXIDE_LLC="${CUDA_OXIDE_LLC:-/usr/bin/llc-21}"
-# the backend reads its own overrides for opt and llvm-link; pinning them here keeps the
-# tools it runs the ones tools.txt records
-export CUDA_OXIDE_OPT="${CUDA_OXIDE_OPT:-${CUDA_OXIDE_LLC/llc/opt}}"
-export CUDA_OXIDE_LLVM_LINK="${CUDA_OXIDE_LLVM_LINK:-${CUDA_OXIDE_LLC/llc/llvm-link}}"
+# the backend would find these same tools on its own; exporting them keeps the ones it
+# runs the ones tools.txt records
+llvm_bin="$(rustc "+$toolchain" --print sysroot)/lib/rustlib/$(rustc "+$toolchain" --print host-tuple)/bin"
+export CUDA_OXIDE_LLC="${CUDA_OXIDE_LLC:-$llvm_bin/llc}"
+export CUDA_OXIDE_OPT="${CUDA_OXIDE_OPT:-${CUDA_OXIDE_LLC%llc*}opt${CUDA_OXIDE_LLC##*llc}}"
+export CUDA_OXIDE_LLVM_LINK="${CUDA_OXIDE_LLVM_LINK:-${CUDA_OXIDE_LLC%llc*}llvm-link${CUDA_OXIDE_LLC##*llc}}"
 export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-21/lib}"
 export CUDA_OXIDE_LIBDEVICE="${CUDA_OXIDE_LIBDEVICE:-${CUDA_HOME:-/usr/local/cuda}/nvvm/libdevice/libdevice.10.bc}"
 # a cargo or rustup environment inherited from a parent build would pick another toolchain
 unset RUSTUP_TOOLCHAIN CARGO RUSTC
 
 stamp="$CARGO_HOME/cargo-oxide.rev"
-if [[ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]]; then
-  cargo "+$toolchain" install --locked --force --git https://github.com/NVIDIA/cuda-rust.git --rev "$rev" cargo-oxide
-  echo "$rev" > "$stamp"
+if [[ "$(cat "$stamp" 2>/dev/null)" != "$repo $rev" ]]; then
+  cargo "+$toolchain" install --locked --force --git "$repo" --rev "$rev" cargo-oxide
+  echo "$repo $rev" > "$stamp"
 fi
 
 # llc, opt, llvm-link and the libdevice linked into kernels that call math functions all

@@ -14,6 +14,9 @@ license = "Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-# cuda-oxide from main; Cargo.lock pins the commit and scripts/build-ptx.sh installs the
-# cargo-oxide of that same commit, so the device API and the codegen backend match
-cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
+# cuda-oxide from the praveenperera/cuda-rust fork, upstream main plus fixes with PRs
+# pending (hoisted scratch allocas, partial unroll of runtime-step loops, BlockRows, shared
+# statics named by identity); move back to NVIDIA/cuda-rust main once they merge.
+# Cargo.lock pins the commit and scripts/build-ptx.sh installs the cargo-oxide of that same
+# commit, so the device API and the codegen backend match
+cuda-device = { git = "https://github.com/praveenperera/cuda-rust.git", branch = "master" }
