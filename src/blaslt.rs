@@ -332,9 +332,10 @@ impl BlasLt {
                 times.push(f32::INFINITY);
                 continue;
             };
-            let reps = ((1.0 / first.max(1e-3)) as usize).clamp(3, 200);
+            // ~0.25 ms windows, best of 2: every new shape pays this on its first call
+            let reps = ((0.25 / first.max(1e-3)) as usize).clamp(2, 50);
             let mut best = f32::INFINITY;
-            for _ in 0..3 {
+            for _ in 0..2 {
                 best = best.min(time(algo, reps)?);
             }
             times.push(best);
