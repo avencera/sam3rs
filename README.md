@@ -34,10 +34,11 @@ There is also a Python package with numpy in and out; see
 - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
   ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
   fused into cuBLASLt epilogues. The first call of each GEMM shape times cuBLASLt's top
-  candidate algorithms and keeps the fastest. FP32 weights and activations. Attention
-  without a causal mask or additive bias, the detector's box-biased cross-attention
-  included, runs a fused flash-attention kernel on TF32 tensor cores with an FP32
-  softmax; the rest stays materialized.
+  candidate algorithms and switches from its first choice only to one more than 5%
+  faster, so close calls keep the same algorithm from run to run. FP32 weights and
+  activations. Attention without a causal mask or additive bias, the detector's
+  box-biased cross-attention included, runs a fused flash-attention kernel on TF32
+  tensor cores with an FP32 softmax; the rest stays materialized.
 - `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
   is the reference path for parity checks.
 
