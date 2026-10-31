@@ -33,7 +33,9 @@ There is also a Python package with numpy in and out; see
   k and v to FP16 and sums scores and P @ V tiles in FP16.
 - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
   ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
-  fused into cuBLASLt epilogues. FP32 weights and activations, materialized attention.
+  fused into cuBLASLt epilogues. The first call of each GEMM shape times cuBLASLt's top
+  candidate algorithms and keeps the fastest. FP32 weights and activations, materialized
+  attention.
 - `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
   is the reference path for parity checks.
 

@@ -14,6 +14,13 @@ use eyre::{Result, WrapErr, bail};
 /// NVIDIA's recommended cuBLASLt workspace for Hopper and newer
 const WORKSPACE: usize = 32 << 20;
 
+/// TF32 mode times up to this many of the heuristic's candidates for each new shape
+const TUNE_CANDIDATES: usize = 8;
+
+/// A tuned candidate replaces the heuristic's first choice only when it is this much
+/// faster, so the choice, and with it the summation order, stays the same from run to run
+const TUNE_MARGIN: f32 = 1.05;
+
 /// What the epilogue applies after `x @ w^T + beta * out`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Epilogue {
@@ -140,7 +147,13 @@ impl BlasLt {
         let mut plans = self.plans.borrow_mut();
         let plan = match plans.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(self.plan(key)?),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let (mut plan, candidates) = self.plan(key)?;
+                if candidates.len() > 1 {
+                    plan.algo = self.tune(&plan, &candidates, key, stream, x, w, beta, bias)?;
+                }
+                e.insert(plan)
+            }
         };
         let set = |attr, value: *const c_void, size| unsafe {
             check(lt::cublasLtMatmulDescSetAttribute(plan.desc, attr, value, size))
@@ -176,8 +189,10 @@ impl BlasLt {
         .wrap_err_with(|| format!("cuBLASLt linear m={m} n={n} k={k}"))
     }
 
-    /// Column-major view of the row-major problem: out^T[n, m] = w[n, k] (w^T stored) @ x^T
-    fn plan(&self, key: Key) -> Result<Plan> {
+    /// Column-major view of the row-major problem: out^T[n, m] = w[n, k] (w^T stored) @ x^T.
+    /// Returns the plan with the heuristic's first choice, and for TF32 operands its other
+    /// candidates too
+    fn plan(&self, key: Key) -> Result<(Plan, Vec<lt::cublasLtMatmulAlgo_t>)> {
         let Key { m, n, k, x_ld, epilogue, operands, out_bf16 } = key;
         unsafe {
             let mut desc = std::ptr::null_mut();
@@ -221,7 +236,8 @@ impl BlasLt {
                 (&ws as *const u64).cast(),
                 8,
             ))?;
-            let mut result = std::mem::MaybeUninit::<lt::cublasLtMatmulHeuristicResult_t>::zeroed();
+            let count = if operands == Operands::F32FastTf32 { TUNE_CANDIDATES } else { 1 };
+            let mut results = vec![std::mem::zeroed::<lt::cublasLtMatmulHeuristicResult_t>(); count];
             let mut found = 0;
             let status = lt::cublasLtMatmulAlgoGetHeuristic(
                 self.handle,
@@ -231,8 +247,8 @@ impl BlasLt {
                 out,
                 out,
                 pref,
-                1,
-                result.as_mut_ptr(),
+                count as i32,
+                results.as_mut_ptr(),
                 &mut found,
             );
             lt::cublasLtMatmulPreferenceDestroy(pref);
@@ -240,8 +256,97 @@ impl BlasLt {
             if found == 0 {
                 bail!("no cuBLASLt algorithm for m={m} n={n} k={k} {epilogue:?}");
             }
-            Ok(Plan { desc, w, x, out, algo: result.assume_init().algo })
+            let candidates: Vec<_> = results[..found as usize].iter().map(|r| r.algo).collect();
+            Ok((Plan { desc, w, x, out, algo: candidates[0] }, candidates))
         }
+    }
+
+    /// Times each candidate on this call's operands, writing to a scratch output so a
+    /// residual output stays untouched, and returns the one to keep. On an RTX 5090 the
+    /// heuristic's first choice ran the backbone's GELU linear 10% and the 3x3 conv taps
+    /// 16% slower than another candidate, and small-row GEMMs up to 1.5x slower than a
+    /// split-K one
+    #[allow(clippy::too_many_arguments)]
+    fn tune(
+        &self,
+        plan: &Plan,
+        candidates: &[lt::cublasLtMatmulAlgo_t],
+        key: Key,
+        stream: CUstream,
+        x: u64,
+        w: u64,
+        beta: f32,
+        bias: u64,
+    ) -> Result<lt::cublasLtMatmulAlgo_t> {
+        if key.epilogue.has_bias() {
+            unsafe {
+                check(lt::cublasLtMatmulDescSetAttribute(
+                    plan.desc,
+                    lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                    (&bias as *const u64).cast(),
+                    size_of::<u64>(),
+                ))?;
+            }
+        }
+        let bytes = key.m * key.n * if key.out_bf16 { 2 } else { 4 };
+        let out = unsafe { cur::malloc_sync(bytes) }.wrap_err("cuBLASLt tuning output")?;
+        let flags = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        let (start, end) = (cur::event::create(flags)?, cur::event::create(flags)?);
+        let alpha = 1f32;
+        let run = |algo: &lt::cublasLtMatmulAlgo_t| unsafe {
+            check(lt::cublasLtMatmul(
+                self.handle,
+                plan.desc,
+                (&alpha as *const f32).cast(),
+                w as *const c_void,
+                plan.w,
+                x as *const c_void,
+                plan.x,
+                (&beta as *const f32).cast(),
+                out as *const c_void,
+                plan.out,
+                out as *mut c_void,
+                plan.out,
+                algo,
+                self.workspace as *mut c_void,
+                WORKSPACE,
+                stream as _,
+            ))
+        };
+        // milliseconds per call over `reps` calls
+        let time = |algo: &lt::cublasLtMatmulAlgo_t, reps: usize| -> Result<f32> {
+            unsafe {
+                cur::event::record(start, stream)?;
+                for _ in 0..reps {
+                    run(algo)?;
+                }
+                cur::event::record(end, stream)?;
+                cur::event::synchronize(end)?;
+                Ok(cur::event::elapsed(start, end)? / reps as f32)
+            }
+        };
+        let mut times = Vec::with_capacity(candidates.len());
+        for algo in candidates {
+            // a candidate that fails to launch never wins
+            let Ok(first) = time(algo, 1) else {
+                times.push(f32::INFINITY);
+                continue;
+            };
+            let reps = ((1.0 / first.max(1e-3)) as usize).clamp(3, 200);
+            let mut best = f32::INFINITY;
+            for _ in 0..3 {
+                best = best.min(time(algo, reps)?);
+            }
+            times.push(best);
+        }
+        unsafe {
+            let _ = cur::event::destroy(start);
+            let _ = cur::event::destroy(end);
+            cur::free_sync(out)?;
+        }
+        let (fastest, t) =
+            times.iter().enumerate().fold((0, f32::INFINITY), |a, (i, &t)| if t < a.1 { (i, t) } else { a });
+        Ok(if times[0] > t * TUNE_MARGIN { candidates[fastest] } else { candidates[0] })
     }
 }
 
