@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::hf::{Hub, HubError};
 use eyre::{Result, eyre};
+use hf_fetch::{Hub, HubError};
 
 /// Hugging Face repo of the official checkpoint
 pub const MODEL_REPO: &str = "facebook/sam3";
