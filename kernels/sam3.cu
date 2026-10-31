@@ -979,9 +979,9 @@ __device__ void flash_attn(float* o, long long o_ld, long long o_stride, const T
     extern "C" __global__ void __launch_bounds__(FA_WARPS * 32)                                                    \
         NAME(float* o, long long o_ld, long long o_stride, const T* q, long long q_ld, long long q_stride, const T* k, \
              long long k_ld, long long k_stride, const T* v, long long v_ld, long long v_stride, int lq, int lk,     \
-             float scale_log2, const uint8_t* key_pad) {                                                           \
+             float scale_log2, const uint8_t* key_pad, float* part, int kv_chunk) {                                \
         flash_attn<D, T>(o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,       \
-                         scale_log2, key_pad);                                                                     \
+                         scale_log2, key_pad, nullptr, nullptr, 0, part, kv_chunk);                                \
     }
 FLASH_ATTN(flash_attn_d32, 32, float)
 FLASH_ATTN(flash_attn_d64, 64, float)

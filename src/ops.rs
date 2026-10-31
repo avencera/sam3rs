@@ -325,6 +325,13 @@ pub struct Mask {
 /// Key splits for the fused box-RPB attention
 const RPB_SPLITS: usize = 16;
 
+/// Other head-dim-32 attentions split their keys when they would launch fewer blocks than
+/// this, aiming for about `SPLIT_BLOCKS` blocks. Below `SPLIT_MIN_KEYS` keys the extra
+/// combine launch costs more than the idle SMs
+const SPLIT_UNDER_BLOCKS: usize = 64;
+const SPLIT_BLOCKS: usize = 256;
+const SPLIT_MIN_KEYS: usize = 1024;
+
 /// Box relative position bias in factored form: for head `h`, query row `1 + q` and key
 /// `y * side + x`, the bias is `dy[q, y, h] + dx[q, x, h]`, and row 0 gets none. The
 /// fused kernel adds it per score instead of reading a `[heads, lq, side^2]` tensor
@@ -367,18 +374,26 @@ pub fn attention(
             args.extend(view(m));
         }
         args.extend([Arg::from(lq as i32), Arg::from(lk as i32), Arg::from(scale_log2)]);
-        let Some(r) = mask.rpb else {
-            args.push(Arg::from(mask.key_pad));
-            return gpu.launch(kernel, grid, (128, 1, 1), 0, args);
-        };
 
-        // the decoder has 201 queries over 5184 keys: 32 blocks would leave most SMs idle,
-        // so split the keys and merge the partial softmaxes
-        let chunk = lk.div_ceil(RPB_SPLITS).next_multiple_of(64);
+        // the decoder has 201 queries over 5184 keys and the geometry encoder a few: one
+        // block per 64 queries and head would leave most SMs idle, so split the keys and
+        // merge the partial softmaxes
+        let tiles = (grid.0 * grid.1) as usize;
+        let splits = match mask.rpb {
+            Some(_) => RPB_SPLITS,
+            None if hd == 32 && tiles < SPLIT_UNDER_BLOCKS && lk >= SPLIT_MIN_KEYS => SPLIT_BLOCKS.div_ceil(tiles),
+            None => 1,
+        };
+        let chunk = lk.div_ceil(splits).next_multiple_of(64);
         let splits = lk.div_ceil(chunk);
-        let part = gpu.empty(&[splits, batch, lq, hd + 2])?;
-        args.extend([Arg::from(r.dx), Arg::from(r.dy), Arg::from(r.side), Arg::from(part.ptr()), Arg::from(chunk)]);
+        let part = if splits > 1 { Some(gpu.empty(&[splits, batch, lq, hd + 2])?) } else { None };
+        match mask.rpb {
+            Some(r) => args.extend([Arg::from(r.dx), Arg::from(r.dy), Arg::from(r.side)]),
+            None => args.push(Arg::from(mask.key_pad)),
+        }
+        args.extend([Arg::from(part.as_ref().map_or(0, Tensor::ptr)), Arg::from(chunk)]);
         gpu.launch(kernel, (grid.0, grid.1, splits as u32), (128, 1, 1), 0, args)?;
+        let Some(part) = part else { return Ok(()) };
         let warps = batch * lq;
         return launch!(gpu, "flash_combine_d32", (blocks(warps * 32, 256), 1, 1), B256, 0;
             out.ptr, out.ld as u64, out.stride as u64, &part, splits, batch, lq);
