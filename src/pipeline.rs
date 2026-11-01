@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eyre::{Result, ensure};
 
 use crate::detector::{BoxPrompt, Detector, DetectorImage, QUERIES};
-use crate::gpu::{Gpu, Precision, launch};
+use crate::gpu::{Arg, Gpu, Precision, launch};
 use crate::image::{RgbImage, preprocess};
 use crate::masks::{MaskBuffer, MaskPool};
 use crate::nvtx::range;
@@ -24,6 +24,9 @@ pub const SCORE_THRESHOLD: f32 = 0.5;
 
 /// Text used for box-only prompts, as in upstream and osam
 pub const VISUAL_PROMPT: &str = "visual";
+
+/// Mask outputs resized per group in `detect`: 1 GiB of FP32 staging
+const MASK_GROUP_ELEMENTS: usize = 1 << 28;
 
 /// Tells models apart, so an embedding is only used with the model that made it
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(0);
@@ -281,11 +284,21 @@ impl Sam3 {
         let idx = upload_i32(gpu, idx)?;
         let picked = gpu.empty(&[kept.len(), side])?;
         launch!(gpu, "gather_rows", ew(picked.len()), B256, 0; &picked, &out.masks, idx.slice::<i32>(), side)?;
-        let up = gpu.empty(&[kept.len(), h * w])?;
-        launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &picked, LOW_RES, LOW_RES, h, w)?;
-        // sigmoid(x) > 0.5 is x > 0
-        let mask = gpu.alloc_bytes(up.len())?;
-        launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
+        // masks go through in groups whose FP32 staging stays bounded and whose element
+        // count fits the kernels' 32-bit thread index; one mask at the largest image size
+        // is 2^28 elements, so a group always holds at least one
+        let plane = h * w;
+        let group = (MASK_GROUP_ELEMENTS / plane).max(1);
+        let up = gpu.empty(&[group.min(kept.len()), plane])?;
+        let mask = gpu.alloc_bytes(kept.len() * plane)?;
+        for start in (0..kept.len()).step_by(group) {
+            let n = group.min(kept.len() - start) * plane;
+            let input = Arg::slice(picked.at(start * side), n / plane * side);
+            launch!(gpu, "resize_bilinear", ew(n), B256, 0; Arg::slice(up.ptr(), n), input, LOW_RES, LOW_RES, h, w)?;
+            // sigmoid(x) > 0.5 is x > 0
+            let out = Arg::slice(mask.ptr() + (start * plane) as u64, n);
+            launch!(gpu, "threshold_u8", ew(n), B256, 0; out, Arg::slice(up.ptr(), n), 0.0f32)?;
+        }
         let mut masks = self.masks.take(reserved, kept.len() * h * w)?;
         gpu.download_into(&mask, &mut masks)?;
 

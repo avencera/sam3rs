@@ -17,6 +17,9 @@ use eyre::{Result, eyre};
 /// while asking for the next; more would pin memory a caller has let go of
 const KEPT: usize = 2;
 
+/// Most bytes [`MaskPool::reserve`] faults in ahead of a call: 16 masks of 4096x4096
+const RESERVE_LIMIT: usize = 256 << 20;
+
 type Shelf = Mutex<Vec<Vec<u8>>>;
 
 /// Mask bytes in host memory: `n * height * width` bytes, 1 = foreground
@@ -107,6 +110,9 @@ impl MaskPool {
     /// Starts getting at least `len` bytes: the smallest returned buffer that is big
     /// enough, or else new memory faulted in on another thread while the GPU works
     pub(crate) fn reserve(&self, len: usize) -> Reserved {
+        // the length is a guess from the last call, so a big guess on a huge image would
+        // fault in memory the call may never use; `take` grows a short one
+        let len = len.min(RESERVE_LIMIT);
         let mut shelf = self.shelf();
         let fit = (0..shelf.len()).filter(|&i| shelf[i].len() >= len).min_by_key(|&i| shelf[i].len());
         match fit {
