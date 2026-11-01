@@ -1,0 +1,65 @@
+name: Fmt
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+
+  readme:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-rdme
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-rdme@2.2.2
+
+      # cargo-rdme resolves intralinks with a pinned nightly toolchain
+      - name: Install the intralink toolchain
+        run: cargo rdme install-rust-toolchain-for-intralinks
+
+      # README.md between the cargo-rdme markers must match the crate docs in src/lib.rs
+      - name: Check README matches the crate docs
+        run: cargo rdme --check
+
+  ruff:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Run ruff format
+        working-directory: crates/sam3rs-python
+        run: uvx ruff format --check .

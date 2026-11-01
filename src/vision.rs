@@ -104,7 +104,7 @@ impl Backbone {
         launch!(gpu, "patchify", ew(patches.len()), B256, 0; &patches, pixels, IMAGE_SIZE, PATCH)?;
         let x = self.patch.forward(gpu, &patches)?;
         drop(patches);
-        launch!(gpu, "add_pos_tiled", ew(x.len()), B256, 0; &x, &self.pos, GRID, 24usize, DIM)?;
+        launch!(gpu, "add_pos_tiled", ew(x.len()), B256, 0; &x, &self.pos, GRID, 24usize)?;
         self.ln_pre.forward_inplace(gpu, &x)?;
         for block in &self.blocks {
             self.block(gpu, block, &x)?;
@@ -127,7 +127,7 @@ impl Backbone {
             let k = Bf16::empty(gpu, batch * l, HEAD_DIM)?;
             let v = Bf16::empty(gpu, batch * l, HEAD_DIM)?;
             launch!(gpu, "vit_split_rope_bf16", ew(tokens * DIM / 2), B256, 0;
-                q.buf.ptr(), k.buf.ptr(), v.buf.ptr(), qkv.buf.ptr(), &rope.0, &rope.1, GRID, win, HEADS, HEAD_DIM)?;
+                &q, &k, &v, &qkv, &rope.0, &rope.1, GRID, win, HEADS, HEAD_DIM)?;
             drop(qkv);
             let view = |t: &Bf16| Mat::new(t.buf.ptr(), HEAD_DIM).stride(l * HEAD_DIM).bf16();
             attention(gpu, view(&q), view(&k), view(&v), out, batch, l, l, HEAD_DIM, Mask::default())?;
@@ -146,7 +146,7 @@ impl Backbone {
         if bf16 {
             let merged = Bf16::empty(gpu, tokens, DIM)?;
             launch!(gpu, "vit_merge_heads_bf16", ew(tokens * DIM), B256, 0;
-                merged.buf.ptr(), &o, GRID, win, HEADS, HEAD_DIM)?;
+                &merged, &o, GRID, win, HEADS, HEAD_DIM)?;
             drop(o);
             b.proj.forward16_residual(gpu, &merged, x)?;
             drop(merged);

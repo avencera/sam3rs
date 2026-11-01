@@ -181,7 +181,7 @@ impl PointDecoder {
     /// Tracker neck outputs -> decoder image features
     pub fn prepare_image(&self, gpu: &Gpu, fpn: &[Tensor]) -> Result<PointImage> {
         let embed = gpu.clone_tensor(&fpn[2])?;
-        launch!(gpu, "add_row", ew(embed.len()), B256, 0; &embed, &embed, &self.no_mem, embed.rows() as u64, D)?;
+        launch!(gpu, "add_row", ew(embed.len()), B256, 0; &embed, &self.no_mem)?;
         Ok(PointImage {
             embed,
             feat_s0: self.conv_s0.forward(gpu, &fpn[0])?,
@@ -214,7 +214,7 @@ impl PointDecoder {
     fn dense(&self, gpu: &Gpu, mask: Option<&Tensor>) -> Result<Tensor> {
         let Some(mask) = mask else {
             let out = gpu.zeros(&[GRID * GRID, D])?;
-            launch!(gpu, "add_row", ew(out.len()), B256, 0; &out, &out, &self.no_mask, out.rows() as u64, D)?;
+            launch!(gpu, "add_row", ew(out.len()), B256, 0; &out, &self.no_mask)?;
             return Ok(out);
         };
         let mut side = LOW_RES;
@@ -222,7 +222,7 @@ impl PointDecoder {
         for (conv, ln) in [(&self.mask_conv1, &self.mask_ln1), (&self.mask_conv2, &self.mask_ln2)] {
             let c = x.cols();
             let patches = gpu.empty(&[(side / 2) * (side / 2), c * 4])?;
-            launch!(gpu, "patchify2x2", ew(patches.len()), B256, 0; &patches, &x, side, side, c)?;
+            launch!(gpu, "patchify2x2", ew(patches.len()), B256, 0; &patches, &x, side, c)?;
             side /= 2;
             x = conv.forward(gpu, &patches)?;
             ln.forward_inplace(gpu, &x)?;
@@ -311,7 +311,7 @@ pub fn clamped_mask(gpu: &Gpu, low_res: &Tensor, index: usize) -> Result<Tensor>
     let n = LOW_RES * LOW_RES;
     let out = gpu.empty(&[n])?;
     gpu.copy_dtod(low_res.at(index * n), out.ptr(), n * 4)?;
-    launch!(gpu, "clamp", ew(n), B256, 0; &out, n as u64, -32.0f32, 32.0f32)?;
+    launch!(gpu, "clamp", ew(n), B256, 0; &out, -32.0f32, 32.0f32)?;
     Ok(out)
 }
 
@@ -355,7 +355,15 @@ pub fn fill_holes(logits: &mut [f32], side: usize, max_area: usize) {
 
 /// Hole-fills `n` low-res masks `[n, 288^2]` on the host, upsamples them bilinearly to
 /// the original size and thresholds at 0, returning `[n, height * width]` 0/1 bytes
-pub fn full_res_masks(gpu: &Gpu, low_res: &Tensor, n: usize, width: usize, height: usize) -> Result<Vec<u8>> {
+/// into `out`, which must hold `n * width * height` bytes
+pub fn full_res_masks(
+    gpu: &Gpu,
+    low_res: &Tensor,
+    n: usize,
+    width: usize,
+    height: usize,
+    out: &mut [u8],
+) -> Result<()> {
     let side = LOW_RES;
     assert_eq!(low_res.len(), n * side * side);
     let mut logits = gpu.download(low_res)?;
@@ -364,10 +372,9 @@ pub fn full_res_masks(gpu: &Gpu, low_res: &Tensor, n: usize, width: usize, heigh
     }
     let filled = gpu.upload(logits, &[n, side * side])?;
     let up = gpu.empty(&[n, height * width])?;
-    launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &filled, n, side, side, height, width)?;
+    launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &filled, side, side, height, width)?;
     let mask = gpu.alloc_bytes(up.len())?;
-    launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.ptr(), &up, up.len() as u64, 0.0f32)?;
-    let mut out = vec![0u8; up.len()];
-    gpu.download_into(&mask, &mut out)?;
-    Ok(out)
+    launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
+    ensure!(out.len() == up.len(), "mask buffer of {} bytes for {} pixels", out.len(), up.len());
+    gpu.download_into(&mask, out)
 }

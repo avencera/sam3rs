@@ -21,7 +21,8 @@ hf="https://huggingface.co"
 auth=()
 if [[ "$repo" == facebook/sam3 ]]; then
   token="${HF_TOKEN:-}"
-  token_file="${HF_TOKEN_PATH:-${HF_HOME:-$HOME/.cache/huggingface}/token}"
+  # huggingface_hub's precedence: HF_TOKEN_PATH, then HF_HOME, then XDG_CACHE_HOME
+  token_file="${HF_TOKEN_PATH:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/token}"
   [[ -z "$token" && -s "$token_file" ]] && token="$(<"$token_file")"
   if [[ -z "$token" ]]; then
     echo "facebook/sam3 is gated: accept Meta's SAM License at $hf/facebook/sam3, then run" >&2

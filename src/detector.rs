@@ -3,10 +3,11 @@
 
 use eyre::{Result, WrapErr, ensure};
 
-use crate::gpu::{Gpu, Tensor, launch};
+use crate::gpu::{Gpu, Precision, Tensor, blocks, launch};
 use crate::nvtx::range;
 use crate::ops::{
-    ACT_RELU, Attention, B256, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm, upload_i32,
+    ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm_stats,
+    upload_i32,
 };
 use crate::posenc::box_encoding;
 use crate::text::TextFeatures;
@@ -94,22 +95,37 @@ struct EncoderLayer {
     norm3: LayerNorm,
     fc1: Linear,
     fc2: Linear,
+    /// the FFN runs in BF16 end to end (see [`EncoderLayer::load`])
+    ffn16: bool,
 }
 
 impl EncoderLayer {
-    fn load(gpu: &Gpu, wts: &Weights, p: &str) -> Result<Self> {
+    /// `ffn16` puts the FFN on BF16 cuBLASLt in BF16 mode: the fusion encoder's FFN runs
+    /// 5184 tokens through 1M weights per layer, at the TF32 rate otherwise
+    fn load(gpu: &Gpu, wts: &Weights, p: &str, ffn16: bool) -> Result<Self> {
+        let ffn16 = ffn16 && gpu.precision() == Precision::Bf16;
+        let fc = |name: &str| -> Result<Linear> {
+            let fc = Linear::load(gpu, wts, &format!("{p}.mlp.{name}"))?;
+            if ffn16 { fc.bf16(gpu) } else { Ok(fc) }
+        };
         Ok(Self {
             norm1: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm1"), 1e-5)?,
             self_attn: Attention::load(gpu, wts, &format!("{p}.self_attn"), HEADS)?,
             norm2: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm2"), 1e-5)?,
             cross_attn: Attention::load(gpu, wts, &format!("{p}.cross_attn"), HEADS)?,
             norm3: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm3"), 1e-5)?,
-            fc1: Linear::load(gpu, wts, &format!("{p}.mlp.fc1"))?,
-            fc2: Linear::load(gpu, wts, &format!("{p}.mlp.fc2"))?,
+            fc1: fc("fc1")?,
+            fc2: fc("fc2")?,
+            ffn16,
         })
     }
 
     fn ffn(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
+        if self.ffn16 {
+            let h = self.norm3.forward16(gpu, x)?;
+            let hidden = self.fc1.forward16_act16(gpu, &h, ACT_RELU)?;
+            return self.fc2.forward16_residual(gpu, &hidden, x);
+        }
         let h = self.norm3.forward(gpu, x)?;
         let hidden = self.fc1.forward_act(gpu, &h, ACT_RELU)?;
         self.fc2.forward_residual(gpu, &hidden, x)
@@ -181,11 +197,13 @@ impl Detector {
             cls: wts.get(gpu, &format!("{g}.cls_embed.weight"))?,
             final_proj: Linear::load(gpu, wts, &format!("{g}.final_proj"))?,
             prompt_norm: LayerNorm::load(gpu, wts, &format!("{g}.prompt_layer_norm"), 1e-5)?,
-            layers: (0..3).map(|i| EncoderLayer::load(gpu, wts, &format!("{g}.layers.{i}"))).collect::<Result<_>>()?,
+            layers: (0..3)
+                .map(|i| EncoderLayer::load(gpu, wts, &format!("{g}.layers.{i}"), false))
+                .collect::<Result<_>>()?,
             out_norm: LayerNorm::load(gpu, wts, &format!("{g}.output_layer_norm"), 1e-5)?,
         };
         let encoder = (0..6)
-            .map(|i| EncoderLayer::load(gpu, wts, &format!("{p}.detr_encoder.layers.{i}")))
+            .map(|i| EncoderLayer::load(gpu, wts, &format!("{p}.detr_encoder.layers.{i}"), true))
             .collect::<Result<_>>()?;
         let dd = format!("{p}.detr_decoder");
         let mut decoder = Vec::new();
@@ -271,7 +289,7 @@ impl Detector {
             let xyxy = gpu.upload(xyxy, &[n, 4])?;
             let pooled = gpu.empty(&[n, D * ROI * ROI])?;
             launch!(gpu, "roi_align", ew(pooled.len()), B256, 0;
-                &pooled, &img.fpn2_normed, &xyxy, n, GRID, GRID, D, ROI)?;
+                &pooled, &img.fpn2_normed, &xyxy, GRID, GRID, D, ROI)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
             let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh)).collect();
@@ -281,7 +299,7 @@ impl Detector {
             let labels: Vec<i32> = boxes.iter().map(|b| b.positive as i32).collect();
             let labels = upload_i32(gpu, labels)?;
             let label = gpu.empty(&[n, D])?;
-            launch!(gpu, "gather_rows", ew(n * D), B256, 0; &label, &g.label, labels.ptr(), n, D)?;
+            launch!(gpu, "gather_rows", ew(label.len()), B256, 0; &label, &g.label, labels.slice::<i32>(), D)?;
             crate::ops::add_assign(gpu, &x, &label)?;
             concat_rows(gpu, &x, &g.cls)?
         };
@@ -325,7 +343,7 @@ impl Detector {
             let _r = range(c"decoder");
             self.decode(gpu, &memory, &prompt, prompt_mask)?
         };
-        let logits = self.score(gpu, &hs, &prompt, &pad, prompt.rows())?;
+        let logits = self.score(gpu, &hs, &prompt, &pad)?;
         let masks = {
             let _r = range(c"seg_head");
             self.segment(gpu, img, &memory, &hs, &prompt, prompt_mask)?
@@ -363,16 +381,15 @@ impl Detector {
         crate::ops::bias_act(gpu, &boxes, None, crate::ops::ACT_SIGMOID)?;
         let mem_pos = add(gpu, memory, &self.pos)?;
         let qpos = gpu.zeros(&[n, D])?;
-        let bias = gpu.empty(&[HEADS, n, GRID * GRID])?;
         let mut hs = None;
         let mut presence = None;
 
         for (i, l) in self.decoder.iter().enumerate() {
             let sine = gpu.empty(&[QUERIES, 2 * D])?;
-            launch!(gpu, "box_sine_embed", ew(sine.len()), B256, 0; &sine, &boxes, QUERIES)?;
+            launch!(gpu, "box_sine_embed", ew(sine.len()), B256, 0; &sine, &boxes)?;
             let pos = self.ref_point_head.forward(gpu, &sine)?;
             gpu.copy_dtod(pos.ptr(), qpos.at(D), pos.len() * 4)?;
-            self.box_rpb(gpu, &boxes, &bias)?;
+            let [dx, dy] = self.box_rpb(gpu, &boxes)?;
 
             let qk = add(gpu, &x, &qpos)?;
             l.self_attn.forward_residual(gpu, &qk, &qk, &x, Mask::default(), &x)?;
@@ -383,7 +400,7 @@ impl Detector {
             l.text_norm.forward_inplace(gpu, &x)?;
 
             let q = add(gpu, &x, &qpos)?;
-            let rpb = Mask { bias: bias.ptr(), bias_div: 1, ..Mask::default() };
+            let rpb = Mask { rpb: Some(BoxRpb { dx: dx.ptr(), dy: dy.ptr(), side: GRID }), ..Mask::default() };
             l.image_attn.forward_residual(gpu, &q, &mem_pos, memory, rpb, &x)?;
             l.image_norm.forward_inplace(gpu, &x)?;
 
@@ -396,7 +413,7 @@ impl Detector {
             let normed = self.out_norm.forward(gpu, &queries)?;
             let delta = self.box_head.forward(gpu, &normed)?;
             let refined = gpu.empty(&[QUERIES, 4])?;
-            launch!(gpu, "box_refine", ew(QUERIES * 4), B256, 0; &refined, &boxes, &delta, QUERIES)?;
+            launch!(gpu, "box_refine", ew(refined.len()), B256, 0; &refined, &boxes, &delta)?;
             boxes = refined;
 
             if i == self.decoder.len() - 1 {
@@ -410,28 +427,35 @@ impl Detector {
         Ok((hs.unwrap(), boxes, presence.unwrap()))
     }
 
-    /// Box relative position bias for the image cross-attention, `[8, 201, 5184]`
-    fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor, bias: &Tensor) -> Result<()> {
-        let mut deltas = Vec::new();
-        for (axis, mlp) in [(0i32, &self.rpb_x), (1, &self.rpb_y)] {
+    /// Box relative position bias for the image cross-attention in factored form, `dx`
+    /// and `dy` as `[8, 200, 72]` (see [`BoxRpb`])
+    fn box_rpb(&self, gpu: &Gpu, boxes: &Tensor) -> Result<[Tensor; 2]> {
+        let delta = |axis: usize, mlp: &Mlp| -> Result<Tensor> {
             let d = gpu.empty(&[QUERIES * GRID, 2])?;
-            launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, QUERIES, GRID, axis)?;
-            deltas.push(mlp.forward(gpu, &d)?);
-        }
-        launch!(gpu, "rpb_combine", ew(bias.len()), B256, 0; bias, &deltas[0], &deltas[1], QUERIES, GRID, HEADS)
+            launch!(gpu, "rpb_deltas", ew(d.len()), B256, 0; &d, boxes, GRID, axis)?;
+            // the MLP gives [200 * 72, heads]; head-major rows let the attention kernel
+            // read a query's biases contiguously instead of one float per 32-byte sector
+            let per_pos = mlp.forward(gpu, &d)?;
+            let heads = per_pos.cols();
+            let out = gpu.empty(&[heads, QUERIES * GRID])?;
+            launch!(gpu, "transpose", ew(out.len()), B256, 0; &out, &per_pos, heads)?;
+            Ok(out)
+        };
+        Ok([delta(0, &self.rpb_x)?, delta(1, &self.rpb_y)?])
     }
 
-    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf, len: usize) -> Result<Tensor> {
+    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf) -> Result<Tensor> {
         let p = self.text_mlp.forward(gpu, prompt)?;
         crate::ops::add_assign(gpu, &p, prompt)?;
         self.text_mlp_norm.forward_inplace(gpu, &p)?;
         let pooled = gpu.empty(&[1, D])?;
-        launch!(gpu, "masked_mean", (1, 1, 1), B256, 0; &pooled, &p, pad.ptr(), len, D)?;
+        // one thread per output column; the kernel takes the prompt length from p's rows
+        launch!(gpu, "masked_mean", (blocks(D, 256), 1, 1), B256, 0; &pooled, &p, pad.slice::<u8>())?;
         let pp = self.text_proj.forward(gpu, &pooled)?;
         let ph = self.query_proj.forward(gpu, hs)?;
         let scores = gpu.empty(&[QUERIES])?;
         let scale = 1.0 / (D as f32).sqrt();
-        launch!(gpu, "dot_scores", ((QUERIES as u32).div_ceil(8), 1, 1), B256, 0; &scores, &ph, &pp, QUERIES, D, scale, 12.0f32)?;
+        launch!(gpu, "dot_scores", ((QUERIES as u32).div_ceil(8), 1, 1), B256, 0; &scores, &ph, &pp, scale, 12.0f32)?;
         Ok(scores)
     }
 
@@ -449,16 +473,17 @@ impl Detector {
         self.seg_attn.forward_residual(gpu, &h, prompt, prompt, prompt_mask, &enc)?;
         drop(h);
 
+        // each level's group norm is applied as the next level's conv reads it
         let mut prev = enc;
+        let mut norm = None;
         let mut side = GRID;
         for (i, fine) in [&img.fpn[1], &img.fpn[0]].into_iter().enumerate() {
-            let up = gpu.empty(&[4 * side * side, D])?;
-            launch!(gpu, "upsample2_add", ew(up.len()), B256, 0; &up, fine, &prev, side, side, D)?;
             side *= 2;
-            prev = self.pixel_convs[i].forward(gpu, &up, side, side)?;
+            prev = self.pixel_convs[i].forward_up(gpu, fine, &prev, norm.as_ref(), side, side)?;
             let (w, b) = &self.pixel_norms[i];
-            group_norm(gpu, &prev, 8, w, b, 1e-5, ACT_RELU)?;
+            norm = Some(group_norm_stats(gpu, &prev, 8, w, b, 1e-5, ACT_RELU)?);
         }
+        norm.expect("two pixel decoder levels").apply(gpu, &prev)?;
         let instance = self.instance_proj.forward(gpu, &prev)?;
         drop(prev);
         let embed = self.mask_embed.forward(gpu, hs)?;

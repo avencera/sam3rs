@@ -265,7 +265,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # maturin names Python files with the PEP 440 form of the crate's SemVer version,
+          # so a v0.2.0-rc.1 tag ships sam3rs-0.2.0rc1
+          # plain bash, so no registry code runs beside the publish token; other
+          # prerelease forms fail here rather than publish under a mismatched name
           version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-(alpha|beta|rc)\.([0-9]+))?$ ]]; then
+            pre="${BASH_REMATCH[3]/alpha/a}"
+            version="${BASH_REMATCH[1]}${pre/beta/b}${BASH_REMATCH[4]}"
+          else
+            echo "tag $GITHUB_REF_NAME is not X.Y.Z or X.Y.Z-{alpha,beta,rc}.N" >&2
+            exit 1
+          fi
           ls -la dist
           test "$(find dist -type f | wc -l)" -eq 2
           for file in dist/*; do
@@ -292,7 +303,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # the PEP 440 form maturin published, converted as in the publish job's file check
           version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-(alpha|beta|rc)\.([0-9]+))?$ ]]; then
+            pre="${BASH_REMATCH[3]/alpha/a}"
+            version="${BASH_REMATCH[1]}${pre/beta/b}${BASH_REMATCH[4]}"
+          else
+            echo "tag $GITHUB_REF_NAME is not X.Y.Z or X.Y.Z-{alpha,beta,rc}.N" >&2
+            exit 1
+          fi
           uv venv --python 3.12 .venv-release
           # sam3rs alone from TestPyPI, where numpy isn't a trustworthy copy, then its
           # dependencies from PyPI; a new release can take a few minutes to appear
@@ -305,7 +324,10 @@ jobs:
             sleep 30
           done
           uv pip install --python .venv-release numpy
-          .venv-release/bin/python -I -c "import sam3rs; assert sam3rs.__version__ == '${version}'"
+          # the distribution carries the PEP 440 version; __version__ is the crate's SemVer one
+          .venv-release/bin/python -I -c "import importlib.metadata, sam3rs
+          assert importlib.metadata.version('sam3rs') == '${version}'
+          assert sam3rs.__version__ == '${GITHUB_REF_NAME#v}'"
           .venv-release/bin/sam3rs --help
 
   pypi-publish:

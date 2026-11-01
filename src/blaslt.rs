@@ -1,5 +1,6 @@
-//! cuBLASLt matmuls for the BF16 linears: BF16 operands, FP32 output, with the bias and
-//! activation fused into the GEMM epilogue instead of a separate pass over the output
+//! cuBLASLt matmuls for the linears of the BF16 precision mode: BF16 operands with FP32
+//! or BF16 output, or FP32 operands and output, with the bias and activation fused into
+//! the GEMM epilogue instead of a separate pass over the output
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -7,13 +8,22 @@ use std::ffi::c_void;
 
 use cudarc::cublaslt::sys as lt;
 use cudarc::driver::result as cur;
-use cudarc::driver::sys::CUstream;
+use cudarc::driver::sys::{CUevent, CUstream};
 use eyre::{Result, WrapErr, bail};
 
 use crate::cublas::Lt;
 
 /// NVIDIA's recommended cuBLASLt workspace for Hopper and newer
 const WORKSPACE: usize = 32 << 20;
+
+/// TF32 mode times up to this many of the heuristic's candidates for each new shape
+const TUNE_CANDIDATES: usize = 8;
+
+/// A tuned candidate replaces the heuristic's first choice only when it is this much
+/// faster, so most close calls keep the first choice. A candidate near the margin can still
+/// win in one process and lose in the next, so TF32 outputs can differ slightly between runs
+/// (on an RTX 5090, one binary gave two outputs 0.00001 apart in score)
+const TUNE_MARGIN: f32 = 1.05;
 
 /// What the epilogue applies after `x @ w^T + beta * out`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +58,37 @@ impl Epilogue {
     }
 }
 
+/// Operand types and the compute type of a matmul
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Operands {
+    /// BF16 x and w, FP32 accumulation
+    Bf16,
+    /// FP32 x, w and output with plain FP32 compute
+    F32,
+    /// FP32 x, w and output on TF32 tensor cores
+    F32FastTf32,
+    /// FP32 x, w and output on tensor cores that may round the inputs to BF16
+    F32Fast16Bf,
+}
+
+impl Operands {
+    fn compute(self) -> lt::cublasComputeType_t {
+        use lt::cublasComputeType_t::{CUBLAS_COMPUTE_32F, CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_COMPUTE_32F_FAST_TF32};
+        match self {
+            Self::Bf16 | Self::F32 => CUBLAS_COMPUTE_32F,
+            Self::F32FastTf32 => CUBLAS_COMPUTE_32F_FAST_TF32,
+            Self::F32Fast16Bf => CUBLAS_COMPUTE_32F_FAST_16BF,
+        }
+    }
+
+    fn input(self) -> lt::cudaDataType_t {
+        match self {
+            Self::Bf16 => lt::cudaDataType_t::CUDA_R_16BF,
+            Self::F32 | Self::F32FastTf32 | Self::F32Fast16Bf => lt::cudaDataType_t::CUDA_R_32F,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
     m: usize,
@@ -55,16 +96,62 @@ struct Key {
     k: usize,
     x_ld: usize,
     epilogue: Epilogue,
+    operands: Operands,
     out_bf16: bool,
 }
 
 /// Descriptors and the heuristic's algorithm for one shape
 struct Plan {
-    desc: lt::cublasLtMatmulDesc_t,
-    w: lt::cublasLtMatrixLayout_t,
-    x: lt::cublasLtMatrixLayout_t,
-    out: lt::cublasLtMatrixLayout_t,
+    desc: Desc,
+    w: Layout,
+    x: Layout,
+    out: Layout,
     algo: lt::cublasLtMatmulAlgo_t,
+}
+
+// owners of cuBLASLt and driver objects, so an early return on any error path releases them.
+// The cuBLASLt ones keep the entry points that destroy them
+
+struct Desc(lt::cublasLtMatmulDesc_t, &'static Lt);
+
+impl Drop for Desc {
+    fn drop(&mut self) {
+        unsafe { (self.1.matmul_desc_destroy)(self.0) };
+    }
+}
+
+struct Layout(lt::cublasLtMatrixLayout_t, &'static Lt);
+
+impl Drop for Layout {
+    fn drop(&mut self) {
+        unsafe { (self.1.matrix_layout_destroy)(self.0) };
+    }
+}
+
+struct Preference(lt::cublasLtMatmulPreference_t, &'static Lt);
+
+impl Drop for Preference {
+    fn drop(&mut self) {
+        unsafe { (self.1.preference_destroy)(self.0) };
+    }
+}
+
+/// Device memory from `cuMemAlloc`
+struct DeviceAlloc(u64);
+
+impl Drop for DeviceAlloc {
+    fn drop(&mut self) {
+        // cuMemFree waits for work still using the memory
+        let _ = unsafe { cur::free_sync(self.0) };
+    }
+}
+
+struct Event(CUevent);
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        let _ = unsafe { cur::event::destroy(self.0) };
+    }
 }
 
 pub struct BlasLt {
@@ -82,16 +169,24 @@ impl BlasLt {
     pub fn new(api: &'static Lt) -> Result<Self> {
         let mut handle = std::ptr::null_mut();
         unsafe { check((api.create)(&mut handle))? };
-        let workspace = unsafe { cur::malloc_sync(WORKSPACE) }.wrap_err("cuBLASLt workspace")?;
+        let workspace = match unsafe { cur::malloc_sync(WORKSPACE) } {
+            Ok(workspace) => workspace,
+            Err(e) => {
+                unsafe { (api.destroy)(handle) };
+                return Err(e).wrap_err("cuBLASLt workspace");
+            }
+        };
         Ok(Self { api, handle, workspace, plans: RefCell::new(HashMap::new()) })
     }
 
-    /// Row-major `out[m, n] = epilogue(x[m, k] @ w[n, k]^T + beta * out)` with BF16 `x`
-    /// (row stride `x_ld`) and `w`, and FP32 or BF16 `out` and `bias[n]`
+    /// Row-major `out[m, n] = epilogue(x[m, k] @ w[n, k]^T + beta * out)` with `x` (row
+    /// stride `x_ld`) and `w` of the operand type, and `out` and `bias[n]` FP32, or BF16
+    /// for BF16 operands
     #[allow(clippy::too_many_arguments)]
     pub fn linear(
         &self,
         stream: CUstream,
+        operands: Operands,
         (m, n, k): (usize, usize, usize),
         x: u64,
         x_ld: usize,
@@ -101,14 +196,23 @@ impl BlasLt {
         bias: u64,
         epilogue: Epilogue,
     ) -> Result<()> {
-        let key = Key { m, n, k, x_ld, epilogue, out_bf16 };
+        if out_bf16 && operands != Operands::Bf16 {
+            bail!("BF16 output needs BF16 operands");
+        }
+        let key = Key { m, n, k, x_ld, epilogue, operands, out_bf16 };
         let mut plans = self.plans.borrow_mut();
         let plan = match plans.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => e.insert(self.plan(key)?),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let (mut plan, candidates) = self.plan(key)?;
+                if candidates.len() > 1 {
+                    plan.algo = self.tune(&plan, &candidates, key, stream, x, w, beta, bias)?;
+                }
+                e.insert(plan)
+            }
         };
         let set = |attr, value: *const c_void, size| unsafe {
-            check((self.api.matmul_desc_set_attribute)(plan.desc, attr, value, size))
+            check((self.api.matmul_desc_set_attribute)(plan.desc.0, attr, value, size))
         };
         if epilogue.has_bias() {
             set(
@@ -121,17 +225,17 @@ impl BlasLt {
         unsafe {
             check((self.api.matmul)(
                 self.handle,
-                plan.desc,
+                plan.desc.0,
                 (&alpha as *const f32).cast(),
                 w as *const c_void,
-                plan.w,
+                plan.w.0,
                 x as *const c_void,
-                plan.x,
+                plan.x.0,
                 (&beta as *const f32).cast(),
                 out as *const c_void,
-                plan.out,
+                plan.out.0,
                 out as *mut c_void,
-                plan.out,
+                plan.out.0,
                 &plan.algo,
                 self.workspace as *mut c_void,
                 WORKSPACE,
@@ -141,18 +245,18 @@ impl BlasLt {
         .wrap_err_with(|| format!("cuBLASLt linear m={m} n={n} k={k}"))
     }
 
-    /// Column-major view of the row-major problem: out^T[n, m] = w[n, k] (w^T stored) @ x^T
-    fn plan(&self, key: Key) -> Result<Plan> {
-        let Key { m, n, k, x_ld, epilogue, out_bf16 } = key;
+    /// Column-major view of the row-major problem: out^T[n, m] = w[n, k] (w^T stored) @ x^T.
+    /// Returns the plan with the heuristic's first choice, and for TF32 operands its other
+    /// candidates too
+    fn plan(&self, key: Key) -> Result<(Plan, Vec<lt::cublasLtMatmulAlgo_t>)> {
+        let Key { m, n, k, x_ld, epilogue, operands, out_bf16 } = key;
         unsafe {
             let mut desc = std::ptr::null_mut();
-            check((self.api.matmul_desc_create)(
-                &mut desc,
-                lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                lt::cudaDataType_t::CUDA_R_32F,
-            ))?;
-            let set =
-                |attr, value: *const c_void, size| check((self.api.matmul_desc_set_attribute)(desc, attr, value, size));
+            check((self.api.matmul_desc_create)(&mut desc, operands.compute(), lt::cudaDataType_t::CUDA_R_32F))?;
+            let desc = Desc(desc, self.api);
+            let set = |attr, value: *const c_void, size| {
+                check((self.api.matmul_desc_set_attribute)(desc.0, attr, value, size))
+            };
             use lt::cublasLtMatmulDescAttributes_t::{
                 CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_MATMUL_DESC_TRANSA,
                 CUBLASLT_MATMUL_DESC_TRANSB,
@@ -172,57 +276,147 @@ impl BlasLt {
                 )?;
             }
 
-            let layout = |ty, rows: usize, cols: usize, ld: usize| -> Result<lt::cublasLtMatrixLayout_t> {
+            let layout = |ty, rows: usize, cols: usize, ld: usize| -> Result<Layout> {
                 let mut l = std::ptr::null_mut();
                 check((self.api.matrix_layout_create)(&mut l, ty, rows as u64, cols as u64, ld as i64))?;
-                Ok(l)
+                Ok(Layout(l, self.api))
             };
-            let w = layout(lt::cudaDataType_t::CUDA_R_16BF, k, n, k)?;
-            let x = layout(lt::cudaDataType_t::CUDA_R_16BF, k, m, x_ld)?;
+            let w = layout(operands.input(), k, n, k)?;
+            let x = layout(operands.input(), k, m, x_ld)?;
             let out = layout(out_ty, n, m, n)?;
 
             let mut pref = std::ptr::null_mut();
             check((self.api.preference_create)(&mut pref))?;
+            let pref = Preference(pref, self.api);
             let ws = WORKSPACE as u64;
             check((self.api.preference_set_attribute)(
-                pref,
+                pref.0,
                 lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                 (&ws as *const u64).cast(),
                 8,
             ))?;
-            let mut result = std::mem::MaybeUninit::<lt::cublasLtMatmulHeuristicResult_t>::zeroed();
+            let count = if operands == Operands::F32FastTf32 { TUNE_CANDIDATES } else { 1 };
+            let mut results = vec![std::mem::zeroed::<lt::cublasLtMatmulHeuristicResult_t>(); count];
             let mut found = 0;
-            let status = (self.api.algo_get_heuristic)(
+            check((self.api.algo_get_heuristic)(
                 self.handle,
-                desc,
-                w,
-                x,
-                out,
-                out,
-                pref,
-                1,
-                result.as_mut_ptr(),
+                desc.0,
+                w.0,
+                x.0,
+                out.0,
+                out.0,
+                pref.0,
+                count as i32,
+                results.as_mut_ptr(),
                 &mut found,
-            );
-            (self.api.preference_destroy)(pref);
-            check(status)?;
-            if found == 0 {
+            ))?;
+            // an entry's algo is only valid when its own state is success
+            let candidates: Vec<_> = results[..found as usize]
+                .iter()
+                .filter(|r| r.state == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
+                .map(|r| r.algo)
+                .collect();
+            let Some(&algo) = candidates.first() else {
                 bail!("no cuBLASLt algorithm for m={m} n={n} k={k} {epilogue:?}");
-            }
-            Ok(Plan { desc, w, x, out, algo: result.assume_init().algo })
+            };
+            Ok((Plan { desc, w, x, out, algo }, candidates))
         }
+    }
+
+    /// Times each candidate on this call's operands, writing to a scratch output so a
+    /// residual output stays untouched, and returns the one to keep. On an RTX 5090 the
+    /// heuristic's first choice ran the backbone's GELU linear 10% and the 3x3 conv taps
+    /// 16% slower than another candidate, and small-row GEMMs up to 1.5x slower than a
+    /// split-K one
+    #[allow(clippy::too_many_arguments)]
+    fn tune(
+        &self,
+        plan: &Plan,
+        candidates: &[lt::cublasLtMatmulAlgo_t],
+        key: Key,
+        stream: CUstream,
+        x: u64,
+        w: u64,
+        beta: f32,
+        bias: u64,
+    ) -> Result<lt::cublasLtMatmulAlgo_t> {
+        if key.epilogue.has_bias() {
+            unsafe {
+                check((self.api.matmul_desc_set_attribute)(
+                    plan.desc.0,
+                    lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                    (&bias as *const u64).cast(),
+                    size_of::<u64>(),
+                ))?;
+            }
+        }
+        let bytes = key.m * key.n * if key.out_bf16 { 2 } else { 4 };
+        let scratch = DeviceAlloc(unsafe { cur::malloc_sync(bytes) }.wrap_err("cuBLASLt tuning output")?);
+        // a residual linear (beta = 1) reads its output, so start from zeros rather than
+        // uninitialized memory
+        unsafe { cur::memset_d8_async(scratch.0, 0, bytes, stream) }?;
+        let out = scratch.0;
+        let flags = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        let (start, end) = (Event(cur::event::create(flags)?), Event(cur::event::create(flags)?));
+        let alpha = 1f32;
+        let run = |algo: &lt::cublasLtMatmulAlgo_t| unsafe {
+            check((self.api.matmul)(
+                self.handle,
+                plan.desc.0,
+                (&alpha as *const f32).cast(),
+                w as *const c_void,
+                plan.w.0,
+                x as *const c_void,
+                plan.x.0,
+                (&beta as *const f32).cast(),
+                out as *const c_void,
+                plan.out.0,
+                out as *mut c_void,
+                plan.out.0,
+                algo,
+                self.workspace as *mut c_void,
+                WORKSPACE,
+                stream as _,
+            ))
+        };
+        // milliseconds per call over `reps` calls
+        let time = |algo: &lt::cublasLtMatmulAlgo_t, reps: usize| -> Result<f32> {
+            unsafe {
+                cur::event::record(start.0, stream)?;
+                for _ in 0..reps {
+                    run(algo)?;
+                }
+                cur::event::record(end.0, stream)?;
+                cur::event::synchronize(end.0)?;
+                Ok(cur::event::elapsed(start.0, end.0)? / reps as f32)
+            }
+        };
+        let mut times = Vec::with_capacity(candidates.len());
+        for algo in candidates {
+            // a candidate that fails to launch never wins
+            let Ok(first) = time(algo, 1) else {
+                times.push(f32::INFINITY);
+                continue;
+            };
+            // ~0.25 ms windows, best of 2: every new shape pays this on its first call
+            let reps = ((0.25 / first.max(1e-3)) as usize).clamp(2, 50);
+            let mut best = f32::INFINITY;
+            for _ in 0..2 {
+                best = best.min(time(algo, reps)?);
+            }
+            times.push(best);
+        }
+
+        let (fastest, t) =
+            times.iter().enumerate().fold((0, f32::INFINITY), |a, (i, &t)| if t < a.1 { (i, t) } else { a });
+        Ok(if times[0] > t * TUNE_MARGIN { candidates[fastest] } else { candidates[0] })
     }
 }
 
 impl Drop for BlasLt {
     fn drop(&mut self) {
+        self.plans.get_mut().clear();
         unsafe {
-            for plan in self.plans.get_mut().values() {
-                (self.api.matrix_layout_destroy)(plan.w);
-                (self.api.matrix_layout_destroy)(plan.x);
-                (self.api.matrix_layout_destroy)(plan.out);
-                (self.api.matmul_desc_destroy)(plan.desc);
-            }
             let _ = cur::free_sync(self.workspace);
             (self.api.destroy)(self.handle);
         }

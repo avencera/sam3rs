@@ -94,7 +94,6 @@ struct Taps {
     starts: Vec<i32>,
     counts: Vec<i32>,
     weights: Vec<f32>,
-    max_taps: usize,
 }
 
 fn aa_taps(input: usize, output: usize) -> Taps {
@@ -102,7 +101,7 @@ fn aa_taps(input: usize, output: usize) -> Taps {
     let support = if scale >= 1.0 { scale } else { 1.0 };
     let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
     let max_taps = (support.ceil() as usize) * 2 + 1;
-    let mut taps = Taps { starts: vec![], counts: vec![], weights: vec![0.0; output * max_taps], max_taps };
+    let mut taps = Taps { starts: vec![], counts: vec![], weights: vec![0.0; output * max_taps] };
     for i in 0..output {
         let center = scale * (i as f32 + 0.5);
         let xmin = ((center - support + 0.5) as i32).max(0);
@@ -130,7 +129,7 @@ pub fn preprocess(gpu: &Gpu, img: &RgbImage) -> Result<Tensor> {
     let (h, w) = (img.height, img.width);
     let raw = gpu.upload_slice(&img.data)?;
     let planes = gpu.empty(&[3, h, w])?;
-    launch!(gpu, "hwc_u8_to_chw", ew(h * w * 3), B256, 0; &planes, raw.ptr(), h, w)?;
+    launch!(gpu, "hwc_u8_to_chw", ew(planes.len()), B256, 0; &planes, raw.slice::<u8>())?;
 
     // separable passes; rounding back to uint8 absorbs the summation-order difference
     // from the fused PyTorch kernel
@@ -140,7 +139,7 @@ pub fn preprocess(gpu: &Gpu, img: &RgbImage) -> Result<Tensor> {
     let xw = gpu.upload(tx.weights, &[w_taps])?;
     let wide = gpu.empty(&[3, h, IMAGE_SIZE])?;
     launch!(gpu, "resample_cols", ew(wide.len()), B256, 0;
-        &wide, &planes, 3 * h, w, IMAGE_SIZE, xs.ptr(), xc.ptr(), &xw, tx.max_taps)?;
+        &wide, &planes, xs.slice::<i32>(), xc.slice::<i32>(), &xw)?;
 
     let ty = aa_taps(h, IMAGE_SIZE);
     let h_taps = ty.weights.len();
@@ -148,7 +147,7 @@ pub fn preprocess(gpu: &Gpu, img: &RgbImage) -> Result<Tensor> {
     let yw = gpu.upload(ty.weights, &[h_taps])?;
     let out = gpu.empty(&[3, IMAGE_SIZE, IMAGE_SIZE])?;
     launch!(gpu, "resample_rows", ew(out.len()), B256, 0;
-        &out, &wide, 3usize, h, IMAGE_SIZE, IMAGE_SIZE, ys.ptr(), yc.ptr(), &yw, ty.max_taps)?;
-    launch!(gpu, "quantize_normalize", ew(out.len()), B256, 0; &out, out.len() as u64)?;
+        &out, &wide, ys.slice::<i32>(), yc.slice::<i32>(), &yw, IMAGE_SIZE)?;
+    launch!(gpu, "quantize_normalize", ew(out.len()), B256, 0; &out)?;
     Ok(out)
 }

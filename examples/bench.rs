@@ -1,7 +1,9 @@
 //! Times sam3rs with the osam benchmark protocol: dogs.jpg, model load and JPEG decode
 //! excluded, one warm-up then the median of 5 runs for the image encoder and for each
 //! prompt (point, box, negative box, text). Every prompt call ends with full-resolution
-//! masks on the host, and detection prompts re-run the text encoder, as osam does
+//! masks on the host. The text prompt re-runs the text encoder on every call, as osam
+//! does; box prompts reuse the cached features of the "visual" text, which osam and
+//! PyTorch re-encode each time
 //!
 //!     cargo run --release --example bench -- --precision bf16
 
@@ -26,6 +28,11 @@ struct Args {
     /// (BF16 backbone, fused attention)
     #[arg(long, default_value = "bf16")]
     precision: Precision,
+    /// After timing, write the outputs of one more encode and one call per prompt to
+    /// this file (scores, boxes, DETR queries and masks), so a timed build can be
+    /// checked against the control by hashing it
+    #[arg(long)]
+    outputs: Option<PathBuf>,
 }
 
 fn median_ms(repeat: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
@@ -65,9 +72,33 @@ fn main() -> Result<()> {
         row.push(median_ms(args.repeat, || prompt(&emb))?);
     }
 
+    if let Some(path) = &args.outputs {
+        let emb = model.encode(&img)?;
+        let mut bytes = Vec::new();
+        let pm = model.segment_points(&emb, &point)?;
+        bytes.extend(pm.score.to_le_bytes());
+        bytes.extend(pm.mask.iter());
+        let detections: [(&str, &[BoxPrompt]); 3] =
+            [(VISUAL_PROMPT, &[positive]), (VISUAL_PROMPT, &[positive, negative]), ("dog", &[])];
+        for (text, boxes) in detections {
+            let found = model.detect(&emb, text, boxes)?;
+            bytes.extend((found.len() as u64).to_le_bytes());
+            for (i, d) in found.iter().enumerate() {
+                bytes.extend(d.score.to_le_bytes());
+                for v in d.bbox {
+                    bytes.extend(v.to_le_bytes());
+                }
+                bytes.extend((d.query as u64).to_le_bytes());
+                bytes.extend(found.mask(i));
+            }
+        }
+        std::fs::write(path, bytes)?;
+    }
+
     let names: Vec<&str> = prompts.iter().map(|(n, _)| *n).collect();
     println!("| Runtime | Encode | {} |", names.join(" | "));
-    let cells: Vec<String> = row.iter().map(|ms| format!("{ms:.1}")).collect();
+    // two decimals: at one, a 7 ms prompt moves in 1.4% steps, coarser than the run-to-run noise
+    let cells: Vec<String> = row.iter().map(|ms| format!("{ms:.2}")).collect();
     println!("| sam3rs {:?} | {} |", args.precision, cells.join(" | "));
     Ok(())
 }
