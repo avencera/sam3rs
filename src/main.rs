@@ -17,25 +17,25 @@ use serde_json::json;
 #[command(about = "SAM 3 image segmentation on CUDA")]
 struct Args {
     image: PathBuf,
-    /// noun phrase to detect, alone or with boxes
+    /// Noun phrase to detect, alone or with boxes
     #[arg(long)]
     text: Option<String>,
-    /// positive box exemplar x0,y0,x1,y1 in pixels
+    /// Positive box exemplar x0,y0,x1,y1 in pixels
     #[arg(long = "box", value_parser = parse_coords::<4>)]
     boxes: Vec<[f32; 4]>,
-    /// negative box exemplar x0,y0,x1,y1
+    /// Negative box exemplar x0,y0,x1,y1
     #[arg(long = "neg-box", value_parser = parse_coords::<4>)]
     neg_boxes: Vec<[f32; 4]>,
-    /// foreground click x,y; points can't be combined with text or boxes
+    /// Foreground click x,y; points can't be combined with text or boxes
     #[arg(long = "point", value_parser = parse_coords::<2>)]
     points: Vec<[f32; 2]>,
-    /// background click x,y
+    /// Background click x,y
     #[arg(long = "neg-point", value_parser = parse_coords::<2>)]
     neg_points: Vec<[f32; 2]>,
     /// PNG with the masks drawn over the image
     #[arg(long)]
     out: Option<PathBuf>,
-    /// directory with model.safetensors, vocab.json and merges.txt [default: download
+    /// Directory with model.safetensors, vocab.json and merges.txt [default: download
     /// facebook/sam3 from Hugging Face]
     #[arg(long)]
     model: Option<PathBuf>,

@@ -1,17 +1,17 @@
 //! SAM 3 detector: geometry (box) encoder, fusion encoder, DETR decoder with presence
 //! token, dot-product scoring and the segmentation head
 
-use eyre::{Result, WrapErr, ensure};
+use eyre::{Result, WrapErr, ensure, eyre};
 
-use crate::gpu::{Gpu, Precision, Tensor, blocks, launch};
+use crate::gpu::{Buf, Gpu, Precision, Tensor, blocks, launch};
 use crate::nvtx::range;
 use crate::ops::{
-    ACT_RELU, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm_stats,
-    upload_i32,
+    Act, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, concat_rows, ew,
+    group_norm_stats, upload_i32,
 };
-use crate::posenc::box_encoding;
+use crate::posenc::{box_encoding, sine_2d};
 use crate::text::TextFeatures;
-use crate::vision::GRID;
+use crate::vision::{Fpn, GRID};
 use crate::weights::Weights;
 
 const D: usize = 256;
@@ -68,10 +68,9 @@ impl BoxPrompt {
 
 /// Image features the detector reads, computed once per image
 pub struct DetectorImage {
-    /// fpn levels `[288^2, 256]`, `[144^2, 256]`, `[72^2, 256]`
-    pub fpn: Vec<Tensor>,
-    /// LayerNorm(fpn2) for box ROI pooling
-    pub fpn2_normed: Tensor,
+    pub fpn: Fpn,
+    /// LayerNorm(fpn.coarse) for box ROI pooling
+    pub coarse_normed: Tensor,
 }
 
 /// Raw detector outputs for one prompt, all on the device
@@ -95,7 +94,7 @@ struct EncoderLayer {
     norm3: LayerNorm,
     fc1: Linear,
     fc2: Linear,
-    /// the FFN runs in BF16 end to end (see [`EncoderLayer::load`])
+    /// The FFN runs in BF16 end to end (see [`EncoderLayer::load`])
     ffn16: bool,
 }
 
@@ -123,11 +122,11 @@ impl EncoderLayer {
     fn ffn(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
         if self.ffn16 {
             let h = self.norm3.forward16(gpu, x)?;
-            let hidden = self.fc1.forward16_act16(gpu, &h, ACT_RELU)?;
+            let hidden = self.fc1.forward16_act16(gpu, &h, Act::Relu)?;
             return self.fc2.forward16_residual(gpu, &hidden, x);
         }
         let h = self.norm3.forward(gpu, x)?;
-        let hidden = self.fc1.forward_act(gpu, &h, ACT_RELU)?;
+        let hidden = self.fc1.forward_act(gpu, &h, Act::Relu)?;
         self.fc2.forward_residual(gpu, &hidden, x)
     }
 }
@@ -181,7 +180,7 @@ pub struct Detector {
     pixel_norms: Vec<(Tensor, Tensor)>,
     instance_proj: Linear,
     mask_embed: Mlp,
-    /// sine position encoding of the 72x72 grid `[5184, 256]`
+    /// Sine position encoding of the 72x72 grid `[5184, 256]`
     pos: Tensor,
 }
 
@@ -233,14 +232,14 @@ impl Detector {
             query_embed: wts.get(gpu, &format!("{dd}.query_embed.weight"))?,
             reference_points: wts.get(gpu, &format!("{dd}.reference_points.weight"))?,
             presence_token: wts.get(gpu, &format!("{dd}.presence_token.weight"))?,
-            ref_point_head: Mlp::load_numbered(gpu, wts, &format!("{dd}.ref_point_head"), 2, ACT_RELU)?,
-            rpb_x: Mlp::load_numbered(gpu, wts, &format!("{dd}.box_rpb_embed_x"), 2, ACT_RELU)?,
-            rpb_y: Mlp::load_numbered(gpu, wts, &format!("{dd}.box_rpb_embed_y"), 2, ACT_RELU)?,
-            box_head: Mlp::load_numbered(gpu, wts, &format!("{dd}.box_head"), 3, ACT_RELU)?,
-            presence_head: Mlp::load_numbered(gpu, wts, &format!("{dd}.presence_head"), 3, ACT_RELU)?,
+            ref_point_head: Mlp::load_numbered(gpu, wts, &format!("{dd}.ref_point_head"), 2, Act::Relu)?,
+            rpb_x: Mlp::load_numbered(gpu, wts, &format!("{dd}.box_rpb_embed_x"), 2, Act::Relu)?,
+            rpb_y: Mlp::load_numbered(gpu, wts, &format!("{dd}.box_rpb_embed_y"), 2, Act::Relu)?,
+            box_head: Mlp::load_numbered(gpu, wts, &format!("{dd}.box_head"), 3, Act::Relu)?,
+            presence_head: Mlp::load_numbered(gpu, wts, &format!("{dd}.presence_head"), 3, Act::Relu)?,
             presence_norm: LayerNorm::load(gpu, wts, &format!("{dd}.presence_layer_norm"), 1e-5)?,
             out_norm: LayerNorm::load(gpu, wts, &format!("{dd}.output_layer_norm"), 1e-5)?,
-            text_mlp: Mlp::load_numbered(gpu, wts, &format!("{s}.text_mlp"), 2, ACT_RELU)?,
+            text_mlp: Mlp::load_numbered(gpu, wts, &format!("{s}.text_mlp"), 2, Act::Relu)?,
             text_mlp_norm: LayerNorm::load(gpu, wts, &format!("{s}.text_mlp_out_norm"), 1e-5)?,
             text_proj: Linear::load(gpu, wts, &format!("{s}.text_proj"))?,
             query_proj: Linear::load(gpu, wts, &format!("{s}.query_proj"))?,
@@ -257,14 +256,14 @@ impl Detector {
                 })
                 .collect::<Result<_>>()?,
             instance_proj: Linear::load(gpu, wts, &format!("{m}.instance_projection"))?,
-            mask_embed: Mlp::load_indexed(gpu, wts, &format!("{m}.mask_embedder"), 3, ACT_RELU)?,
-            pos: gpu.upload(crate::posenc::sine_2d(GRID, 256), &[GRID * GRID, D])?,
+            mask_embed: Mlp::load_indexed(gpu, wts, &format!("{m}.mask_embedder"), 3, Act::Relu)?,
+            pos: gpu.upload(sine_2d(GRID, 256), &[GRID * GRID, D])?,
         })
     }
 
-    pub fn prepare_image(&self, gpu: &Gpu, fpn: Vec<Tensor>) -> Result<DetectorImage> {
-        let fpn2_normed = self.vision_norm.forward(gpu, &fpn[2])?;
-        Ok(DetectorImage { fpn, fpn2_normed })
+    pub fn prepare_image(&self, gpu: &Gpu, fpn: Fpn) -> Result<DetectorImage> {
+        let coarse_normed = self.vision_norm.forward(gpu, &fpn.coarse)?;
+        Ok(DetectorImage { fpn, coarse_normed })
     }
 
     /// Geometry tokens: one per box, then the CLS token, all valid
@@ -289,7 +288,7 @@ impl Detector {
             let xyxy = gpu.upload(xyxy, &[n, 4])?;
             let pooled = gpu.empty(&[n, D * ROI * ROI])?;
             launch!(gpu, "roi_align", ew(pooled.len()), B256, 0;
-                &pooled, &img.fpn2_normed, &xyxy, GRID, GRID, D, ROI)?;
+                &pooled, &img.coarse_normed, &xyxy, GRID, GRID, D, ROI)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
             let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh)).collect();
@@ -300,18 +299,18 @@ impl Detector {
             let labels = upload_i32(gpu, labels)?;
             let label = gpu.empty(&[n, D])?;
             launch!(gpu, "gather_rows", ew(label.len()), B256, 0; &label, &g.label, labels.slice::<i32>(), D)?;
-            crate::ops::add_assign(gpu, &x, &label)?;
+            add_assign(gpu, &x, &label)?;
             concat_rows(gpu, &x, &g.cls)?
         };
 
         let x = g.final_proj.forward(gpu, &embeds)?;
         g.prompt_norm.forward_inplace(gpu, &x)?;
-        let mem_pos = add(gpu, &img.fpn[2], &self.pos)?;
+        let mem_pos = add(gpu, &img.fpn.coarse, &self.pos)?;
         for l in &g.layers {
             let h = l.norm1.forward(gpu, &x)?;
             l.self_attn.forward_residual(gpu, &h, &h, &h, Mask::default(), &x)?;
             let h = l.norm2.forward(gpu, &x)?;
-            l.cross_attn.forward_residual(gpu, &h, &mem_pos, &img.fpn[2], Mask::default(), &x)?;
+            l.cross_attn.forward_residual(gpu, &h, &mem_pos, &img.fpn.coarse, Mask::default(), &x)?;
             l.ffn(gpu, &x)?;
         }
         g.out_norm.forward_inplace(gpu, &x)?;
@@ -352,7 +351,7 @@ impl Detector {
     }
 
     fn fusion_encoder(&self, gpu: &Gpu, img: &DetectorImage, prompt: &Tensor, prompt_mask: Mask) -> Result<Tensor> {
-        let x = gpu.clone_tensor(&img.fpn[2])?;
+        let x = gpu.clone_tensor(&img.fpn.coarse)?;
         for l in &self.encoder {
             let h = l.norm1.forward(gpu, &x)?;
             let qk = add(gpu, &h, &self.pos)?;
@@ -378,11 +377,10 @@ impl Detector {
         // row 0 is the presence token, which has a zero query position
         let x = concat_rows(gpu, &self.presence_token, &self.query_embed)?;
         let mut boxes = gpu.clone_tensor(&self.reference_points)?;
-        crate::ops::bias_act(gpu, &boxes, None, crate::ops::ACT_SIGMOID)?;
+        bias_act(gpu, &boxes, None, Act::Sigmoid)?;
         let mem_pos = add(gpu, memory, &self.pos)?;
         let qpos = gpu.zeros(&[n, D])?;
         let mut hs = None;
-        let mut presence = None;
 
         for (i, l) in self.decoder.iter().enumerate() {
             let sine = gpu.empty(&[QUERIES, 2 * D])?;
@@ -404,7 +402,7 @@ impl Detector {
             l.image_attn.forward_residual(gpu, &q, &mem_pos, memory, rpb, &x)?;
             l.image_norm.forward_inplace(gpu, &x)?;
 
-            let hidden = l.fc1.forward_act(gpu, &x, ACT_RELU)?;
+            let hidden = l.fc1.forward_act(gpu, &x, Act::Relu)?;
             l.fc2.forward_residual(gpu, &hidden, &x)?;
             l.mlp_norm.forward_inplace(gpu, &x)?;
 
@@ -416,15 +414,19 @@ impl Detector {
             launch!(gpu, "box_refine", ew(refined.len()), B256, 0; &refined, &boxes, &delta)?;
             boxes = refined;
 
-            if i == self.decoder.len() - 1 {
-                let p = gpu.empty(&[1, D])?;
-                gpu.copy_dtod(x.ptr(), p.ptr(), D * 4)?;
-                let p = self.presence_norm.forward(gpu, &p)?;
-                presence = Some(self.presence_head.forward(gpu, &p)?);
+            // only the last layer's queries are kept, so earlier ones free before the next layer
+            if i + 1 == self.decoder.len() {
                 hs = Some(normed);
             }
         }
-        Ok((hs.unwrap(), boxes, presence.unwrap()))
+        let hs = hs.ok_or_else(|| eyre!("the detector has no decoder layers"))?;
+
+        // the presence token is row 0 of the last layer's output
+        let p = gpu.empty(&[1, D])?;
+        gpu.copy_dtod(x.ptr(), p.ptr(), D * 4)?;
+        let p = self.presence_norm.forward(gpu, &p)?;
+        let presence = self.presence_head.forward(gpu, &p)?;
+        Ok((hs, boxes, presence))
     }
 
     /// Box relative position bias for the image cross-attention in factored form, `dx`
@@ -444,9 +446,9 @@ impl Detector {
         Ok([delta(0, &self.rpb_x)?, delta(1, &self.rpb_y)?])
     }
 
-    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf) -> Result<Tensor> {
+    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &Buf) -> Result<Tensor> {
         let p = self.text_mlp.forward(gpu, prompt)?;
-        crate::ops::add_assign(gpu, &p, prompt)?;
+        add_assign(gpu, &p, prompt)?;
         self.text_mlp_norm.forward_inplace(gpu, &p)?;
         let pooled = gpu.empty(&[1, D])?;
         // one thread per output column; the kernel takes the prompt length from p's rows
@@ -477,11 +479,11 @@ impl Detector {
         let mut prev = enc;
         let mut norm = None;
         let mut side = GRID;
-        for (i, fine) in [&img.fpn[1], &img.fpn[0]].into_iter().enumerate() {
+        for (i, fine) in [&img.fpn.mid, &img.fpn.fine].into_iter().enumerate() {
             side *= 2;
             prev = self.pixel_convs[i].forward_up(gpu, fine, &prev, norm.as_ref(), side, side)?;
             let (w, b) = &self.pixel_norms[i];
-            norm = Some(group_norm_stats(gpu, &prev, 8, w, b, 1e-5, ACT_RELU)?);
+            norm = Some(group_norm_stats(gpu, &prev, 8, w, b, 1e-5, Act::Relu)?);
         }
         norm.expect("two pixel decoder levels").apply(gpu, &prev)?;
         let instance = self.instance_proj.forward(gpu, &prev)?;

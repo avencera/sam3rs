@@ -2,20 +2,21 @@
 //! transformer, high-resolution upscaling and the multimask heads
 
 use std::f64::consts::PI;
+use std::ops::Range;
 
 use eyre::{Result, ensure};
 
-use crate::gpu::{Gpu, Tensor, launch};
-use crate::ops::{
-    ACT_GELU, ACT_RELU, ACT_SIGMOID, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew,
-};
-use crate::vision::{GRID, IMAGE_SIZE};
+use crate::gpu::{Arg, Buf, Gpu, Tensor, launch};
+use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, ew};
+use crate::vision::{Fpn, GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
 const D: usize = 256;
 const HEADS: usize = 8;
-/// side of the low-resolution mask logits
+/// Side of the low-resolution mask logits
 pub const LOW_RES: usize = 4 * GRID;
+/// Most mask pixels [`MaskResize`] resizes per launch: 1 GiB of FP32 staging
+const MASK_GROUP_ELEMENTS: usize = 1 << 28;
 
 /// A click in original image pixels; positive = foreground
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,11 +51,11 @@ impl PointPrompt {
 
 /// Image features the point decoder reads, computed once per image
 pub struct PointImage {
-    /// tracker fpn2 + no-memory embedding `[72^2, 256]`
+    /// Tracker `fpn.coarse` + no-memory embedding `[72^2, 256]`
     pub embed: Tensor,
-    /// conv_s0(tracker fpn0) `[288^2, 32]`
+    /// conv_s0(tracker `fpn.fine`) `[288^2, 32]`
     pub feat_s0: Tensor,
-    /// conv_s1(tracker fpn1) `[144^2, 64]`
+    /// conv_s1(tracker `fpn.mid`) `[144^2, 64]`
     pub feat_s1: Tensor,
 }
 
@@ -101,7 +102,7 @@ pub struct PointDecoder {
     mask_ln2: LayerNorm,
     mask_conv3: Linear,
     dense_pe: Tensor,
-    /// obj score, iou and 4 mask tokens `[6, 256]`
+    /// Object score, IoU and 4 mask tokens `[6, 256]`
     output_tokens: Vec<f32>,
     layers: Vec<TwoWayLayer>,
     final_attn: Attention,
@@ -157,7 +158,7 @@ impl PointDecoder {
                 norm1: ln("layer_norm1")?,
                 token_to_image: at("cross_attn_token_to_image")?,
                 norm2: ln("layer_norm2")?,
-                mlp: Mlp::load(gpu, wts, &[format!("{l}.mlp.proj_in"), format!("{l}.mlp.proj_out")], ACT_RELU)?,
+                mlp: Mlp::load(gpu, wts, &[format!("{l}.mlp.proj_in"), format!("{l}.mlp.proj_out")], Act::Relu)?,
                 norm3: ln("layer_norm3")?,
                 image_to_token: at("cross_attn_image_to_token")?,
                 norm4: ln("layer_norm4")?,
@@ -183,10 +184,10 @@ impl PointDecoder {
             upscale_ln: LayerNorm::load(gpu, wts, &format!("{md}.upscale_layer_norm"), 1e-6)?,
             upscale2: ConvT2x2::load(gpu, wts, &format!("{md}.upscale_conv2"))?,
             hyper: (0..4)
-                .map(|i| Mlp::load_in_out(gpu, wts, &format!("{md}.output_hypernetworks_mlps.{i}"), 3, ACT_RELU))
+                .map(|i| Mlp::load_in_out(gpu, wts, &format!("{md}.output_hypernetworks_mlps.{i}"), 3, Act::Relu))
                 .collect::<Result<_>>()?,
-            iou_head: Mlp::load_in_out(gpu, wts, &format!("{md}.iou_prediction_head"), 3, ACT_RELU)?,
-            obj_score_head: Mlp::load_in_out(gpu, wts, &format!("{md}.pred_obj_score_head"), 3, ACT_RELU)?,
+            iou_head: Mlp::load_in_out(gpu, wts, &format!("{md}.iou_prediction_head"), 3, Act::Relu)?,
+            obj_score_head: Mlp::load_in_out(gpu, wts, &format!("{md}.pred_obj_score_head"), 3, Act::Relu)?,
             no_mem: wts.get(gpu, "tracker_model.no_memory_embedding")?,
             conv_s0: Linear::load(gpu, wts, &format!("{md}.conv_s0"))?,
             conv_s1: Linear::load(gpu, wts, &format!("{md}.conv_s1"))?,
@@ -194,13 +195,13 @@ impl PointDecoder {
     }
 
     /// Tracker neck outputs -> decoder image features
-    pub fn prepare_image(&self, gpu: &Gpu, fpn: &[Tensor]) -> Result<PointImage> {
-        let embed = gpu.clone_tensor(&fpn[2])?;
+    pub fn prepare_image(&self, gpu: &Gpu, fpn: &Fpn) -> Result<PointImage> {
+        let embed = gpu.clone_tensor(&fpn.coarse)?;
         launch!(gpu, "add_row", ew(embed.len()), B256, 0; &embed, &self.no_mem)?;
         Ok(PointImage {
             embed,
-            feat_s0: self.conv_s0.forward(gpu, &fpn[0])?,
-            feat_s1: self.conv_s1.forward(gpu, &fpn[1])?,
+            feat_s0: self.conv_s0.forward(gpu, &fpn.fine)?,
+            feat_s1: self.conv_s1.forward(gpu, &fpn.mid)?,
         })
     }
 
@@ -246,7 +247,7 @@ impl PointDecoder {
             side /= 2;
             x = conv.forward(gpu, &patches)?;
             ln.forward_inplace(gpu, &x)?;
-            bias_act(gpu, &x, None, ACT_GELU)?;
+            bias_act(gpu, &x, None, Act::Gelu)?;
         }
         self.mask_conv3.forward(gpu, &x)
     }
@@ -287,7 +288,7 @@ impl PointDecoder {
         let queries = gpu.clone_tensor(&prompt_pe)?;
 
         let keys = self.dense(gpu, mask_input)?;
-        crate::ops::add_assign(gpu, &keys, embed)?;
+        add_assign(gpu, &keys, embed)?;
         let none = Mask::default();
 
         let mut queries = queries;
@@ -307,7 +308,7 @@ impl PointDecoder {
             l.norm2.forward_inplace(gpu, &queries)?;
 
             let m = l.mlp.forward(gpu, &queries)?;
-            crate::ops::add_assign(gpu, &queries, &m)?;
+            add_assign(gpu, &queries, &m)?;
             l.norm3.forward_inplace(gpu, &queries)?;
 
             let q = add(gpu, &queries, &prompt_pe)?;
@@ -320,12 +321,12 @@ impl PointDecoder {
         self.final_norm.forward_inplace(gpu, &queries)?;
 
         let up = self.upscale1.forward(gpu, &keys, GRID, GRID)?;
-        crate::ops::add_assign(gpu, &up, &img.feat_s1)?;
+        add_assign(gpu, &up, &img.feat_s1)?;
         self.upscale_ln.forward_inplace(gpu, &up)?;
-        bias_act(gpu, &up, None, ACT_GELU)?;
+        bias_act(gpu, &up, None, Act::Gelu)?;
         let up = self.upscale2.forward(gpu, &up, 2 * GRID, 2 * GRID)?;
-        crate::ops::add_assign(gpu, &up, &img.feat_s0)?;
-        bias_act(gpu, &up, None, ACT_GELU)?;
+        add_assign(gpu, &up, &img.feat_s0)?;
+        bias_act(gpu, &up, None, Act::Gelu)?;
 
         // mask token 0 is the single-mask output, 1 to 3 the multimask ones
         let side = LOW_RES * LOW_RES;
@@ -337,7 +338,7 @@ impl PointDecoder {
         }
 
         let iou = self.iou_head.forward(gpu, &row(gpu, &queries, 1)?)?;
-        bias_act(gpu, &iou, None, ACT_SIGMOID)?;
+        bias_act(gpu, &iou, None, Act::Sigmoid)?;
         Ok(Decoded { low_res, iou, tokens: queries })
     }
 
@@ -354,6 +355,17 @@ pub fn row(gpu: &Gpu, x: &Tensor, r: usize) -> Result<Tensor> {
     let out = gpu.empty(&[1, d])?;
     gpu.copy_dtod(x.at(r * d), out.ptr(), d * 4)?;
     Ok(out)
+}
+
+/// First index of the maximum, like `torch.argmax`
+pub fn argmax(v: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, x) in v.iter().enumerate() {
+        if *x > v[best] {
+            best = i;
+        }
+    }
+    best
 }
 
 /// One low-res mask `[288^2]` clamped to +-32, as the next pass's mask input
@@ -421,10 +433,66 @@ pub fn full_res_masks(
         fill_holes(m, side, 256);
     }
     let filled = gpu.upload(logits, &[n, side * side])?;
-    let up = gpu.empty(&[n, height * width])?;
-    launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &filled, side, side, height, width)?;
-    let mask = gpu.alloc_bytes(up.len())?;
-    launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
-    ensure!(out.len() == up.len(), "mask buffer of {} bytes for {} pixels", out.len(), up.len());
+    let mask = MaskResize::new(gpu, n, width, height)?.all(gpu, &filled)?;
+    ensure!(out.len() == mask.bytes(), "mask buffer of {} bytes for {} pixels", out.len(), mask.bytes());
     gpu.download_into(&mask, out)
+}
+
+/// Low-res mask logits `[n, 288^2]` to full-size 0/1 masks: bilinear upsampling to
+/// `height` x `width`, then a threshold at 0
+///
+/// Masks go through in groups whose FP32 staging stays bounded and whose element count
+/// fits the kernels' 32-bit thread index; one mask at the largest image size is 2^28
+/// elements, so a group always holds at least one. Callers choose where each group's
+/// bytes go, so they can keep every mask on the GPU or download group by group
+pub struct MaskResize {
+    n: usize,
+    width: usize,
+    height: usize,
+    /// Masks per group
+    group: usize,
+    /// FP32 upsampled logits of one group
+    up: Tensor,
+}
+
+impl MaskResize {
+    pub fn new(gpu: &Gpu, n: usize, width: usize, height: usize) -> Result<Self> {
+        let plane = width * height;
+        let group = (MASK_GROUP_ELEMENTS / plane).min(n).max(1);
+        Ok(Self { n, width, height, group, up: gpu.empty(&[group, plane])? })
+    }
+
+    /// Most masks in one group
+    pub fn group(&self) -> usize {
+        self.group
+    }
+
+    /// The mask indices of each group, in order
+    pub fn groups(&self) -> impl Iterator<Item = Range<usize>> + use<> {
+        let (n, group) = (self.n, self.group);
+        (0..n).step_by(group).map(move |start| start..n.min(start + group))
+    }
+
+    /// Every mask of `low_res` into one device buffer of `n * height * width` bytes
+    pub fn all(&self, gpu: &Gpu, low_res: &Tensor) -> Result<Buf> {
+        let plane = self.width * self.height;
+        let mask = gpu.alloc_bytes(self.n * plane)?;
+        for range in self.groups() {
+            let dst = Arg::slice(mask.ptr() + (range.start * plane) as u64, range.len() * plane);
+            self.run(gpu, low_res, range, dst)?;
+        }
+        Ok(mask)
+    }
+
+    /// Masks `range` of `low_res` into `dst`, `range.len() * height * width` bytes
+    pub fn run(&self, gpu: &Gpu, low_res: &Tensor, range: Range<usize>, dst: Arg) -> Result<()> {
+        let side = LOW_RES * LOW_RES;
+        assert!(range.len() <= self.group && range.end * side <= low_res.len());
+        let n = range.len() * self.width * self.height;
+        let input = Arg::slice(low_res.at(range.start * side), range.len() * side);
+        let up = Arg::slice(self.up.ptr(), n);
+        launch!(gpu, "resize_bilinear", ew(n), B256, 0; up, input, LOW_RES, LOW_RES, self.height, self.width)?;
+        // sigmoid(x) > 0.5 is x > 0
+        launch!(gpu, "threshold_u8", ew(n), B256, 0; dst, up, 0.0f32)
+    }
 }

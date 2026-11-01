@@ -5,8 +5,7 @@ use eyre::Result;
 
 use crate::gpu::{Arg, Gpu, Mat, Precision, Tensor, launch};
 use crate::ops::{
-    ACT_GELU, ACT_GELU_TANH, ACT_NONE, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, add_assign_bf16,
-    attention, bias_act, ew,
+    Act, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, add_assign_bf16, attention, bias_act, ew,
 };
 use crate::weights::Weights;
 
@@ -112,7 +111,7 @@ impl Backbone {
         })
     }
 
-    /// pixels `[3, 1008, 1008]` -> tokens `[72 * 72, 1024]`
+    /// Pixels `[3, 1008, 1008]` -> tokens `[72 * 72, 1024]`
     pub fn forward(&self, gpu: &Gpu, pixels: &Tensor) -> Result<Tensor> {
         let k = 3 * PATCH * PATCH;
         let patches = gpu.empty(&[GRID * GRID, k])?;
@@ -156,7 +155,7 @@ impl Backbone {
             None => b.norm1.forward16(gpu, x)?,
         };
         drop(pending);
-        let qkv = b.qkv.forward16_act16(gpu, &h, ACT_NONE)?;
+        let qkv = b.qkv.forward16_act16(gpu, &h, Act::None)?;
         drop(h);
 
         let (cos, sin) = if b.global { &self.rope_global_wm } else { &self.rope_window };
@@ -190,11 +189,11 @@ impl Backbone {
         gpu.launch("vit_attn_bf16_d64", ((tokens / 64) as u32, HEADS as u32, 1), (128, 1, 1), 0, args)?;
         drop((qkv, k));
 
-        let attn = b.proj.forward16_act16(gpu, &merged, ACT_NONE)?;
+        let attn = b.proj.forward16_act16(gpu, &merged, Act::None)?;
         drop(merged);
-        let hidden = b.fc1.forward16_act16(gpu, &b.norm2.add_forward16(gpu, x, &attn)?, ACT_GELU_TANH)?;
+        let hidden = b.fc1.forward16_act16(gpu, &b.norm2.add_forward16(gpu, x, &attn)?, Act::GeluTanh)?;
         drop(attn);
-        b.fc2.forward16_act16(gpu, &hidden, ACT_NONE)
+        b.fc2.forward16_act16(gpu, &hidden, Act::None)
     }
 
     /// One FP32 block over raster-order `x` in place
@@ -223,7 +222,7 @@ impl Backbone {
 
         let h = b.norm2.forward(gpu, x)?;
         // upstream runs fc1 through `addmm_act`, whose CUDA GELU is the tanh approximation
-        let hidden = b.fc1.forward_act(gpu, &h, ACT_GELU_TANH)?;
+        let hidden = b.fc1.forward_act(gpu, &h, Act::GeluTanh)?;
         drop(h);
         b.fc2.forward_residual(gpu, &hidden, x)
     }
@@ -237,7 +236,19 @@ fn window_order(gpu: &Gpu, x: &Tensor, to_window: bool) -> Result<Tensor> {
     Ok(out)
 }
 
+/// The three SimpleFPN levels, channels-last with 256 channels
+pub struct Fpn {
+    /// 4x level `[288^2, 256]`
+    pub fine: Tensor,
+    /// 2x level `[144^2, 256]`
+    pub mid: Tensor,
+    /// 1x level `[72^2, 256]`, at the backbone's resolution
+    pub coarse: Tensor,
+}
+
+/// How a level resizes the trunk before its projections
 enum Scale {
+    /// Two 2x transposed convs with a GELU between
     Up4(ConvT2x2, ConvT2x2),
     Up2(ConvT2x2),
     Same,
@@ -249,60 +260,66 @@ struct Level {
     proj2: Conv3x3,
 }
 
+impl Level {
+    fn load(gpu: &Gpu, wts: &Weights, prefix: &str, scale: Scale) -> Result<Self> {
+        Ok(Self {
+            scale,
+            proj1: Linear::load(gpu, wts, &format!("{prefix}.proj1"))?.bf16(gpu)?,
+            proj2: Conv3x3::load(gpu, wts, &format!("{prefix}.proj2"))?,
+        })
+    }
+
+    fn forward(&self, gpu: &Gpu, trunk: &Trunk) -> Result<Tensor> {
+        let (h, side) = match (&self.scale, &trunk.bf16) {
+            (Scale::Up4(a, b), Some(t16)) => {
+                let h16 = a.forward16(gpu, t16, GRID, GRID, Act::Gelu)?;
+                let y16 = b.forward16(gpu, &h16, 2 * GRID, 2 * GRID, Act::None)?;
+                (self.proj1.forward_from16(gpu, &y16)?, 4 * GRID)
+            }
+            (Scale::Up2(a), Some(t16)) => {
+                (self.proj1.forward_from16(gpu, &a.forward16(gpu, t16, GRID, GRID, Act::None)?)?, 2 * GRID)
+            }
+            (Scale::Same, Some(t16)) => (self.proj1.forward_from16(gpu, t16)?, GRID),
+            (Scale::Up4(a, b), None) => {
+                let h = a.forward(gpu, &trunk.f32, GRID, GRID)?;
+                bias_act(gpu, &h, None, Act::Gelu)?;
+                (self.proj1.forward(gpu, &b.forward(gpu, &h, 2 * GRID, 2 * GRID)?)?, 4 * GRID)
+            }
+            (Scale::Up2(a), None) => (self.proj1.forward(gpu, &a.forward(gpu, &trunk.f32, GRID, GRID)?)?, 2 * GRID),
+            (Scale::Same, None) => (self.proj1.forward(gpu, &trunk.f32)?, GRID),
+        };
+        self.proj2.forward(gpu, &h, side, side)
+    }
+}
+
 /// One SimpleFPN neck: 4x, 2x and 1x levels (the 0.5x level is dropped upstream)
 pub struct Neck {
-    levels: Vec<Level>,
+    fine: Level,
+    mid: Level,
+    coarse: Level,
 }
 
 impl Neck {
     pub fn load(gpu: &Gpu, wts: &Weights, prefix: &str) -> Result<Self> {
-        let mut levels = Vec::new();
-        for i in 0..3 {
-            let l = format!("{prefix}.fpn_layers.{i}");
-            let s = |j: usize| ConvT2x2::load(gpu, wts, &format!("{l}.scale_layers.{j}"));
-            let scale = match i {
-                0 => Scale::Up4(s(0)?, s(2)?),
-                1 => Scale::Up2(s(0)?),
-                _ => Scale::Same,
-            };
-            levels.push(Level {
-                scale,
-                proj1: Linear::load(gpu, wts, &format!("{l}.proj1"))?.bf16(gpu)?,
-                proj2: Conv3x3::load(gpu, wts, &format!("{l}.proj2"))?,
-            });
-        }
-        Ok(Self { levels })
+        let level = |i: usize| format!("{prefix}.fpn_layers.{i}");
+        let up = |i: usize, j: usize| ConvT2x2::load(gpu, wts, &format!("{}.scale_layers.{j}", level(i)));
+        Ok(Self {
+            fine: Level::load(gpu, wts, &level(0), Scale::Up4(up(0, 0)?, up(0, 2)?))?,
+            mid: Level::load(gpu, wts, &level(1), Scale::Up2(up(1, 0)?))?,
+            coarse: Level::load(gpu, wts, &level(2), Scale::Same)?,
+        })
     }
 
-    /// trunk `[72 * 72, 1024]` -> `[288^2, 256]`, `[144^2, 256]`, `[72^2, 256]`. In BF16
-    /// mode pass the trunk's BF16 copy too ([`Trunk::new`]): every GEMM up to `proj1`
-    /// then reads BF16 its producer wrote, rather than an FP32 map converted again per level
-    pub fn forward(&self, gpu: &Gpu, trunk: &Trunk) -> Result<Vec<Tensor>> {
-        let mut out = Vec::new();
-        for level in &self.levels {
-            let (h, side) = match (&level.scale, &trunk.bf16) {
-                (Scale::Up4(a, b), Some(t16)) => {
-                    let h16 = a.forward16(gpu, t16, GRID, GRID, ACT_GELU)?;
-                    let y16 = b.forward16(gpu, &h16, 2 * GRID, 2 * GRID, ACT_NONE)?;
-                    (level.proj1.forward_from16(gpu, &y16)?, 4 * GRID)
-                }
-                (Scale::Up2(a), Some(t16)) => {
-                    (level.proj1.forward_from16(gpu, &a.forward16(gpu, t16, GRID, GRID, ACT_NONE)?)?, 2 * GRID)
-                }
-                (Scale::Same, Some(t16)) => (level.proj1.forward_from16(gpu, t16)?, GRID),
-                (Scale::Up4(a, b), None) => {
-                    let h = a.forward(gpu, &trunk.f32, GRID, GRID)?;
-                    bias_act(gpu, &h, None, ACT_GELU)?;
-                    (level.proj1.forward(gpu, &b.forward(gpu, &h, 2 * GRID, 2 * GRID)?)?, 4 * GRID)
-                }
-                (Scale::Up2(a), None) => {
-                    (level.proj1.forward(gpu, &a.forward(gpu, &trunk.f32, GRID, GRID)?)?, 2 * GRID)
-                }
-                (Scale::Same, None) => (level.proj1.forward(gpu, &trunk.f32)?, GRID),
-            };
-            out.push(level.proj2.forward(gpu, &h, side, side)?);
-        }
-        Ok(out)
+    /// Trunk `[72 * 72, 1024]` -> the three levels. In BF16 mode pass the trunk's BF16
+    /// copy too ([`Trunk::new`]): every GEMM up to `proj1` then reads BF16 its producer
+    /// wrote, rather than an FP32 map converted again per level
+    pub fn forward(&self, gpu: &Gpu, trunk: &Trunk) -> Result<Fpn> {
+        // struct fields evaluate in the order written, so the levels run fine to coarse
+        Ok(Fpn {
+            fine: self.fine.forward(gpu, trunk)?,
+            mid: self.mid.forward(gpu, trunk)?,
+            coarse: self.coarse.forward(gpu, trunk)?,
+        })
     }
 }
 

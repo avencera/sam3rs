@@ -16,11 +16,9 @@ use eyre::{Result, ensure, eyre};
 use crate::gpu::{Arg, Buf, Gpu, Precision, Tensor, launch};
 use crate::image::{AaResize, RgbImage, preprocess};
 use crate::nvtx::range;
-use crate::ops::{
-    ACT_GELU, ACT_RELU, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha,
-};
-use crate::pipeline::{MASK_GROUP_ELEMENTS, Sam3};
-use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, PointImage, PointPrompt, row};
+use crate::ops::{Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha};
+use crate::pipeline::Sam3;
+use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, PointPrompt, argmax, row};
 use crate::posenc::sine_2d;
 use crate::vision::{GRID, IMAGE_SIZE, Trunk};
 use crate::weights::Weights;
@@ -445,11 +443,11 @@ impl MemoryAttention {
             }
             if bf16 {
                 // the 2048-wide hidden stays BF16 between the two GEMMs
-                let hidden = l.linear1.forward16_act16(gpu, &l.norm3.forward16(gpu, &x)?, ACT_RELU)?;
+                let hidden = l.linear1.forward16_act16(gpu, &l.norm3.forward16(gpu, &x)?, Act::Relu)?;
                 l.linear2.forward16_residual(gpu, &hidden, &x)?;
             } else {
                 let h = l.norm3.forward(gpu, &x)?;
-                l.linear2.forward_residual(gpu, &l.linear1.forward_act(gpu, &h, ACT_RELU)?, &x)?;
+                l.linear2.forward_residual(gpu, &l.linear1.forward_act(gpu, &h, Act::Relu)?, &x)?;
             }
         }
         self.norm.forward(gpu, &x)
@@ -569,7 +567,7 @@ impl MemoryEncoder {
                 }
             };
             let n = &l.norm;
-            launch!(gpu, "layernorm_act_rows", ew(side * side), B256, 0; &y, &n.w, &n.b, l.cout, n.eps, ACT_GELU)?;
+            launch!(gpu, "layernorm_act_rows", ew(side * side), B256, 0; &y, &n.w, &n.b, l.cout, n.eps, Act::Gelu)?;
             x = y;
         }
         assert_eq!(side, GRID);
@@ -579,7 +577,7 @@ impl MemoryEncoder {
             let y = gpu.empty(x.shape())?;
             launch!(gpu, "dwconv7x7", ew(y.len()), B256, 0; &y, &x, &b.dw_w, &b.dw_b, GRID)?;
             b.norm.forward_inplace(gpu, &y)?;
-            b.fc2.forward_residual(gpu, &b.fc1.forward_act(gpu, &y, ACT_GELU)?, &x)?;
+            b.fc2.forward_residual(gpu, &b.fc1.forward_act(gpu, &y, Act::Gelu)?, &x)?;
         }
         self.out_proj.forward(gpu, &x)
     }
@@ -624,7 +622,7 @@ impl Tracker {
         Ok(Self {
             mem_attn: MemoryAttention::load(gpu, wts)?,
             mem_enc: MemoryEncoder::load(gpu, wts)?,
-            obj_ptr_proj: Mlp::load_in_out(gpu, wts, &format!("{p}.object_pointer_proj"), 3, ACT_RELU)?,
+            obj_ptr_proj: Mlp::load_in_out(gpu, wts, &format!("{p}.object_pointer_proj"), 3, Act::Relu)?,
             tpos_proj: Linear::load(gpu, wts, &format!("{p}.temporal_positional_encoding_projection_layer"))?,
             no_obj_ptr: wts.get(gpu, &format!("{p}.no_object_pointer"))?,
             no_obj_spatial: no_obj_spatial.reshape(&[MEM_D]),
@@ -738,18 +736,18 @@ pub struct VideoTracker<'a> {
     next_frame: usize,
     objects: usize,
     cond: Vec<MemFrame>,
-    /// the last frames (up to `min(num_frames, 16) - 1`) whose score passed
+    /// The last frames (up to `min(num_frames, 16) - 1`) whose score passed
     /// [`MEMORY_SCORE_THRESHOLD`], oldest first
     passing: VecDeque<MemFrame>,
-    /// the previous frame when its score didn't pass: upstream always keeps it
+    /// The previous frame when its score didn't pass: upstream always keeps it
     prev: Option<MemFrame>,
 }
 
 /// Features of one video frame
 pub(crate) struct FrameFeatures {
     pub(crate) point: PointImage,
-    /// tracker neck 72x72 level `[5184, 256]`, without the no-memory embedding
-    pub(crate) fpn2: Tensor,
+    /// Tracker neck's `fpn.coarse` `[5184, 256]`, without the no-memory embedding
+    pub(crate) coarse: Tensor,
 }
 
 impl Sam3 {
@@ -761,9 +759,9 @@ impl Sam3 {
             self.backbone.forward(gpu, pixels)?
         };
         let _r = range(c"neck");
-        let mut fpn = self.tracker_neck.forward(gpu, &Trunk::new(gpu, trunk)?)?;
+        let fpn = self.tracker_neck.forward(gpu, &Trunk::new(gpu, trunk)?)?;
         let point = self.point.prepare_image(gpu, &fpn)?;
-        Ok(FrameFeatures { point, fpn2: fpn.pop().expect("three levels") })
+        Ok(FrameFeatures { point, coarse: fpn.coarse })
     }
 
     /// Starts tracking objects through a video of `num_frames` frames: segments each
@@ -877,7 +875,7 @@ impl VideoTracker<'_> {
         for (b, &score) in scores.iter().enumerate() {
             let mask = gpu.empty(&[n])?;
             gpu.copy_dtod(input.at(b * n), mask.ptr(), n * 4)?;
-            mem.push(m.tracker.memory(gpu, &feats.fpn2, &mask, score > 0.0)?);
+            mem.push(m.tracker.memory(gpu, &feats.coarse, &mask, score > 0.0)?);
         }
         let keys = self.frame_keys(&mem)?;
         self.cond.push(MemFrame { frame: 0, mem, ptr: ptrs, keys });
@@ -1017,7 +1015,7 @@ impl VideoTracker<'_> {
         // layer 0 up to its cross-attention is the same for every object
         let start = if inputs.is_none() {
             let _r = range(c"memory_attention");
-            Some(m.tracker.mem_attn.frame_start(gpu, &feats.fpn2)?)
+            Some(m.tracker.mem_attn.frame_start(gpu, &feats.coarse)?)
         } else {
             None
         };
@@ -1031,7 +1029,7 @@ impl VideoTracker<'_> {
                 let _r = range(c"memory_attention");
                 match inputs.as_mut().and_then(Iterator::next) {
                     Some((memory, memory_pos)) => {
-                        m.tracker.mem_attn.forward(gpu, &feats.fpn2, &memory, &memory_pos, ptr_tokens)?
+                        m.tracker.mem_attn.forward(gpu, &feats.coarse, &memory, &memory_pos, ptr_tokens)?
                     }
                     None => self.memory_attention_cached(&sel, b, start.as_ref().expect("BF16 frame start"))?,
                 }
@@ -1048,7 +1046,7 @@ impl VideoTracker<'_> {
             let _r = range(c"memory_encoder");
             let high = upsample(gpu, Arg::slice(low_res.at(b * side), side), 1, IMAGE_SIZE, IMAGE_SIZE)?;
             let input = mask_for_mem(gpu, &high, false)?;
-            mems.push(m.tracker.memory(gpu, &feats.fpn2, &input, present)?);
+            mems.push(m.tracker.memory(gpu, &feats.coarse, &input, present)?);
             // `cal_mem_score`: present objects' rescaled score and their best IoU
             norm_sum += if present { 2.0 / (1.0 + (-score).exp()) - 1.0 } else { 0.0 };
             iou_sum += iou[best];
@@ -1097,20 +1095,14 @@ impl VideoTracker<'_> {
         let gpu = &self.model.gpu;
         let _r = range(c"postprocess");
         let (w, h) = (self.width, self.height);
-        // objects in groups of at most MASK_GROUP_ELEMENTS pixels, so a launch stays under
-        // the 2^32 threads `ew` allows and the GPU never holds every object's FP32 plane
-        let (plane, side) = (w * h, LOW_RES * LOW_RES);
-        let group = (MASK_GROUP_ELEMENTS / plane).max(1).min(self.objects);
-        let up = gpu.empty(&[group, plane])?;
-        let mask = gpu.alloc_bytes(group * plane)?;
+        // each group is downloaded before the next, so the GPU holds one group's bytes
+        let resize = MaskResize::new(gpu, self.objects, w, h)?;
+        let plane = w * h;
+        let mask = gpu.alloc_bytes(resize.group() * plane)?;
         let mut masks = Vec::with_capacity(self.objects);
-        for start in (0..self.objects).step_by(group) {
-            let k = group.min(self.objects - start);
-            let n = k * plane;
-            let input = Arg::slice(low_res.at(start * side), k * side);
-            launch!(gpu, "resize_bilinear", ew(n), B256, 0; Arg::slice(up.ptr(), n), input, LOW_RES, LOW_RES, h, w)?;
-            // sigmoid(x) > 0.5 is x > 0
-            launch!(gpu, "threshold_u8", ew(n), B256, 0; Arg::slice(mask.ptr(), n), Arg::slice(up.ptr(), n), 0.0f32)?;
+        for range in resize.groups() {
+            let n = range.len() * plane;
+            resize.run(gpu, &low_res, range, Arg::slice(mask.ptr(), n))?;
             let mut bytes = vec![0u8; n];
             gpu.download_into(&mask, &mut bytes)?;
             masks.extend(bytes.chunks_exact(plane).map(<[u8]>::to_vec));
@@ -1148,7 +1140,6 @@ fn stability(logits: &[f32]) -> f32 {
     if union > 0 { inter as f32 / union as f32 } else { 1.0 }
 }
 
-/// First index of the maximum, like `torch.argmax`
 /// All the clicks, or the first and last half of [`MAX_CLICKS`] when there are more
 fn cap_clicks(points: &[PointPrompt]) -> Vec<PointPrompt> {
     if points.len() <= MAX_CLICKS {
@@ -1156,14 +1147,4 @@ fn cap_clicks(points: &[PointPrompt]) -> Vec<PointPrompt> {
     }
     let first = MAX_CLICKS / 2;
     points[..first].iter().chain(&points[points.len() - (MAX_CLICKS - first)..]).copied().collect()
-}
-
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    for (i, x) in v.iter().enumerate() {
-        if *x > v[best] {
-            best = i;
-        }
-    }
-    best
 }

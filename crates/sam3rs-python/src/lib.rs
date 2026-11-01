@@ -23,14 +23,6 @@ fn precision(name: &str) -> PyResult<Precision> {
     name.parse().map_err(error)
 }
 
-fn precision_name(p: Precision) -> &'static str {
-    match p {
-        Precision::Fp32 => "fp32",
-        Precision::Tf32 => "tf32",
-        Precision::Bf16 => "bf16",
-    }
-}
-
 /// The loaded model on one GPU
 ///
 /// `Sam3` is `Send` but not `Sync`, so calls from several Python threads take turns
@@ -142,7 +134,7 @@ impl Model {
 
     #[getter]
     fn precision(&self) -> &'static str {
-        precision_name(self.precision)
+        self.precision.as_str()
     }
 
     fn encode(&self, py: Python<'_>, width: usize, height: usize, rgb: &[u8]) -> PyResult<Embedding> {
