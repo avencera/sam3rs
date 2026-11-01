@@ -1172,6 +1172,7 @@ dependencies = [
  "eyre",
  "hf-hub",
  "image",
+ "libloading",
  "memmap2",
  "regex",
  "safetensors",

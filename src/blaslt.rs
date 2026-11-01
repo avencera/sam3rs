@@ -10,6 +10,8 @@ use cudarc::driver::result as cur;
 use cudarc::driver::sys::CUstream;
 use eyre::{Result, WrapErr, bail};
 
+use crate::cublas::Lt;
+
 /// NVIDIA's recommended cuBLASLt workspace for Hopper and newer
 const WORKSPACE: usize = 32 << 20;
 
@@ -66,6 +68,7 @@ struct Plan {
 }
 
 pub struct BlasLt {
+    api: &'static Lt,
     handle: lt::cublasLtHandle_t,
     workspace: u64,
     plans: RefCell<HashMap<Key, Plan>>,
@@ -76,11 +79,11 @@ fn check(status: lt::cublasStatus_t) -> Result<()> {
 }
 
 impl BlasLt {
-    pub fn new() -> Result<Self> {
+    pub fn new(api: &'static Lt) -> Result<Self> {
         let mut handle = std::ptr::null_mut();
-        unsafe { check(lt::cublasLtCreate(&mut handle))? };
+        unsafe { check((api.create)(&mut handle))? };
         let workspace = unsafe { cur::malloc_sync(WORKSPACE) }.wrap_err("cuBLASLt workspace")?;
-        Ok(Self { handle, workspace, plans: RefCell::new(HashMap::new()) })
+        Ok(Self { api, handle, workspace, plans: RefCell::new(HashMap::new()) })
     }
 
     /// Row-major `out[m, n] = epilogue(x[m, k] @ w[n, k]^T + beta * out)` with BF16 `x`
@@ -105,7 +108,7 @@ impl BlasLt {
             std::collections::hash_map::Entry::Vacant(e) => e.insert(self.plan(key)?),
         };
         let set = |attr, value: *const c_void, size| unsafe {
-            check(lt::cublasLtMatmulDescSetAttribute(plan.desc, attr, value, size))
+            check((self.api.matmul_desc_set_attribute)(plan.desc, attr, value, size))
         };
         if epilogue.has_bias() {
             set(
@@ -116,7 +119,7 @@ impl BlasLt {
         }
         let alpha = 1f32;
         unsafe {
-            check(lt::cublasLtMatmul(
+            check((self.api.matmul)(
                 self.handle,
                 plan.desc,
                 (&alpha as *const f32).cast(),
@@ -143,13 +146,13 @@ impl BlasLt {
         let Key { m, n, k, x_ld, epilogue, out_bf16 } = key;
         unsafe {
             let mut desc = std::ptr::null_mut();
-            check(lt::cublasLtMatmulDescCreate(
+            check((self.api.matmul_desc_create)(
                 &mut desc,
                 lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 lt::cudaDataType_t::CUDA_R_32F,
             ))?;
             let set =
-                |attr, value: *const c_void, size| check(lt::cublasLtMatmulDescSetAttribute(desc, attr, value, size));
+                |attr, value: *const c_void, size| check((self.api.matmul_desc_set_attribute)(desc, attr, value, size));
             use lt::cublasLtMatmulDescAttributes_t::{
                 CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_MATMUL_DESC_TRANSA,
                 CUBLASLT_MATMUL_DESC_TRANSB,
@@ -171,7 +174,7 @@ impl BlasLt {
 
             let layout = |ty, rows: usize, cols: usize, ld: usize| -> Result<lt::cublasLtMatrixLayout_t> {
                 let mut l = std::ptr::null_mut();
-                check(lt::cublasLtMatrixLayoutCreate(&mut l, ty, rows as u64, cols as u64, ld as i64))?;
+                check((self.api.matrix_layout_create)(&mut l, ty, rows as u64, cols as u64, ld as i64))?;
                 Ok(l)
             };
             let w = layout(lt::cudaDataType_t::CUDA_R_16BF, k, n, k)?;
@@ -179,9 +182,9 @@ impl BlasLt {
             let out = layout(out_ty, n, m, n)?;
 
             let mut pref = std::ptr::null_mut();
-            check(lt::cublasLtMatmulPreferenceCreate(&mut pref))?;
+            check((self.api.preference_create)(&mut pref))?;
             let ws = WORKSPACE as u64;
-            check(lt::cublasLtMatmulPreferenceSetAttribute(
+            check((self.api.preference_set_attribute)(
                 pref,
                 lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                 (&ws as *const u64).cast(),
@@ -189,7 +192,7 @@ impl BlasLt {
             ))?;
             let mut result = std::mem::MaybeUninit::<lt::cublasLtMatmulHeuristicResult_t>::zeroed();
             let mut found = 0;
-            let status = lt::cublasLtMatmulAlgoGetHeuristic(
+            let status = (self.api.algo_get_heuristic)(
                 self.handle,
                 desc,
                 w,
@@ -201,7 +204,7 @@ impl BlasLt {
                 result.as_mut_ptr(),
                 &mut found,
             );
-            lt::cublasLtMatmulPreferenceDestroy(pref);
+            (self.api.preference_destroy)(pref);
             check(status)?;
             if found == 0 {
                 bail!("no cuBLASLt algorithm for m={m} n={n} k={k} {epilogue:?}");
@@ -215,13 +218,13 @@ impl Drop for BlasLt {
     fn drop(&mut self) {
         unsafe {
             for plan in self.plans.get_mut().values() {
-                lt::cublasLtMatrixLayoutDestroy(plan.w);
-                lt::cublasLtMatrixLayoutDestroy(plan.x);
-                lt::cublasLtMatrixLayoutDestroy(plan.out);
-                lt::cublasLtMatmulDescDestroy(plan.desc);
+                (self.api.matrix_layout_destroy)(plan.w);
+                (self.api.matrix_layout_destroy)(plan.x);
+                (self.api.matrix_layout_destroy)(plan.out);
+                (self.api.matmul_desc_destroy)(plan.desc);
             }
             let _ = cur::free_sync(self.workspace);
-            lt::cublasLtDestroy(self.handle);
+            (self.api.destroy)(self.handle);
         }
     }
 }

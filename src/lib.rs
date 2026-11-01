@@ -27,6 +27,7 @@
 #![warn(missing_docs)]
 
 mod blaslt;
+mod cublas;
 mod detector;
 mod gpu;
 #[cfg(feature = "online")]
