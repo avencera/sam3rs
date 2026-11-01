@@ -46,7 +46,7 @@ fn compare(name: &str, got: &[f32], want: &[f32]) {
 /// `[rows, cols]` -> `[cols, rows]`
 fn transpose(gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
     let out = gpu.empty(&[x.cols(), x.rows()])?;
-    launch!(gpu, "transpose", ew(x.len()), B256, 0; &out, x, x.rows() as u64, x.cols())?;
+    launch!(gpu, "transpose", ew(out.len()), B256, 0; &out, x, x.cols())?;
     Ok(out)
 }
 
@@ -127,7 +127,14 @@ fn stages() -> Result<()> {
         println!("  iou {:?} vs {:?}", second.iou, fixture(&st, &format!("{key}.iou"))?);
         let clamped: Vec<f32> = gpu.download(&second.low_res)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
         compare("low_res", &clamped, &fixture(&st, &format!("{key}.low_res"))?);
-        let masks = full_res_masks(&gpu, &second.low_res, 3, img.width(), img.height())?;
+        let masks = full_res_masks(
+            &gpu,
+            &second.low_res,
+            3,
+            img.width(),
+            img.height(),
+            vec![0u8; 3 * img.width() * img.height()],
+        )?;
         let want = fixture(&st, &format!("{key}.masks"))?;
         let hw = img.width() * img.height();
         for m in 0..3 {

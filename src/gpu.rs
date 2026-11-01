@@ -19,18 +19,20 @@ use cudarc::driver::sys::{self as cu, CUdeviceptr, CUfunction, CUmemoryPool, CUm
 use cudarc::driver::{CudaContext, CudaStream, result as cur};
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 
-use crate::blaslt::{BlasLt, Epilogue};
+use crate::blaslt::{BlasLt, Epilogue, Operands};
 
-/// Kernels from `kernels/sam3.cu` as PTX for compute capability 8.0, the first with the
-/// BF16 `mma.sync` the attention kernel uses. The driver JIT-compiles it for the GPU it
-/// runs on; `scripts/build-ptx.sh` regenerates both tiers
+/// Kernels from the cuda-oxide crate `crates/sam3rs-kernels` as PTX for compute
+/// capability 8.0, the first with the BF16 `mma.sync` the attention kernel uses. The
+/// driver JIT-compiles it for the GPU it runs on; `scripts/build-ptx.sh` regenerates both
+/// tiers
 static PTX_SM80: &str = concat!(include_str!("../kernels/ptx/sam3.sm80.ptx"), "\0");
 
 /// The same kernels as compute_120 PTX for RTX 50 series and newer. On an RTX 5090 it
 /// encodes about 3% faster than JIT-compiling the compute_80 tier
 static PTX_SM120: &str = concat!(include_str!("../kernels/ptx/sam3.sm120.ptx"), "\0");
 
-/// Oldest driver API the PTX (ISA 9.0) and cuBLAS 13 run on, as `cuDriverGetVersion` reports it
+/// Oldest driver API cuBLAS 13 runs on, as `cuDriverGetVersion` reports it. The PTX (ISA 8.7
+/// at most) needs no newer one
 const MIN_DRIVER: i32 = 13000;
 const CUBLAS_MAJOR: i32 = 13;
 
@@ -79,8 +81,11 @@ impl Buf {
         self.ptr
     }
 
-    pub fn bytes(&self) -> usize {
-        self.bytes
+    /// The whole buffer as a kernel slice of `T`, the element type the kernel declares
+    /// for it (`u16` for BF16 or FP16, `[u16; 8]` for packed groups of eight)
+    pub fn slice<T>(&self) -> Arg {
+        debug_assert!(self.bytes.is_multiple_of(size_of::<T>()));
+        Arg::slice(self.ptr, self.bytes / size_of::<T>())
     }
 }
 
@@ -138,15 +143,40 @@ impl Tensor {
 }
 
 /// A kernel argument, kept alive until the launch call returns
+///
+/// The kernels are cuda-oxide functions: each `&[T]` or `DisjointSlice<T>` parameter
+/// lowers to two PTX params, the address then the length in elements of `T`, which is
+/// [`Arg::Slice`]. Sizes are `u32` and the rest are 32-bit scalars. There is no bare
+/// pointer kind, since no kernel takes one
+#[derive(Clone, Copy, Debug)]
 pub enum Arg {
-    U64(u64),
+    /// Address and length in elements of the kernel's slice type
+    Slice(u64, u64),
+    U32(u32),
     I32(i32),
     F32(f32),
 }
 
-impl From<u64> for Arg {
-    fn from(v: u64) -> Self {
-        Arg::U64(v)
+impl Arg {
+    /// An empty slice, for an optional input the kernel skips when it is empty. The
+    /// address is never read; it is non-null and aligned because a Rust slice's must be,
+    /// even when empty
+    pub const EMPTY: Arg = Arg::Slice(256, 0);
+
+    /// `len` elements of the kernel's slice type at `ptr`, for sub-views, offsets and
+    /// buffers that aren't a [`Tensor`]
+    pub fn slice(ptr: u64, len: usize) -> Self {
+        Arg::Slice(ptr, len as u64)
+    }
+
+    /// The PTX params this argument fills, in order
+    fn params(&self) -> &'static [Param] {
+        match self {
+            Arg::Slice(..) => &[Param::Ptr, Param::U64],
+            // the PTX declares i32 params as .u32 too
+            Arg::U32(_) | Arg::I32(_) => &[Param::U32],
+            Arg::F32(_) => &[Param::F32],
+        }
     }
 }
 
@@ -158,7 +188,7 @@ impl From<i32> for Arg {
 
 impl From<usize> for Arg {
     fn from(v: usize) -> Self {
-        Arg::I32(i32::try_from(v).expect("kernel int argument overflows i32"))
+        Arg::U32(u32::try_from(v).expect("kernel size argument overflows u32"))
     }
 }
 
@@ -168,19 +198,22 @@ impl From<f32> for Arg {
     }
 }
 
+/// The whole tensor as an f32 slice
 impl From<&Tensor> for Arg {
     fn from(t: &Tensor) -> Self {
-        Arg::U64(t.ptr())
+        Arg::slice(t.ptr(), t.len())
     }
 }
 
 impl From<&mut Tensor> for Arg {
     fn from(t: &mut Tensor) -> Self {
-        Arg::U64(t.ptr())
+        Arg::slice(t.ptr(), t.len())
     }
 }
 
-/// Launches a kernel from the sam3rs module: `launch!(gpu, "name", grid, block, smem; args...)`
+/// Launches a kernel from the sam3rs module: `launch!(gpu, "name", grid, block, smem;
+/// args...)`, each argument converted with `Arg::from`: a [`Tensor`] is its f32 slice, a
+/// `usize` a `u32` size. Use [`Arg::slice`] or [`Buf::slice`] for other slices
 macro_rules! launch {
     ($gpu:expr, $name:expr, $grid:expr, $block:expr, $smem:expr; $($arg:expr),* $(,)?) => {
         $gpu.launch($name, $grid, $block, $smem, vec![$($crate::gpu::Arg::from($arg)),*])
@@ -229,9 +262,13 @@ pub enum Precision {
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default
     Tf32,
-    /// BF16 tensor-core GEMMs (FP32 accumulation) in the vision backbone and necks.
-    /// Every other GEMM stays FP32, but unmasked attention with head dim 32 or 64 runs
-    /// the fused kernel everywhere, which rounds q, k and v to BF16
+    /// Tensor-core GEMMs with FP32 accumulation everywhere. The vision backbone, necks
+    /// and text encoder MLP keep BF16 weights and activations; the rest of the text
+    /// encoder, the fusion encoder, detector and point decoder keep FP32 ones, and cuBLAS
+    /// may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though it
+    /// picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
+    /// and the detector's box-biased cross-attention, run the fused kernel, which rounds
+    /// q, k and v to BF16
     Bf16,
 }
 
@@ -253,10 +290,14 @@ pub struct Gpu {
     lt: Option<BlasLt>,
     device: Arc<Device>,
     module: CUmodule,
-    functions: RefCell<HashMap<&'static str, CUfunction>>,
+    /// the PTX `module` was loaded from, which the launch guard reads params from
+    ptx: &'static str,
+    functions: RefCell<HashMap<&'static str, Kernel>>,
     blas: blas::cublasHandle_t,
     /// compute type of GEMMs with FP32 inputs
     fp32_compute: blas::cublasComputeType_t,
+    /// the same for cuBLASLt linears with FP32 inputs
+    fp32_operands: Operands,
     precision: Precision,
     /// host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
@@ -282,16 +323,16 @@ impl Gpu {
 
         // PTX JIT-compiles forward to any newer GPU, never back to an older one
         let ptx = if major >= 12 { PTX_SM120 } else { PTX_SM80 };
-        let module = unsafe { cur::module::load_data(ptx.as_ptr().cast()) }
-            .wrap_err("JIT-compile the sam3rs kernels (PTX ISA 9.0 needs NVIDIA driver r580 or newer)")?;
+        let module =
+            unsafe { cur::module::load_data(ptx.as_ptr().cast()) }.wrap_err("JIT-compile the sam3rs kernels")?;
 
         let mut handle = std::ptr::null_mut();
         unsafe {
             check_blas(blas::cublasCreate_v2(&mut handle))?;
             check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
         }
-        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and plain FP32
-        // compute for the GEMMs BF16 mode keeps in FP32
+        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and for the
+        // FP32-input GEMMs of BF16 mode, tensor cores that may round inputs to BF16
         let (math, fp32_compute) = match precision {
             Precision::Fp32 => {
                 (blas::cublasMath_t::CUBLAS_PEDANTIC_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC)
@@ -299,7 +340,12 @@ impl Gpu {
             Precision::Tf32 => {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32)
             }
-            Precision::Bf16 => (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F),
+            // strict FP32 compute here cost a third of a detect call with no parity gain,
+            // and FAST_16BF kept more score headroom than FAST_TF32 on the parity set. cuBLAS
+            // still picks TF32 kernels for most of these shapes on an RTX 5090
+            Precision::Bf16 => {
+                (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF)
+            }
         };
         unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
 
@@ -307,14 +353,21 @@ impl Gpu {
             Precision::Fp32 | Precision::Tf32 => None,
             Precision::Bf16 => Some(BlasLt::new()?),
         };
+        let fp32_operands = match fp32_compute {
+            blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => Operands::F32FastTf32,
+            blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF => Operands::F32Fast16Bf,
+            _ => Operands::F32,
+        };
 
         Ok(Self {
             lt,
             device,
             module,
+            ptx,
             functions: RefCell::new(HashMap::new()),
             blas: handle,
             fp32_compute,
+            fp32_operands,
             precision,
             pending: RefCell::new(Vec::new()),
             pending_bytes: Cell::new(0),
@@ -420,6 +473,19 @@ impl Gpu {
         self.synchronize()
     }
 
+    /// Copies consecutive runs of `src` into each of `hosts` in turn and waits once, so
+    /// results land in their final buffers without a staging copy
+    pub fn download_split(&self, src: &Buf, hosts: &mut [Vec<u8>]) -> Result<()> {
+        let total: usize = hosts.iter().map(Vec::len).sum();
+        ensure!(total <= src.bytes, "download of {total} bytes from a {} byte buffer", src.bytes);
+        let mut offset = 0;
+        for host in hosts.iter_mut().filter(|h| !h.is_empty()) {
+            unsafe { cur::memcpy_dtoh_async(host.as_mut_slice(), src.ptr + offset as u64, self.cu_stream())? };
+            offset += host.len();
+        }
+        self.synchronize()
+    }
+
     pub fn download(&self, t: &Tensor) -> Result<Vec<f32>> {
         let mut host = vec![0f32; t.len()];
         self.download_into(&t.buf, &mut host)?;
@@ -432,16 +498,25 @@ impl Gpu {
         Ok(out)
     }
 
-    fn function(&self, name: &'static str) -> Result<CUfunction> {
-        if let Some(f) = self.functions.borrow().get(name) {
-            return Ok(*f);
+    /// The kernel `name`, once its PTX params match `args`. The params are read from
+    /// the loaded PTX on first use and cached with the function, so later launches only
+    /// compare them
+    fn function(&self, name: &'static str, args: &[Arg]) -> Result<CUfunction> {
+        if let Some(k) = self.functions.borrow().get(name) {
+            k.check(name, args)?;
+            return Ok(k.f);
         }
         let f = unsafe { cur::module::get_function(self.module, CString::new(name)?) }
             .wrap_err_with(|| format!("kernel {name} missing from the PTX"))?;
-        self.functions.borrow_mut().insert(name, f);
+        let k = Kernel { f, params: entry_params(self.ptx, name)? };
+        k.check(name, args)?;
+        self.functions.borrow_mut().insert(name, k);
         Ok(f)
     }
 
+    /// Launches `name` with one PTX param per scalar and two per slice. Fails without
+    /// launching if `args` don't match the kernel's PTX params in count and type, which
+    /// the driver would otherwise accept and misread
     pub fn launch(
         &self,
         name: &'static str,
@@ -450,15 +525,20 @@ impl Gpu {
         smem: u32,
         args: Vec<Arg>,
     ) -> Result<()> {
-        let f = self.function(name)?;
-        let mut params: Vec<*mut c_void> = args
-            .iter()
-            .map(|a| match a {
-                Arg::U64(v) => v as *const u64 as *mut c_void,
-                Arg::I32(v) => v as *const i32 as *mut c_void,
-                Arg::F32(v) => v as *const f32 as *mut c_void,
-            })
-            .collect();
+        let f = self.function(name, &args)?;
+        // the 32-bit thread index of the elementwise kernels is exact only up to here
+        ensure!(grid.0 as u64 * block.0 as u64 <= 1 << 32, "launch {name}: more than 2^32 threads along x");
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(2 * args.len());
+        for a in &args {
+            match a {
+                Arg::Slice(ptr, len) => {
+                    params.extend([ptr as *const u64 as *mut c_void, len as *const u64 as *mut c_void]);
+                }
+                Arg::U32(v) => params.push(v as *const u32 as *mut c_void),
+                Arg::I32(v) => params.push(v as *const i32 as *mut c_void),
+                Arg::F32(v) => params.push(v as *const f32 as *mut c_void),
+            }
+        }
         if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
             return Ok(());
         }
@@ -491,7 +571,27 @@ impl Gpu {
         epilogue: Epilogue,
     ) -> Result<()> {
         let lt = self.lt.as_ref().ok_or_else(|| eyre!("cuBLASLt linears need Precision::Bf16"))?;
-        lt.linear(self.cu_stream(), mnk, x, x_ld, w, out, beta, bias, epilogue)
+        lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
+    }
+
+    /// [`Self::linear_bf16`] for FP32 `x`, `w` and `out`, with this precision's FP32
+    /// compute type. Returns false without launching anything when there is no cuBLASLt
+    /// handle (FP32 and TF32 modes), so the caller falls back to [`Self::gemm`]
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_f32(
+        &self,
+        mnk: (usize, usize, usize),
+        x: u64,
+        x_ld: usize,
+        w: u64,
+        out: u64,
+        beta: f32,
+        bias: u64,
+        epilogue: Epilogue,
+    ) -> Result<bool> {
+        let Some(lt) = &self.lt else { return Ok(false) };
+        lt.linear(self.cu_stream(), self.fp32_operands, mnk, x, x_ld, w, (out, false), beta, bias, epilogue)?;
+        Ok(true)
     }
 
     /// Row-major `C[m,n] = alpha * op(A)[m,k] @ op(B)[k,n] + beta * C`, batched by stride
@@ -562,6 +662,72 @@ impl Drop for Gpu {
     }
 }
 
+/// A PTX kernel param as the host fills it: slices are a `.u64 .ptr` address then a
+/// `.u64` length
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Param {
+    Ptr,
+    U64,
+    U32,
+    F32,
+}
+
+/// A loaded kernel and its PTX params
+struct Kernel {
+    f: CUfunction,
+    params: Vec<Param>,
+}
+
+impl Kernel {
+    /// Checks that `args` fill this kernel's params exactly: `cuLaunchKernel` reads each
+    /// param at the size the PTX declares, so a missing slice length or a dropped
+    /// scalar would shift every later argument silently, and a float passed for a size
+    /// would be read as its bits
+    fn check(&self, name: &str, args: &[Arg]) -> Result<()> {
+        let mut host = args.iter().flat_map(Arg::params);
+        for (i, &ptx) in self.params.iter().enumerate() {
+            match host.next() {
+                Some(&param) if param == ptx => {}
+                Some(&param) => bail!("kernel {name} param {i}: the PTX declares {ptx:?}, the host passes {param:?}"),
+                None => bail!("kernel {name} takes {} params, the host passes {i}", self.params.len()),
+            }
+        }
+        let extra = host.count();
+        ensure!(
+            extra == 0,
+            "kernel {name} takes {} params, the host passes {}",
+            self.params.len(),
+            self.params.len() + extra
+        );
+        Ok(())
+    }
+}
+
+/// The params of kernel `name` in `ptx`, in order. Read from the PTX text rather than the
+/// driver: `cuFuncGetParamCount` needs a newer driver than sam3rs supports, and probing
+/// `cuFuncGetParamInfo` past the last param is an API error that compute-sanitizer
+/// reports on every kernel
+fn entry_params(ptx: &str, name: &str) -> Result<Vec<Param>> {
+    let entry = format!(".entry {name}(");
+    let start = ptx.find(&entry).ok_or_else(|| eyre!("kernel {name} missing from the PTX"))? + entry.len();
+    let end = ptx[start..].find(')').ok_or_else(|| eyre!("kernel {name}: unterminated PTX param list"))?;
+    ptx[start..start + end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let ty = line.strip_prefix(".param ").and_then(|rest| rest.split_whitespace().next());
+            match (ty, line.contains(" .ptr ")) {
+                (Some(".u64"), true) => Ok(Param::Ptr),
+                (Some(".u64"), false) => Ok(Param::U64),
+                (Some(".u32"), false) => Ok(Param::U32),
+                (Some(".f32"), false) => Ok(Param::F32),
+                _ => Err(eyre!("kernel {name}: unexpected PTX param `{line}`")),
+            }
+        })
+        .collect()
+}
+
 /// A pool of our own instead of the device default, so keeping freed blocks cached
 /// doesn't change the default pool's behavior for other CUDA users in the process
 fn create_pool(ctx: &CudaContext) -> Result<CUmemoryPool> {
@@ -629,4 +795,28 @@ fn check_blas(status: blas::cublasStatus_t) -> Result<()> {
 /// Grid size for `n` items with `block` threads each
 pub fn blocks(n: usize, block: u32) -> u32 {
     u32::try_from(n.div_ceil(block as usize)).expect("grid too large")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PTX_SM80, PTX_SM120, entry_params};
+
+    /// The launch guard reads every kernel's params from the PTX text, so a cuda-oxide or
+    /// LLVM upgrade that changes the param syntax must fail here, not at a launch
+    #[test]
+    fn ptx_params_parse() {
+        let names: Vec<&str> = PTX_SM120
+            .match_indices(".entry ")
+            .map(|(i, m)| {
+                let rest = &PTX_SM120[i + m.len()..];
+                &rest[..rest.find('(').unwrap()]
+            })
+            .collect();
+        assert!(names.len() > 40, "found {} entries", names.len());
+        for name in names {
+            let params = entry_params(PTX_SM120, name).unwrap();
+            assert!(!params.is_empty(), "{name} has no params");
+            assert_eq!(params, entry_params(PTX_SM80, name).unwrap(), "{name} differs between the tiers");
+        }
+    }
 }

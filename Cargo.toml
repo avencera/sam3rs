@@ -63,7 +63,7 @@ nvtx = ["dep:cc"]
 
 [dependencies]
 # libcuda and cuBLAS are loaded at run time and the kernels ship as PTX, so the crate
-# builds without a CUDA toolkit. The 13.0 API floor matches the PTX ISA (driver r580+)
+# builds without a CUDA toolkit. The 13.0 API floor is cuBLAS 13's (driver r580+)
 cudarc = { version = "0.19.10", default-features = false, features = [
     "std",
     "driver",
