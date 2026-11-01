@@ -327,14 +327,21 @@ impl Gpu {
 
         // PTX JIT-compiles forward to any newer GPU, never back to an older one
         let ptx = if major >= 12 { PTX_SM120 } else { PTX_SM80 };
-        let module =
-            unsafe { cur::module::load_data(ptx.as_ptr().cast()) }.wrap_err("JIT-compile the sam3rs kernels")?;
+        // the module and cuBLAS handle are raw, so until `Gpu` owns them a failed step
+        // below frees them here; `Gpu::drop` only runs once construction finishes
+        let module = Unowned(
+            unsafe { cur::module::load_data(ptx.as_ptr().cast()) }.wrap_err("JIT-compile the sam3rs kernels")?,
+            |m| unsafe {
+                let _ = cur::module::unload(m);
+            },
+        );
 
-        let mut handle = std::ptr::null_mut();
-        unsafe {
-            check_blas(blas::cublasCreate_v2(&mut handle))?;
-            check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
-        }
+        let mut raw = std::ptr::null_mut();
+        unsafe { check_blas(blas::cublasCreate_v2(&mut raw))? };
+        let handle = Unowned(raw, |h| unsafe {
+            blas::cublasDestroy_v2(h);
+        });
+        unsafe { check_blas(blas::cublasSetStream_v2(handle.0, device.stream.cu_stream() as _))? };
         // pedantic math for the parity reference (default math measured the same on an RTX
         // 5090), TF32 tensor cores for Tf32, and for the FP32-input GEMMs of BF16 mode,
         // tensor cores that may round inputs to BF16
@@ -352,7 +359,7 @@ impl Gpu {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF)
             }
         };
-        unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
+        unsafe { check_blas(blas::cublasSetMathMode(handle.0, math))? };
 
         // every mode fuses bias and activation into cuBLASLt epilogues; FP32 mode's run with
         // plain FP32 compute, so the products are as strict as its cuBLAS GEMMs
@@ -366,10 +373,10 @@ impl Gpu {
         Ok(Self {
             lt,
             device,
-            module,
+            module: module.into_inner(),
             ptx,
             functions: RefCell::new(HashMap::new()),
-            blas: handle,
+            blas: handle.into_inner(),
             fp32_compute,
             fp32_operands,
             precision,
@@ -633,6 +640,23 @@ impl Gpu {
             )
         };
         check_blas(status).wrap_err_with(|| format!("gemm m={m} n={n} k={k} batch={batch}"))
+    }
+}
+
+/// A raw handle `Gpu::new` frees with its function unless the finished `Gpu` takes it
+struct Unowned<T: Copy>(T, fn(T));
+
+impl<T: Copy> Unowned<T> {
+    fn into_inner(self) -> T {
+        let value = self.0;
+        std::mem::forget(self);
+        value
+    }
+}
+
+impl<T: Copy> Drop for Unowned<T> {
+    fn drop(&mut self) {
+        (self.1)(self.0);
     }
 }
 
