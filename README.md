@@ -1,5 +1,8 @@
 # sam3rs
 
+<!-- generated from the crate docs in src/lib.rs by cargo-rdme: edit those, then run `cargo rdme` -->
+<!-- cargo-rdme start -->
+
 A native Rust/CUDA runtime for [Meta SAM 3](https://github.com/facebookresearch/sam3)
 image inference. It loads the official Hugging Face `model.safetensors` checkpoint and
 runs the whole image path on one CUDA stream without ONNX Runtime or PyTorch:
@@ -13,13 +16,17 @@ runs the whole image path on one CUDA stream without ONNX Runtime or PyTorch:
 
 Image features stay on the GPU between prompts. Kernels that cuBLAS doesn't cover are
 Rust, written with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) in
-[crates/sam3rs-kernels](crates/sam3rs-kernels). They ship as prebuilt PTX in
+[crates/sam3rs-kernels](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-kernels). They ship as prebuilt PTX in
 `kernels/ptx` that the driver compiles when the model loads, so building sam3rs needs no
 CUDA toolkit or cuda-oxide. `scripts/build-ptx.sh` regenerates the PTX after a kernel
 change.
 
 There is also a Python package with numpy in and out; see
-[crates/sam3rs-python](crates/sam3rs-python/README.md).
+[crates/sam3rs-python](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python).
+
+Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
+blocking client with rustls and the shared Python Hugging Face cache. The `online`
+feature enables downloads; local model loading works without it.
 
 ## Precision modes
 
@@ -209,6 +216,8 @@ boxes, mask logits) for one fixture.
   or long text prompts hasn't been measured.
 - Parity covers four images and 13 prompts, and the BF16 worst score delta is within
   about 0.005 of the 0.01 gate.
+
+<!-- cargo-rdme end -->
 
 ## License
 

@@ -1,0 +1,32 @@
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# TODO(license): switching sam3rs to Meta's SAM License needs a [[licenses.clarify]]
+# entry for sam3rs, since its license-file has no SPDX id
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    # pyo3-build-config depends on target-lexicon
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
