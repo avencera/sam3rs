@@ -26,6 +26,10 @@ from collections import defaultdict
 COPY_KINDS = {1: "HtoD", 2: "DtoH", 8: "DtoD", 10: "PtoP", 9: "HtoH"}
 LAUNCH = re.compile(r"(LaunchKernel|LaunchCooperativeKernel|cuLaunch)")
 GRAPH_LAUNCH = re.compile(r"GraphLaunch")
+# video_reference.py marks the last `frame N` range, which only found the video exhausted
+END_MARK = "frames exhausted"
+# NVTX_EVENTS eventType of a mark
+NVTX_MARK = 34
 # calls that block the host until the device catches up
 BLOCKING = re.compile(r"(Synchronize|^cudaMemcpy_|^cudaMemcpy$|^cuMemcpyDtoH|^cudaMemcpy2D_v)")
 
@@ -44,7 +48,22 @@ def load(path):
     ):
         label = text if text is not None else strings.get(text_id, "")
         nvtx.append((start, end, label, tid))
+    end_marks = [
+        (start, tid)
+        for start, text, text_id, tid in db.execute(
+            "SELECT start, text, textId, globalTid FROM NVTX_EVENTS WHERE eventType = ?", (NVTX_MARK,)
+        )
+        if (text if text is not None else strings.get(text_id, "")) == END_MARK
+    ]
 
+    # graph-level tracing (nsys's default for graphs) records one interval a graph launch and
+    # no kernel rows for it, which would undercount GPU busy time and stage times
+    if table_exists(db, "CUPTI_ACTIVITY_KIND_GRAPH_TRACE") and db.execute(
+        "SELECT 1 FROM CUPTI_ACTIVITY_KIND_GRAPH_TRACE LIMIT 1"
+    ).fetchone():
+        raise SystemExit("capture traced CUDA graphs as whole graphs; re-capture with --cuda-graph-trace=node")
+    if not table_exists(db, "CUPTI_ACTIVITY_KIND_KERNEL"):
+        raise SystemExit("capture has no kernel records; was CUDA tracing on?")
     kernels = list(
         db.execute(
             "SELECT k.start, k.end, k.correlationId, COALESCE(s.value, '') FROM CUPTI_ACTIVITY_KIND_KERNEL k "
@@ -65,7 +84,7 @@ def load(path):
                 f"SELECT start, end, correlationId, nameId, globalTid FROM {table}"
             ):
                 api.append((start, end, corr, strings.get(name_id, ""), tid))
-    return nvtx, kernels, copies, sets, api
+    return nvtx, end_marks, kernels, copies, sets, api
 
 
 def union_within(intervals, lo, hi):
@@ -93,13 +112,17 @@ def in_window(sorted_items, starts, lo, hi):
 
 
 def analyze(path, skip, window=None):
-    nvtx, kernels, copies, sets, api = load(path)
+    nvtx, end_marks, kernels, copies, sets, api = load(path)
     if window:
         # one window per range with this label (a ComfyUI node), numbered from `skip`
         picked = sorted((s, e, tid) for s, e, label, tid in nvtx if label == window)
         frames = [(s, e, skip + i, tid) for i, (s, e, tid) in enumerate(picked)]
     else:
-        frames = sorted((s, e, int(label.split()[1]), tid) for s, e, label, tid in nvtx if re.fullmatch(r"frame \d+", label))
+        frames = sorted(
+            (s, e, int(label.split()[1]), tid)
+            for s, e, label, tid in nvtx
+            if re.fullmatch(r"frame \d+", label) and not any(mt == tid and s <= m <= e for m, mt in end_marks)
+        )
     if not frames:
         raise SystemExit("no matching NVTX ranges; was the capture taken with --nvtx?")
     main_tid = frames[0][3]

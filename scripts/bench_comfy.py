@@ -17,8 +17,9 @@ its input directory (hard links), and posts API-format workflows built from core
   new click each time the way an interactive user clicks; `--refine` sets the decoder
   passes (the node default is 2, and each pass re-runs the image encoder)
 
-Each video config runs `--runs` times with a slightly different detection threshold so
-ComfyUI's cache re-executes the tracker node but keeps the decoded video; the first run is
+Each video config runs `--runs` times with a `bench_run` key added to the tracker's inputs:
+the node ignores it, but it changes ComfyUI's cache key, so the tracker re-executes with the
+same settings and the decoded video stays cached; the first run is
 the warm-up and includes video decoding. One JSON line per config goes to
 `OUT/comfy-<scenario>.jsonl`. `--nsys PREFIX` runs the server under nsys and profiles the
 `--profile-prompt`-th prompt
@@ -216,8 +217,11 @@ def video_click(server, args, clip, n_obj, spec, out):
                 "model": ["ckpt", 0],
                 "initial_mask": mask,
                 # varied per run only so the cache re-runs the tracker; no text, so it is unused
-                "detection_threshold": 0.5 + 0.001 * r,
+                "detection_threshold": 0.5,
                 "max_objects": n_obj,
+                # not a node input, so the node never sees it, but it is part of ComfyUI's
+                # cache key: each run re-executes the tracker and keeps the decoded video
+                "bench_run": r,
                 "detect_interval": 1,
             },
         }
@@ -239,8 +243,10 @@ def video_text(server, args, clip, spec, out):
                 "images": ["frames", 0],
                 "model": ["ckpt", 0],
                 "conditioning": ["text", 0],
-                "detection_threshold": 0.5 + 0.001 * r,
+                # fixed, since text detections near it would change the tracked objects
+                "detection_threshold": 0.5,
                 "max_objects": cap,
+                "bench_run": r,
                 "detect_interval": 1,
             },
         }
@@ -327,7 +333,8 @@ def main():
     ap.add_argument("--profile-prompt", type=int, default=0)
     args = ap.parse_args()
 
-    out = pathlib.Path(args.out)
+    # the launcher changes into the ComfyUI directory, so relative paths would split
+    out = pathlib.Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     inputs = pathlib.Path(args.comfy_dir) / "input"
     inputs.mkdir(exist_ok=True)
@@ -351,7 +358,10 @@ def main():
             clip, _, n = item.partition(":")
             spec = specs[clip.split("-")[0]]
             if args.scenario == "video-click":
-                row = video_click(server, args, clip, int(n or 1), spec, out)
+                n_obj = int(n or 1)
+                if not 1 <= n_obj <= len(spec["objects"]):
+                    raise SystemExit(f"{clip}: {n_obj} objects asked, the prompt file has {len(spec['objects'])}")
+                row = video_click(server, args, clip, n_obj, spec, out)
             elif args.scenario == "video-text":
                 row = video_text(server, args, clip, spec, out)
             else:
