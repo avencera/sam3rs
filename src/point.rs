@@ -362,8 +362,8 @@ pub fn full_res_masks(
     n: usize,
     width: usize,
     height: usize,
-    mut out: Vec<u8>,
-) -> Result<Vec<u8>> {
+    out: &mut [u8],
+) -> Result<()> {
     let side = LOW_RES;
     assert_eq!(low_res.len(), n * side * side);
     let mut logits = gpu.download(low_res)?;
@@ -376,6 +376,5 @@ pub fn full_res_masks(
     let mask = gpu.alloc_bytes(up.len())?;
     launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
     ensure!(out.len() == up.len(), "mask buffer of {} bytes for {} pixels", out.len(), up.len());
-    gpu.download_into(&mask, &mut out)?;
-    Ok(out)
+    gpu.download_into(&mask, out)
 }

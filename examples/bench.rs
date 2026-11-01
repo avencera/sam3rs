@@ -77,19 +77,19 @@ fn main() -> Result<()> {
         let mut bytes = Vec::new();
         let pm = model.segment_points(&emb, &point)?;
         bytes.extend(pm.score.to_le_bytes());
-        bytes.extend(&pm.mask);
+        bytes.extend(pm.mask.iter());
         let detections: [(&str, &[BoxPrompt]); 3] =
             [(VISUAL_PROMPT, &[positive]), (VISUAL_PROMPT, &[positive, negative]), ("dog", &[])];
         for (text, boxes) in detections {
             let found = model.detect(&emb, text, boxes)?;
             bytes.extend((found.len() as u64).to_le_bytes());
-            for d in found {
+            for (i, d) in found.iter().enumerate() {
                 bytes.extend(d.score.to_le_bytes());
                 for v in d.bbox {
                     bytes.extend(v.to_le_bytes());
                 }
                 bytes.extend((d.query as u64).to_le_bytes());
-                bytes.extend(&d.mask);
+                bytes.extend(found.mask(i));
             }
         }
         std::fs::write(path, bytes)?;
