@@ -65,8 +65,8 @@ matrix multiply on tensor cores with BF16 or TF32 inputs. `precision="tf32"` kee
 weights and activations but runs the matrix multiplies on TF32 tensor cores, as ONNX
 Runtime does for FP32 models, with most attention fused on TF32 tensor cores.
 `precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image
-takes about 33 ms in BF16, 64 ms in TF32 and 143 ms in FP32; a point prompt 1.9 to
-2.3 ms; a box prompt 5.5, 8.0 and 27 ms; and a text prompt 7.0, 9.3 and 30 ms.
+takes about 34 ms in BF16, 65 ms in TF32 and 119 ms in FP32; a point prompt 2.0 to
+2.2 ms; a box prompt 5.6, 8.0 and 27 ms; and a text prompt 7.0, 9.4 and 29 ms.
 
 Calls release the GIL while the GPU works. Calls on one model from several threads
 take turns.
