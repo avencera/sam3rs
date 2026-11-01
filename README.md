@@ -256,6 +256,12 @@ cargo run --release --example bench_video -- --frames DIR --clip horses --object
 `tests/video_prompts.json` (`--prompts`). `--outputs DIR` writes the last run's
 scores and masks for an A/B gate.
 
+`scripts/video_reference.py bench` times the PyTorch rows. `scripts/bench_comfy.py
+video-click horses-720p-64:1 horses-720p-64:3` times the ComfyUI row through a stock
+ComfyUI server, with per-node times from `scripts/comfy_launch.py`.
+`scripts/nsys_frames.py` turns an nsys capture of either into per-frame GPU busy
+time, launches and stage times.
+
 ## Parity
 
 `tests/parity.rs` runs four images and 13 prompts (text, box, negative box, points)
