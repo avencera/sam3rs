@@ -4,6 +4,7 @@ members = ["crates/sam3rs-python"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 # TODO(license): Apache-2.0 is a placeholder until the license is chosen. To switch to
 # Meta's SAM License, which has no SPDX id: put its text in LICENSE, replace this line
 # with `license-file = "LICENSE"`, set `license = "LicenseRef-SAM-License"` in
@@ -24,6 +25,7 @@ redundant_closure_for_method_calls = "warn"
 name = "sam3rs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Native Rust/CUDA runtime for Meta SAM 3 image segmentation with text, box and point prompts"
 license.workspace = true
 repository.workspace = true
@@ -51,9 +53,8 @@ workspace = true
 
 [features]
 default = ["online"]
-# downloads facebook/sam3 from Hugging Face over rustls (ureq's default), so nothing
-# links against the system OpenSSL
-online = ["dep:hf-hub", "hf-hub/ureq", "dep:ureq"]
+# blocking Hub downloads through hf-fetch, with rustls and no async runtime
+online = ["dep:hf-fetch", "hf-fetch/online"]
 # the `sam3rs` command
 cli = ["dep:clap", "dep:color-eyre"]
 # NVTX ranges per pipeline stage for nsys; builds csrc/nvtx.c against the CUDA toolkit's
@@ -78,9 +79,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 serde_json = "1"
 regex = "1.13"
 eyre = "0.6"
-hf-hub = { version = "0.5", optional = true, default-features = false }
-# hf-hub's error type wraps ureq's, which carries the HTTP status of a gated download
-ureq = { version = "3", optional = true, default-features = false }
+hf-fetch = { version = "0.1.2", default-features = false, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 color-eyre = { version = "0.6", optional = true }
 
@@ -90,6 +89,7 @@ cc = { version = "1", optional = true }
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
+tempfile = "3"
 
 [[bin]]
 name = "sam3rs"
