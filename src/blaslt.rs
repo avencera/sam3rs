@@ -18,7 +18,9 @@ const WORKSPACE: usize = 32 << 20;
 const TUNE_CANDIDATES: usize = 8;
 
 /// A tuned candidate replaces the heuristic's first choice only when it is this much
-/// faster, so the choice, and with it the summation order, stays the same from run to run
+/// faster, so most close calls keep the first choice. A candidate near the margin can still
+/// win in one process and lose in the next, so TF32 outputs can differ slightly between runs
+/// (on an RTX 5090, one binary gave two outputs 0.00001 apart in score)
 const TUNE_MARGIN: f32 = 1.05;
 
 /// What the epilogue applies after `x @ w^T + beta * out`

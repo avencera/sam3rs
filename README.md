@@ -35,7 +35,8 @@ There is also a Python package with numpy in and out; see
   ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
   fused into cuBLASLt epilogues. The first call of each GEMM shape times cuBLASLt's top
   candidate algorithms and switches from its first choice only to one more than 5%
-  faster, so close calls keep the same algorithm from run to run. FP32 weights and
+  faster. A candidate near that margin can win in one run and lose in the next, so
+  outputs can differ slightly between runs (about 0.00001 in score). FP32 weights and
   activations. Attention without a causal mask or additive bias, the detector's
   box-biased cross-attention included, runs a fused flash-attention kernel on TF32
   tensor cores with an FP32 softmax; the rest stays materialized.
