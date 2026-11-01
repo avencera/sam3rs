@@ -58,6 +58,19 @@ pub struct PointImage {
     pub feat_s1: Tensor,
 }
 
+/// One decoder pass with every output still on the device, for the video tracker
+pub struct Decoded {
+    /// `[4 - first, 288 * 288]` logits of mask tokens `first..4`
+    pub low_res: Tensor,
+    /// `[1, 4]` predicted IoU of all four mask tokens, after the sigmoid
+    pub iou: Tensor,
+    /// `[6 + prompts, 256]` output tokens: object score, IoU, then mask tokens 0 to 3
+    pub tokens: Tensor,
+}
+
+/// Row of mask token `m` in [`Decoded::tokens`]
+pub const MASK_TOKEN_ROW: usize = 2;
+
 /// Three candidate masks from one decoder pass
 pub struct PointOutput {
     /// `[3, 288 * 288]` logits. Upstream clamps them to +-32 before reuse as a mask
@@ -98,6 +111,7 @@ pub struct PointDecoder {
     upscale2: ConvT2x2,
     hyper: Vec<Mlp>,
     iou_head: Mlp,
+    obj_score_head: Mlp,
     no_mem: Tensor,
     conv_s0: Linear,
     conv_s1: Linear,
@@ -172,6 +186,7 @@ impl PointDecoder {
                 .map(|i| Mlp::load_in_out(gpu, wts, &format!("{md}.output_hypernetworks_mlps.{i}"), 3, ACT_RELU))
                 .collect::<Result<_>>()?,
             iou_head: Mlp::load_in_out(gpu, wts, &format!("{md}.iou_prediction_head"), 3, ACT_RELU)?,
+            obj_score_head: Mlp::load_in_out(gpu, wts, &format!("{md}.pred_obj_score_head"), 3, ACT_RELU)?,
             no_mem: wts.get(gpu, "tracker_model.no_memory_embedding")?,
             conv_s0: Linear::load(gpu, wts, &format!("{md}.conv_s0"))?,
             conv_s1: Linear::load(gpu, wts, &format!("{md}.conv_s1"))?,
@@ -189,8 +204,13 @@ impl PointDecoder {
         })
     }
 
-    /// Sparse prompt tokens: one per point plus the padding point
+    /// Sparse prompt tokens: one per point plus the padding point. Without points (a
+    /// tracked frame) upstream still passes one point labelled -1 before the padding, so
+    /// there are two padding tokens
     fn sparse_tokens(&self, points: &[PointPrompt], width: usize, height: usize) -> Vec<f32> {
+        if points.is_empty() {
+            return [self.not_a_point.as_slice(), self.not_a_point.as_slice()].concat();
+        }
         let n = points.len() + 1;
         let mut out = vec![0f32; n * D];
         let size = IMAGE_SIZE as f32;
@@ -240,6 +260,26 @@ impl PointDecoder {
         height: usize,
         mask_input: Option<&Tensor>,
     ) -> Result<PointOutput> {
+        let out = self.decode(gpu, &img.embed, img, points, (width, height), mask_input, 1)?;
+        let iou = gpu.download(&out.iou)?;
+        Ok(PointOutput { low_res: out.low_res, iou: [iou[1], iou[2], iou[3]] })
+    }
+
+    /// The decoder over image embedding `embed` (the memory-conditioned features on a
+    /// tracked frame, `img.embed` otherwise) and the high-resolution features of `img`,
+    /// with masks for mask tokens `first..4` only
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode(
+        &self,
+        gpu: &Gpu,
+        embed: &Tensor,
+        img: &PointImage,
+        points: &[PointPrompt],
+        (width, height): (usize, usize),
+        mask_input: Option<&Tensor>,
+        first: usize,
+    ) -> Result<Decoded> {
+        assert!(first < 4, "mask tokens 0 to 3");
         let mut tokens = self.output_tokens.clone();
         tokens.extend(self.sparse_tokens(points, width, height));
         let n = tokens.len() / D;
@@ -247,7 +287,7 @@ impl PointDecoder {
         let queries = gpu.clone_tensor(&prompt_pe)?;
 
         let keys = self.dense(gpu, mask_input)?;
-        crate::ops::add_assign(gpu, &keys, &img.embed)?;
+        crate::ops::add_assign(gpu, &keys, embed)?;
         let none = Mask::default();
 
         let mut queries = queries;
@@ -287,23 +327,33 @@ impl PointDecoder {
         crate::ops::add_assign(gpu, &up, &img.feat_s0)?;
         bias_act(gpu, &up, None, ACT_GELU)?;
 
-        // multimask output: mask tokens 1..=3 (token 0 is the single-mask output)
-        let low_res = gpu.empty(&[3, LOW_RES * LOW_RES])?;
+        // mask token 0 is the single-mask output, 1 to 3 the multimask ones
+        let side = LOW_RES * LOW_RES;
+        let low_res = gpu.empty(&[4 - first, side])?;
         let proj = Linear::new(up, None);
-        for m in 0..3 {
-            let token = gpu.empty(&[1, D])?;
-            gpu.copy_dtod(queries.at((3 + m) * D), token.ptr(), D * 4)?;
-            let hyper = self.hyper[m + 1].forward(gpu, &token)?;
-            proj.forward_raw(gpu, hyper.ptr(), hyper.cols(), 1, low_res.at(m * LOW_RES * LOW_RES), 0.0)?;
+        for (j, m) in (first..4).enumerate() {
+            let hyper = self.hyper[m].forward(gpu, &row(gpu, &queries, MASK_TOKEN_ROW + m)?)?;
+            proj.forward_raw(gpu, hyper.ptr(), hyper.cols(), 1, low_res.at(j * side), 0.0)?;
         }
 
-        let iou_token = gpu.empty(&[1, D])?;
-        gpu.copy_dtod(queries.at(D), iou_token.ptr(), D * 4)?;
-        let iou = self.iou_head.forward(gpu, &iou_token)?;
+        let iou = self.iou_head.forward(gpu, &row(gpu, &queries, 1)?)?;
         bias_act(gpu, &iou, None, ACT_SIGMOID)?;
-        let iou = gpu.download(&iou)?;
-        Ok(PointOutput { low_res, iou: [iou[1], iou[2], iou[3]] })
+        Ok(Decoded { low_res, iou, tokens: queries })
     }
+
+    /// `[1, 1]` object score logit of a decoder pass; the object is present when it is
+    /// above 0. The image path has no use for it, so [`Self::decode`] leaves it out
+    pub fn obj_score(&self, gpu: &Gpu, out: &Decoded) -> Result<Tensor> {
+        self.obj_score_head.forward(gpu, &row(gpu, &out.tokens, 0)?)
+    }
+}
+
+/// Row `r` of `x` as a `[1, cols]` tensor
+pub fn row(gpu: &Gpu, x: &Tensor, r: usize) -> Result<Tensor> {
+    let d = x.cols();
+    let out = gpu.empty(&[1, d])?;
+    gpu.copy_dtod(x.at(r * d), out.ptr(), d * 4)?;
+    Ok(out)
 }
 
 /// One low-res mask `[288^2]` clamped to +-32, as the next pass's mask input

@@ -1,13 +1,14 @@
 //! Vision backbone: patch embedding, position embedding and windowed attention layout
 //!
-//! Every kernel here is one thread per output element (or per output pair, for the RoPE
-//! split) with the thread's index as its only write location. Kernels whose natural loop
+//! Every kernel here is one thread per output element (or per output pair, for the key
+//! rotation) with the thread's index as its only write location. Kernels whose natural loop
 //! is over the input, like the window partition, are written as gathers over the output
 //! index so the writes stay disjoint. Index math is 32-bit: the host launches one thread
 //! per output element and keeps every buffer under 2^32 elements
 
 use cuda_device::{DisjointSlice, LinearTiles, kernel, launch_contract, thread};
 
+use crate::attention::{VIT_GRID, VIT_WIN, VIT_WIN_TOKENS};
 use crate::common::{Bf16, Elem, pack_bf16};
 
 /// `pixels [3, size, size] -> patches [(size / patch)^2, 3 * patch * patch]`, columns in
@@ -121,36 +122,6 @@ pub fn vit_split_rope(
     }
 }
 
-/// BF16 RoPE split, as [`vit_split_rope`] with BF16 qkv in and q, k, v out; the pair is
-/// rounded to nearest even with one conversion
-#[kernel(launch_context = lc)]
-#[launch_contract(domain = 1, coordinates = u32)]
-pub fn vit_split_rope_bf16(
-    mut q: DisjointSlice<Bf16, LinearTiles<2>>,
-    mut k: DisjointSlice<Bf16, LinearTiles<2>>,
-    mut v: DisjointSlice<Bf16, LinearTiles<2>>,
-    qkv: &[Bf16],
-    cos_t: &[f32],
-    sin_t: &[f32],
-    grid: u32,
-    win: u32,
-    heads: u32,
-    hd: u32,
-) {
-    let (tq, tk, tv) = (thread::index_1d_u32(lc), thread::index_1d_u32(lc), thread::index_1d_u32(lc));
-    let t = tq.get();
-    if let (Some(mut q), Some(mut k), Some(mut v)) = (q.tile_thread32(tq), k.tile_thread32(tk), v.tile_thread32(tv)) {
-        let r = split_rope_pair(t, qkv, cos_t, sin_t, grid, win, heads, hd);
-        let (pq, pk, pv) = (pack_bf16(r.q[0], r.q[1]), pack_bf16(r.k[0], r.k[1]), pack_bf16(r.v[0], r.v[1]));
-        q.at_const::<0>().write(Bf16(pq as u16));
-        q.at_const::<1>().write(Bf16((pq >> 16) as u16));
-        k.at_const::<0>().write(Bf16(pk as u16));
-        k.at_const::<1>().write(Bf16((pk >> 16) as u16));
-        v.at_const::<0>().write(Bf16(pv as u16));
-        v.at_const::<1>().write(Bf16((pv >> 16) as u16));
-    }
-}
-
 /// Index into `o [windows * heads, win * win, hd]` of merged output element `i` of
 /// `[grid * grid, heads * hd]`, undoing the window partition
 #[inline(always)]
@@ -174,13 +145,66 @@ pub fn vit_merge_heads(mut out: DisjointSlice<f32>, o: &[f32], grid: u32, win: u
     }
 }
 
-/// As [`vit_merge_heads`], rounding to BF16 for the projection GEMM
+/// The raster index of row `r` in window-major order, where each `VIT_WIN`-square window's
+/// tokens are contiguous and in raster order inside it
+#[inline(always)]
+fn window_to_raster(r: u32) -> u32 {
+    const NWX: u32 = VIT_GRID / VIT_WIN;
+    let (w, l) = (r / (VIT_WIN * VIT_WIN), r % (VIT_WIN * VIT_WIN));
+    ((w / NWX) * VIT_WIN + l / VIT_WIN) * VIT_GRID + (w % NWX) * VIT_WIN + l % VIT_WIN
+}
+
+/// The inverse of [`window_to_raster`]
+#[inline(always)]
+fn raster_to_window(tok: u32) -> u32 {
+    const NWX: u32 = VIT_GRID / VIT_WIN;
+    let (y, x) = (tok / VIT_GRID, tok % VIT_GRID);
+    ((y / VIT_WIN) * NWX + x / VIT_WIN) * VIT_WIN * VIT_WIN + (y % VIT_WIN) * VIT_WIN + x % VIT_WIN
+}
+
+/// Reorders the rows of `x [VIT_GRID^2, cols]` from raster to window-major order with
+/// `to_window` nonzero, and back otherwise, for the fused ViT attention's token order
+/// (see [`crate::attention::vit_attn_bf16_d64`])
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32)]
-pub fn vit_merge_heads_bf16(mut out: DisjointSlice<Bf16>, o: &[f32], grid: u32, win: u32, heads: u32, hd: u32) {
+pub fn vit_window_order(mut out: DisjointSlice<f32>, x: &[f32], cols: u32, to_window: u32) {
     let t = thread::index_1d_u32(lc);
     let i = t.get();
-    if let Some(mut out) = out.element_thread32(t) {
-        out.write(Bf16(pack_bf16(o[merge_source(i, grid, win, heads, hd)], 0.0) as u16));
-    }
+    let Some(mut out) = out.element_thread32(t) else { return };
+    let (row, c) = (i / cols, i % cols);
+    let src = if to_window != 0 { window_to_raster(row) } else { raster_to_window(row) };
+    out.write(x[(src * cols + c) as usize]);
+}
+
+/// Rotates the k columns of the qkv GEMM's output `qkv [tokens, 3 * dim]` by RoPE into `k
+/// [tokens, dim]`, one adjacent pair per thread, for [`crate::attention::vit_attn_bf16_d64`].
+/// Tokens are window-major; with `windowed` nonzero `cos`/`sin` are the window tables
+/// `[VIT_WIN_TOKENS, hd / 2]`, otherwise the global ones `[tokens, hd / 2]`
+///
+/// A pass of its own because the attention stages every key tile once per query tile:
+/// rotating while staging repeated the work and its table loads 9 times per window and 81
+/// times in a global block, which cost more than this pass
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn vit_rope_k_bf16(
+    mut k: DisjointSlice<Bf16, LinearTiles<2>>,
+    qkv: &[Bf16],
+    cos: &[f32],
+    sin: &[f32],
+    dim: u32,
+    hd: u32,
+    windowed: u32,
+) {
+    let t = thread::index_1d_u32(lc);
+    let p = t.get();
+    let Some(mut k) = k.tile_thread32(t) else { return };
+    let (row, c) = (p / (dim / 2), (p % (dim / 2)) * 2);
+    let src = (row * 3 * dim + dim + c) as usize;
+    let pos = if windowed != 0 { row % VIT_WIN_TOKENS } else { row };
+    let tab = (pos * (hd / 2) + (c % hd) / 2) as usize;
+    let (a, b, cs, sn) = (qkv[src].widen(), qkv[src + 1].widen(), cos[tab], sin[tab]);
+    // FP32 rotation and one rounding of the pair, as the q side does while staging
+    let y = pack_bf16(a * cs - b * sn, a * sn + b * cs);
+    k.at_const::<0>().write(Bf16(y as u16));
+    k.at_const::<1>().write(Bf16((y >> 16) as u16));
 }

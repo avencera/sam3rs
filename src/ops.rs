@@ -47,6 +47,12 @@ pub fn add_assign(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<()> {
     launch!(gpu, "add_assign", ew(a.len()), B256, 0; a, b)
 }
 
+/// `a += b16` in place
+pub fn add_assign_bf16(gpu: &Gpu, a: &Tensor, b16: &Bf16) -> Result<()> {
+    assert_eq!(a.len(), b16.rows * b16.cols);
+    launch!(gpu, "add_assign_bf16", ew(a.len()), B256, 0; a, b16)
+}
+
 /// A row-major BF16 activation matrix
 pub struct Bf16 {
     pub buf: Buf,
@@ -93,8 +99,9 @@ impl Linear {
 
     /// In BF16 mode, keeps only a BF16 copy of the weights and runs this linear through
     /// BF16 cuBLASLt. The vision backbone and the fusion encoder's FFN opt in for their
-    /// FLOPs and the text encoder's MLP for its weight reads (32 tokens over 800 MB of
-    /// FP32 weights); the other detector layers keep FP32 activations and weights
+    /// FLOPs, the text encoder's MLP for its weight reads (32 tokens over 800 MB of FP32
+    /// weights), and the video tracker's memory attention projections and FFN for its 36k
+    /// memory keys; the other detector layers keep FP32 activations and weights
     pub fn bf16(mut self, gpu: &Gpu) -> Result<Self> {
         if gpu.precision() == Precision::Bf16
             && let Some(w) = self.w.take()
@@ -305,6 +312,16 @@ impl LayerNorm {
         let out = Bf16::empty(gpu, x.rows(), x.cols())?;
         launch!(gpu, "layernorm_bf16", (x.rows() as u32, 1, 1), B256, 0;
             &out, x, &self.w, &self.b, x.cols(), self.eps)?;
+        Ok(out)
+    }
+
+    /// `x += add16` in place, then [`Self::forward16`] of the sum, in one pass
+    pub fn add_forward16(&self, gpu: &Gpu, x: &Tensor, add16: &Bf16) -> Result<Bf16> {
+        assert_eq!(x.cols(), self.w.len());
+        assert_eq!((add16.rows, add16.cols), (x.rows(), x.cols()));
+        let out = Bf16::empty(gpu, x.rows(), x.cols())?;
+        launch!(gpu, "add_layernorm_bf16", (x.rows() as u32, 1, 1), B256, 0;
+            &out, x, add16, &self.w, &self.b, x.cols(), self.eps)?;
         Ok(out)
     }
 
@@ -588,6 +605,45 @@ pub fn mha(
         hd,
         Mask { bias_div: mask.bias_div.max(1), ..mask },
     )?;
+    Ok(out)
+}
+
+/// Dynamic shared memory of `flash_attn_f16_d256`: Q, K and V tiles of 64 rows of 264
+/// FP16 values
+const FLASH_D256_SMEM: u32 = 3 * 64 * 264 * 2;
+/// Most key splits of the d256 attention
+const D256_MAX_SPLITS: usize = 8;
+
+/// Single-head attention with head dim 256 over FP16 `q [lq, 256]` and `k`, `v [lk, 256]`
+/// (rows packed), through the fused kernel, which needs a GPU with 99 KB of shared memory
+/// per block (sm_86 and up)
+pub fn attention_f16_d256(gpu: &Gpu, q: &Buf, k: &Buf, v: &Buf, lq: usize, lk: usize) -> Result<Tensor> {
+    const D: usize = 256;
+    assert!(lk > 0 && q.bytes() >= lq * D * 2 && k.bytes() >= lk * D * 2 && v.bytes() >= lk * D * 2);
+    let out = gpu.empty(&[lq, D])?;
+    // one block per SM at this much shared memory, so split the keys into the count whose
+    // grid wastes the least of its last wave, the fewest on ties
+    let qblocks = lq.div_ceil(64);
+    let cost = |s: usize| (qblocks * s).div_ceil(gpu.sms()) as f64 / s as f64;
+    let splits =
+        (1..=D256_MAX_SPLITS).filter(|s| lk >= s * 64).fold(1, |best, s| if cost(s) < cost(best) { s } else { best });
+    let chunk = lk.div_ceil(splits).next_multiple_of(64);
+    let splits = lk.div_ceil(chunk);
+    let part = if splits > 1 { Some(gpu.empty(&[splits, 1, lq, D + 2])?) } else { None };
+
+    let view = |ptr: u64, rows: usize| [Arg::slice(ptr, rows * D), Arg::from(D), Arg::from(0usize)];
+    let mut args: Vec<Arg> = [(out.ptr(), lq), (q.ptr(), lq), (k.ptr(), lk), (v.ptr(), lk)]
+        .into_iter()
+        .flat_map(|(p, r)| view(p, r))
+        .collect();
+    let scale_log2 = std::f32::consts::LOG2_E / (D as f32).sqrt();
+    args.extend([Arg::from(lq), Arg::from(lk), Arg::from(scale_log2)]);
+    args.extend([part.as_ref().map_or(Arg::EMPTY, Arg::from), Arg::from(chunk)]);
+    gpu.launch("flash_attn_f16_d256", (qblocks as u32, 1, splits as u32), (128, 1, 1), FLASH_D256_SMEM, args)?;
+    if let Some(part) = part {
+        // the kernel takes the split count from the length of `part`
+        launch!(gpu, "flash_combine_d256", (blocks(lq * 32, 256), 1, 1), B256, 0; &out, D, 0usize, &part, 1usize, lq)?;
+    }
     Ok(out)
 }
 

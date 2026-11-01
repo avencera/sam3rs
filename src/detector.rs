@@ -258,7 +258,7 @@ impl Detector {
                 .collect::<Result<_>>()?,
             instance_proj: Linear::load(gpu, wts, &format!("{m}.instance_projection"))?,
             mask_embed: Mlp::load_indexed(gpu, wts, &format!("{m}.mask_embedder"), 3, ACT_RELU)?,
-            pos: gpu.upload(crate::posenc::sine_2d(GRID), &[GRID * GRID, D])?,
+            pos: gpu.upload(crate::posenc::sine_2d(GRID, 256), &[GRID * GRID, D])?,
         })
     }
 

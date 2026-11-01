@@ -260,11 +260,14 @@ mod point;
 mod posenc;
 mod text;
 mod tokenizer;
+mod video;
 mod vision;
 mod weights;
 
 #[cfg(test)]
 mod stage_tests;
+#[cfg(test)]
+mod video_tests;
 
 pub use detector::BoxPrompt;
 pub use gpu::Precision;
@@ -274,3 +277,4 @@ pub use image::{MAX_IMAGE_SIDE, RgbImage};
 pub use masks::MaskBuffer;
 pub use pipeline::{Detection, Detections, Embedding, PointMask, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
 pub use point::PointPrompt;
+pub use video::{TrackedFrame, TrackedObject, VideoTracker};

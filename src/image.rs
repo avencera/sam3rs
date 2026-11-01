@@ -5,7 +5,7 @@ use std::path::Path;
 
 use eyre::{Result, WrapErr, ensure, eyre};
 
-use crate::gpu::{Gpu, Tensor, launch};
+use crate::gpu::{Buf, Gpu, Tensor, launch};
 use crate::ops::{B256, ew, upload_i32};
 use crate::vision::IMAGE_SIZE;
 
@@ -122,6 +122,41 @@ fn aa_taps(input: usize, output: usize) -> Taps {
         taps.counts.push(xsize);
     }
     taps
+}
+
+/// One antialiased bilinear resize (`_upsample_bilinear2d_aa`) of planes from one size to
+/// another, with the taps uploaded once
+pub struct AaResize {
+    rows: (Buf, Buf, Tensor),
+    cols: (Buf, Buf, Tensor),
+    input: (usize, usize),
+    output: (usize, usize),
+}
+
+impl AaResize {
+    /// Resizes `(height, width)` planes to `output`
+    pub fn new(gpu: &Gpu, input: (usize, usize), output: (usize, usize)) -> Result<Self> {
+        let upload = |t: Taps| -> Result<(Buf, Buf, Tensor)> {
+            let n = t.weights.len();
+            Ok((upload_i32(gpu, t.starts)?, upload_i32(gpu, t.counts)?, gpu.upload(t.weights, &[n])?))
+        };
+        Ok(Self { rows: upload(aa_taps(input.0, output.0))?, cols: upload(aa_taps(input.1, output.1))?, input, output })
+    }
+
+    /// `x [planes, in_h, in_w]` (any shape of that length) -> `[planes, out_h, out_w]`
+    pub fn forward(&self, gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
+        let ((ih, iw), (oh, ow)) = (self.input, self.output);
+        let planes = x.len() / (ih * iw);
+        assert_eq!(x.len(), planes * ih * iw, "resize input of {} values", x.len());
+        let wide = gpu.empty(&[planes, ih, ow])?;
+        let (s, c, w) = &self.cols;
+        launch!(gpu, "resample_cols", ew(wide.len()), B256, 0; &wide, x, s.slice::<i32>(), c.slice::<i32>(), w)?;
+        let out = gpu.empty(&[planes, oh, ow])?;
+        let (s, c, w) = &self.rows;
+        launch!(gpu, "resample_rows", ew(out.len()), B256, 0;
+            &out, &wide, s.slice::<i32>(), c.slice::<i32>(), w, ow)?;
+        Ok(out)
+    }
 }
 
 /// RGB image -> normalized pixels `[3, 1008, 1008]`

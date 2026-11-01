@@ -16,10 +16,10 @@ fn sine(v: f32, dims: &[f32], out: &mut [f32]) {
     }
 }
 
-/// `PositionEmbeddingSine(256, normalize=True)` over a `side` x `side` grid, channels-last
-/// `[side * side, 256]` with the y features first
-pub fn sine_2d(side: usize) -> Vec<f32> {
-    let half = 128;
+/// `PositionEmbeddingSine(feats, normalize=True)` over a `side` x `side` grid,
+/// channels-last `[side * side, feats]` with the y features first
+pub fn sine_2d(side: usize, feats: usize) -> Vec<f32> {
+    let half = feats / 2;
     let dims = dim_t(half);
     let scale = (2.0 * PI) as f32;
     let norm = |i: usize| (i + 1) as f32 / (side as f32 + 1e-6) * scale;

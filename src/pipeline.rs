@@ -16,6 +16,7 @@ use crate::ops::{B256, ew, upload_i32};
 use crate::point::{LOW_RES, PointDecoder, PointImage, PointPrompt, clamped_mask, full_res_masks};
 use crate::text::{TextEncoder, TextFeatures};
 use crate::tokenizer::Tokenizer;
+use crate::video::Tracker;
 use crate::vision::{Backbone, Neck};
 use crate::weights::Weights;
 
@@ -144,12 +145,14 @@ pub struct PointMask {
 pub struct Sam3 {
     id: u64,
     tokenizer: Tokenizer,
-    backbone: Backbone,
+    pub(crate) backbone: Backbone,
     neck: Neck,
-    tracker_neck: Neck,
+    pub(crate) tracker_neck: Neck,
     text: TextEncoder,
     detector: Detector,
-    point: PointDecoder,
+    pub(crate) point: PointDecoder,
+    /// memory attention, memory encoder and pointer heads of the video tracker
+    pub(crate) tracker: Tracker,
     /// Text features of [`VISUAL_PROMPT`], encoded on first use: every box-only prompt
     /// would otherwise run the 24-layer text encoder on the same string
     visual: OnceCell<TextFeatures>,
@@ -159,7 +162,7 @@ pub struct Sam3 {
     /// host memory of dropped results, reused for later masks
     masks: MaskPool,
     // last, so the layers free their weights before the GPU handles go
-    gpu: Gpu,
+    pub(crate) gpu: Gpu,
 }
 
 impl Sam3 {
@@ -195,6 +198,7 @@ impl Sam3 {
             text: TextEncoder::load(&gpu, &wts)?,
             detector: Detector::load(&gpu, &wts)?,
             point: PointDecoder::load(&gpu, &wts)?,
+            tracker: Tracker::load(&gpu, &wts)?,
             visual: OnceCell::new(),
             last_kept: Cell::new(0),
             masks: MaskPool::default(),

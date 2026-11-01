@@ -24,7 +24,7 @@ use cuda_device::float::{ex2_approx_ftz_f32, fma_rn_f32};
 use cuda_device::thread::{__unroll_config, blockIdx_x, blockIdx_y, blockIdx_z, gridDim_y, threadIdx_x};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_contract, ptx_asm, thread, warp};
 
-use crate::common::{Bf16, F16, Packed8, ldg_u4, ldg4, ldg8, math, pack_f16, stg2};
+use crate::common::{Bf16, F16, Packed8, ldg_u4, ldg4, ldg8, math, pack_bf16, pack_f16, stg2};
 use crate::mma::{FragA, Mma16, SharedTile, sts2, sts4};
 
 pub(crate) const FA_WARPS: usize = 4;
@@ -184,6 +184,23 @@ trait AttnIn: Copy {
         rows: usize,
         threads: usize,
     );
+
+    /// [`AttnIn::stage_qk`] with the ViT's RoPE applied to row `row0 + r` of the tile;
+    /// only BF16 sources implement it, and the other types trap
+    ///
+    /// # Safety
+    /// As [`AttnIn::stage_qk`], and `rope` holds a table row for every staged row
+    #[inline(always)]
+    unsafe fn stage_qk_rope<const D: usize, const LD: usize>(
+        _dst: SharedTile<Self::Qk, LD>,
+        _src: Rows<Self>,
+        _rows: usize,
+        _threads: usize,
+        _rope: Rope,
+        _row0: i32,
+    ) {
+        require(false);
+    }
 }
 
 /// FP32 sources, rounded to FP16 four at a time
@@ -336,6 +353,56 @@ impl AttnIn for Bf16 {
     ) {
         unsafe { stage_bf16_to_f16::<D, LD>(dst, src, rows, threads) };
     }
+
+    /// Rotates each adjacent pair `(x[2p], x[2p + 1])` by its row's angle in FP32 and
+    /// rounds the pair to BF16 with one conversion, as [`crate::vision::vit_rope_k_bf16`] does
+    #[inline(always)]
+    unsafe fn stage_qk_rope<const D: usize, const LD: usize>(
+        dst: SharedTile<Bf16, LD>,
+        src: Rows<Self>,
+        rows: usize,
+        threads: usize,
+        rope: Rope,
+        row0: i32,
+    ) {
+        let n = rows * D / 8;
+        let mut x = [[0; 4]; STAGE_MAX_ITERS];
+        let mut cs = [[0.0; 4]; STAGE_MAX_ITERS];
+        let mut sn = [[0.0; 4]; STAGE_MAX_ITERS];
+        for it in 0..STAGE_MAX_ITERS {
+            __unroll_config::<0>();
+            let i = it * threads + threadIdx_x() as usize;
+            let (r, c) = (i / (D / 8), (i % (D / 8)) * 8);
+            if i < n && (r as i32) < src.rows {
+                // SAFETY: as in stage_copy16; the caller checked the tables cover every
+                // staged row's position, and the 4 pairs start at a multiple of 4 floats
+                unsafe {
+                    x[it] = ldg_u4(src.at(r, c));
+                    let tab = rope.pos((row0 + r as i32) as u32) as usize * (D / 2) + c / 2;
+                    cs[it] = ldg4(rope.cos.as_ptr().add(tab));
+                    sn[it] = ldg4(rope.sin.as_ptr().add(tab));
+                }
+            }
+        }
+        for it in 0..STAGE_MAX_ITERS {
+            __unroll_config::<0>();
+            let i = it * threads + threadIdx_x() as usize;
+            let (r, c) = (i / (D / 8), (i % (D / 8)) * 8);
+            if i < n {
+                let mut y = [0u32; 4];
+                let mut j = 0;
+                while j < 4 {
+                    __unroll_config::<0>();
+                    let (a, b) = (bf16_to_f32(x[it][j] as u16), bf16_to_f32((x[it][j] >> 16) as u16));
+                    let (c, s) = (cs[it][j], sn[it][j]);
+                    y[j] = pack_bf16(a * c - b * s, a * s + b * c);
+                    j += 1;
+                }
+                // SAFETY: as in stage_copy16
+                unsafe { sts4(dst.at(r, c), y) };
+            }
+        }
+    }
 }
 
 impl AttnIn for F16 {
@@ -383,6 +450,37 @@ pub(crate) struct Rpb<'a> {
     pub(crate) side: u32,
 }
 
+/// Side of the ViT's attention windows and of its token grid, in tokens
+pub const VIT_WIN: u32 = 24;
+pub const VIT_GRID: u32 = 72;
+/// Tokens per ViT window
+pub(crate) const VIT_WIN_TOKENS: u32 = VIT_WIN * VIT_WIN;
+
+/// The ViT's rotary tables for the fused attention: `cos` and `sin` are `[positions, D /
+/// 2]`. Tokens are in window-major order (each window's tokens contiguous, raster order
+/// inside it), so a windowed block's row `r` sits at position `r % VIT_WIN_TOKENS` of the
+/// window table, and a global block's tables are laid out in that order already
+#[derive(Clone, Copy)]
+pub(crate) struct Rope<'a> {
+    pub(crate) cos: &'a [f32],
+    pub(crate) sin: &'a [f32],
+    pub(crate) windowed: bool,
+}
+
+impl Rope<'_> {
+    /// No tables, for the kernels without RoPE. A fn, not an associated const: cuda-oxide
+    /// can't lower a const whose slices point at an anonymous allocation
+    #[inline(always)]
+    pub(crate) fn none() -> Self {
+        Rope { cos: &[], sin: &[], windowed: false }
+    }
+
+    #[inline(always)]
+    fn pos(self, row: u32) -> u32 {
+        if self.windowed { row % VIT_WIN_TOKENS } else { row }
+    }
+}
+
 /// The attention of one block of `16 * WARPS` query rows
 ///
 /// Batch entry `blockIdx.y`; `scale_log2 = log2(e) / sqrt(D)`. Keys with `key_pad[j] !=
@@ -393,6 +491,11 @@ pub(crate) struct Rpb<'a> {
 /// so few query rows over many keys still fill the GPU. WARPS sets the query rows per
 /// block: every block re-reads all of K and V, so taller blocks cut that traffic. `KK =
 /// D / 16`, `DJ = D / 8`, `LD = D + 8`
+///
+/// `VIT` is the ViT's fused attention (see [`vit_attn_bf16_d64`]): q gets `rope` as it
+/// is staged (k arrives rotated, as each key tile is staged once per query tile), a windowed block's query tile only sees the keys of its own window,
+/// and the output is BF16, each pair of columns written as one 4-byte slot of `o` (so
+/// `o_ld` and `o_stride` count pairs)
 ///
 /// # Safety
 /// The block has exactly `32 * WARPS` threads (the kernels' `.reqntid`), and distinct
@@ -405,6 +508,7 @@ unsafe fn flash_attn<
     const LD: usize,
     const WARPS: usize,
     const RPB: bool,
+    const VIT: bool,
     T: AttnIn,
     TK: AttnIn<Qk = T::Qk>,
     TV: AttnIn,
@@ -421,6 +525,7 @@ unsafe fn flash_attn<
     scale_log2: f32,
     key_pad: &[u8],
     rpb: Rpb,
+    rope: Rope,
     mut part: DisjointSlice<f32>,
     kv_chunk: u32,
 ) {
@@ -441,6 +546,12 @@ unsafe fn flash_attn<
         k_begin = blockIdx_z() as i32 * kv_chunk as i32;
         k_end = lk.min(k_begin + kv_chunk as i32);
     }
+    // a query tile never straddles two windows: VIT_WIN_TOKENS is a multiple of 16 * WARPS
+    if VIT && rope.windowed {
+        const { assert!(!VIT || VIT_WIN_TOKENS as usize % (16 * WARPS) == 0) };
+        k_begin = q0 / VIT_WIN_TOKENS as i32 * VIT_WIN_TOKENS as i32;
+        k_end = lk.min(k_begin + VIT_WIN_TOKENS as i32);
+    }
 
     // everything this block reads or writes, checked at once up front: one uniform
     // branch to one trap. The RPB rows are checked for the whole block, as a check per
@@ -450,8 +561,11 @@ unsafe fn flash_attn<
     let out_ok = if split {
         rows_fit(part.len(), part_base, q0, nq, (D + 2) as u32, D + 2)
     } else {
-        rows_fit(o.len(), b * o_stride as usize, q0, nq, o_ld, D)
+        rows_fit(o.len(), b * o_stride as usize, q0, nq, o_ld, if VIT { D / 2 } else { D })
     };
+    // every staged row's table position: below VIT_WIN_TOKENS for windows, below lq else
+    let positions = if rope.windowed { VIT_WIN_TOKENS as usize } else { lq as usize };
+    let rope_ok = !VIT || (!split && rope.cos.len().min(rope.sin.len()) >= positions * (D / 2));
     let (rpb_side, rpb_r0) = (rpb.side as usize, q0.max(1));
     let rpb_base = b * (lq - 1) as usize * rpb_side;
     let rpb_len = rpb.dx.len().min(rpb.dy.len());
@@ -460,12 +574,26 @@ unsafe fn flash_attn<
             && rows_fit(rpb_len, rpb_base, rpb_r0 - 1, (q0 + bm as i32).min(lq) - rpb_r0, rpb.side, rpb_side));
     let (qr, kr, vr) =
         (q.rows(b, q0, nq, D), k.rows(b, k_begin, k_end - k_begin, D), v.rows(b, k_begin, k_end - k_begin, D));
-    require(qr.is_some() & kr.is_some() & vr.is_some() & out_ok & rpb_ok & (!has_pad | (key_pad.len() >= lk as usize)));
+    require(
+        qr.is_some()
+            & kr.is_some()
+            & vr.is_some()
+            & out_ok
+            & rpb_ok
+            & rope_ok
+            & (!has_pad | (key_pad.len() >= lk as usize)),
+    );
     let (Some(qr), Some(kr), Some(vr)) = (qr, kr, vr) else { return };
 
     // SAFETY: barriers order the staging stores before the fragment loads, and the
     // block's 32 * WARPS threads cover the tile's 16 * WARPS rows
-    unsafe { T::stage_qk::<D, LD>(qs, qr, bm, 32 * WARPS) };
+    unsafe {
+        if VIT {
+            T::stage_qk_rope::<D, LD>(qs, qr, bm, 32 * WARPS, rope, q0);
+        } else {
+            T::stage_qk::<D, LD>(qs, qr, bm, 32 * WARPS);
+        }
+    }
     thread::sync_threads();
     let mut qa = [FragA::<T::Qk>::ZERO; KK];
     let mut kk = 0;
@@ -745,7 +873,13 @@ unsafe fn flash_attn<
             let mut dj = 0;
             while dj < DJ {
                 __unroll_config::<0>();
-                unsafe { stg2(out.add(dj * 8 + t * 2), acc[dj][2 * r] * l[r], acc[dj][2 * r + 1] * l[r]) };
+                let (a, c) = (acc[dj][2 * r] * l[r], acc[dj][2 * r + 1] * l[r]);
+                if VIT {
+                    // SAFETY: the pair's slot, inside the checked rows of D / 2 slots
+                    unsafe { *out.add(dj * 4 + t) = f32::from_bits(pack_bf16(a, c)) };
+                } else {
+                    unsafe { stg2(out.add(dj * 8 + t * 2), a, c) };
+                }
                 dj += 1;
             }
         }
@@ -801,7 +935,7 @@ macro_rules! flash_attn_kernel {
             let rpb = Rpb { dx: &[], dy: &[], side: 0 };
             // SAFETY: `.reqntid` fixes the block at 128 threads = FA_WARPS warps
             unsafe {
-                flash_attn::<$d, { $d / 16 }, { $d / 8 }, { $d + 8 }, FA_WARPS, false, $t, $t, $t>(
+                flash_attn::<$d, { $d / 16 }, { $d / 8 }, { $d + 8 }, FA_WARPS, false, false, $t, $t, $t>(
                     tiles,
                     o,
                     o_ld,
@@ -814,6 +948,7 @@ macro_rules! flash_attn_kernel {
                     scale_log2,
                     key_pad,
                     rpb,
+                    Rope::none(),
                     part,
                     kv_chunk,
                 )
@@ -825,6 +960,66 @@ macro_rules! flash_attn_kernel {
 flash_attn_kernel!(flash_attn_d32, 32, f32);
 flash_attn_kernel!(flash_attn_d64, 64, f32);
 flash_attn_kernel!(flash_attn_bf16_d64, 64, Bf16);
+
+/// The ViT's attention in BF16 mode, reading q and v straight from the qkv GEMM's output,
+/// rotating q as it is staged, and writing the merged heads, so only the key rotation
+/// ([`crate::vision::vit_rope_k_bf16`]) runs before it and no merge pass after
+///
+/// Tokens are in window-major order (see [`Rope`]); batch entry `blockIdx.y` is a head.
+/// q and v are `qkv [tokens, 3 * heads * 64]` at column offsets 0 and `2 * heads * 64`,
+/// and k is the rotated `[tokens, heads * 64]`, each passed as a view; `o` is the BF16 `[tokens, heads * 64]` output
+/// as 4-byte pair slots, `o_ld` and `o_stride` in slots. With `windowed` nonzero a query
+/// sees only the keys of its own window and `cos`/`sin` are the window tables
+/// `[VIT_WIN_TOKENS, 32]`; otherwise every key and the global tables `[tokens, 32]` in
+/// window-major order. See [`flash_attn`]
+#[kernel]
+#[launch_contract(domain = 3, block = (128, 1, 1))]
+pub fn vit_attn_bf16_d64(
+    o: DisjointSlice<f32>,
+    o_ld: u32,
+    o_stride: u32,
+    q: &[Bf16],
+    q_ld: u32,
+    q_stride: u32,
+    k: &[Bf16],
+    k_ld: u32,
+    k_stride: u32,
+    v: &[Bf16],
+    v_ld: u32,
+    v_stride: u32,
+    lq: u32,
+    lk: u32,
+    scale_log2: f32,
+    cos: &[f32],
+    sin: &[f32],
+    windowed: u32,
+    part: DisjointSlice<f32>,
+) {
+    let tiles = tiles!(16 * FA_WARPS, 64);
+    let rpb = Rpb { dx: &[], dy: &[], side: 0 };
+    let rope = Rope { cos, sin, windowed: windowed != 0 };
+    // SAFETY: `.reqntid` fixes the block at 128 threads = FA_WARPS warps; `part` is empty,
+    // which the rope check requires
+    unsafe {
+        flash_attn::<64, 4, 8, 72, FA_WARPS, false, true, Bf16, Bf16, Bf16>(
+            tiles,
+            o,
+            o_ld,
+            o_stride,
+            Batched { data: q, ld: q_ld, stride: q_stride },
+            Batched { data: k, ld: k_ld, stride: k_stride },
+            Batched { data: v, ld: v_ld, stride: v_stride },
+            lq,
+            lk,
+            scale_log2,
+            &[],
+            rpb,
+            rope,
+            part,
+            0,
+        )
+    };
+}
 
 /// Flash attention with the box relative position bias of [`Rpb`] for head dim 32
 #[kernel]
@@ -854,7 +1049,7 @@ pub fn flash_attn_rpb_d32(
     let tiles = tiles!(16 * FA_WARPS, 32);
     // SAFETY: `.reqntid` fixes the block at 128 threads = FA_WARPS warps
     unsafe {
-        flash_attn::<32, 2, 4, 40, FA_WARPS, true, f32, f32, f32>(
+        flash_attn::<32, 2, 4, 40, FA_WARPS, true, false, f32, f32, f32>(
             tiles,
             o,
             o_ld,
@@ -867,6 +1062,7 @@ pub fn flash_attn_rpb_d32(
             scale_log2,
             &[],
             Rpb { dx: rpb_dx, dy: rpb_dy, side },
+            Rope::none(),
             part,
             kv_chunk,
         )
@@ -899,7 +1095,7 @@ pub fn flash_attn_kv16_d32(
     let no_part = unsafe { DisjointSlice::from_mut_slice(&mut []) };
     // SAFETY: `.reqntid` fixes the block at 256 threads = 8 warps
     unsafe {
-        flash_attn::<32, 2, 4, 40, 8, false, f32, F16, F16>(
+        flash_attn::<32, 2, 4, 40, 8, false, false, f32, F16, F16>(
             tiles,
             o,
             o_ld,
@@ -912,6 +1108,7 @@ pub fn flash_attn_kv16_d32(
             scale_log2,
             key_pad,
             Rpb { dx: &[], dy: &[], side: 0 },
+            Rope::none(),
             no_part,
             0,
         )
@@ -947,7 +1144,7 @@ pub fn kv_to_16(
     out.write(Packed8::new([pack_f16(x[0], x[1]), pack_f16(x[2], x[3]), pack_f16(x[4], x[5]), pack_f16(x[6], x[7])]));
 }
 
-/// Merges the key splits of a split flash attention: one warp per (batch, row), lane `d
+/// Merges the key splits of a split flash attention (also [`crate::attention_d256`]'s): one warp per (batch, row), lane `d
 /// < D` owns output column `d`. Rows with no valid key in any split produce zeros. `N =
 /// D / 32`; the split count is `part.len() / (batch * lq * (D + 2))`
 #[inline(always)]
@@ -1023,4 +1220,12 @@ fn flash_combine<const D: usize, const N: usize>(
 pub fn flash_combine_d32(o: DisjointSlice<f32>, o_ld: u32, o_stride: u32, part: &[f32], batch: u32, lq: u32) {
     let t = thread::index_1d_u32(lc);
     flash_combine::<32, 1>(o, o_ld, o_stride, part, batch, lq, t.get());
+}
+
+/// [`flash_combine`] for head dim 256, one warp per output row
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn flash_combine_d256(o: DisjointSlice<f32>, o_ld: u32, o_stride: u32, part: &[f32], batch: u32, lq: u32) {
+    let t = thread::index_1d_u32(lc);
+    flash_combine::<256, 8>(o, o_ld, o_stride, part, batch, lq, t.get());
 }

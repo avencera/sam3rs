@@ -80,6 +80,10 @@ impl Buf {
         self.ptr
     }
 
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// The whole buffer as a kernel slice of `T`, the element type the kernel declares
     /// for it (`u16` for BF16 or FP16, `[u16; 8]` for packed groups of eight)
     pub fn slice<T>(&self) -> Arg {
@@ -303,6 +307,8 @@ pub struct Gpu {
     /// the same for cuBLASLt linears with FP32 inputs
     fp32_operands: Operands,
     precision: Precision,
+    /// streaming multiprocessors, for kernels that size their grids to whole waves
+    sms: usize,
     /// host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
     pending_bytes: Cell<usize>,
@@ -317,6 +323,7 @@ impl Gpu {
         let cublas = check_libraries()?;
         let ctx = CudaContext::new(ordinal).wrap_err_with(|| format!("open CUDA device {ordinal}"))?;
         let (major, minor) = ctx.compute_capability()?;
+        let sms = ctx.attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
         if major < 8 {
             bail!("GPU {ordinal} has compute capability {major}.{minor}; sam3rs needs 8.0 (Ampere) or newer");
         }
@@ -384,6 +391,7 @@ impl Gpu {
             fp32_compute,
             fp32_operands,
             precision,
+            sms,
             pending: RefCell::new(Vec::new()),
             pending_bytes: Cell::new(0),
         })
@@ -396,6 +404,11 @@ impl Gpu {
 
     pub fn precision(&self) -> Precision {
         self.precision
+    }
+
+    /// Streaming multiprocessors
+    pub fn sms(&self) -> usize {
+        self.sms
     }
 
     fn cu_stream(&self) -> CUstream {
