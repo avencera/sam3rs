@@ -76,7 +76,7 @@ fn main() -> Result<()> {
         let points: Vec<PointPrompt> =
             clicks.map(|(p, positive)| PointPrompt::new(p[0], p[1], positive)).collect::<Result<_>>()?;
         let m = model.segment_points(&emb, &points)?;
-        (vec![json!({ "score": m.score })], vec![m.mask])
+        (vec![json!({ "score": m.score })], m.mask)
     } else {
         let exemplars = args.boxes.iter().map(|b| (b, true)).chain(args.neg_boxes.iter().map(|b| (b, false)));
         let boxes: Vec<BoxPrompt> = exemplars
@@ -85,13 +85,13 @@ fn main() -> Result<()> {
         let text = args.text.as_deref().unwrap_or(VISUAL_PROMPT);
         let dets = model.detect(&emb, text, &boxes)?;
         let results = dets.iter().map(|d| json!({ "score": d.score, "bbox_xyxy": d.bbox })).collect();
-        (results, dets.into_iter().map(|d| d.mask).collect())
+        (results, dets.into_parts().1)
     };
     for r in &results {
         println!("{r}");
     }
     if let Some(out) = &args.out {
-        let masks: Vec<&[u8]> = masks.iter().map(Vec::as_slice).collect();
+        let masks: Vec<&[u8]> = masks.chunks(img.width() * img.height()).collect();
         img.overlay(&masks)?.save(out)?;
         eprintln!("wrote {}", out.display());
     }

@@ -109,14 +109,21 @@ use sam3rs::{BoxPrompt, Precision, RgbImage, Sam3, VISUAL_PROMPT};
 let model = Sam3::from_pretrained(0, Precision::Bf16)?;
 let image = RgbImage::open("dogs.jpg".as_ref())?;
 let embedding = model.encode(&image)?;
-for det in model.detect(&embedding, "dog", &[])? {
-    println!("{:.3} {:?}", det.score, det.bbox);
+let dogs = model.detect(&embedding, "dog", &[])?;
+for (i, det) in dogs.iter().enumerate() {
+    // each mask is height * width bytes, 1 = foreground
+    let pixels = dogs.mask(i).iter().filter(|&&m| m != 0).count();
+    println!("{:.3} {:?} {pixels} px", det.score, det.bbox);
 }
 
 // box exemplars: find more objects like the positive box
 let exemplar = BoxPrompt::from_xyxy([1233.0, 376.0, 1649.0, 691.0], image.width(), image.height(), true)?;
-let dogs = model.detect(&embedding, VISUAL_PROMPT, &[exemplar])?;
+let similar = model.detect(&embedding, VISUAL_PROMPT, &[exemplar])?;
 ```
+
+All of a call's masks share one host buffer. Dropping the result hands that memory
+back to the model, so the next call writes its masks into pages that are already
+mapped. Faulting in fresh memory for 27 masks at 2560 px took about 27 ms.
 
 ## Results
 
@@ -160,7 +167,8 @@ Where the time goes:
   busy. sam3rs issues about 0.6k GPU operations for a box prompt and 0.95k for a text
   prompt, and keeps the GPU about 91% busy. A BF16 box prompt spends about 1.8 ms in the
   fusion encoder, 1.6 ms in the mask head and 1.2 ms in the DETR decoder, then about
-  0.3 ms per kept mask copying it to the host.
+  0.3 ms per kept mask copying it to the host, into memory reused from earlier calls.
+  The Python package views those bytes as numpy bool arrays without copying them.
 - Encode is GEMM-bound. The backbone MLP and qkv GEMMs run at 195-210 TFLOPS, close to
   the card's dense BF16 rate with FP32 accumulation, so the margin over PyTorch BF16 is
   small. The rest is fused bias and GELU epilogues, BF16 activations fed straight into

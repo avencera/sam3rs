@@ -152,7 +152,7 @@ class Sam3:
         return Detections(
             scores=np.asarray(scores, dtype=np.float32),
             boxes=np.asarray(bboxes, dtype=np.float32).reshape(n, 4),
-            masks=np.frombuffer(masks, dtype=np.uint8).reshape(n, h, w).astype(bool),
+            masks=_bool_view(masks, n, h, w),
             queries=np.asarray(queries, dtype=np.int64),
         )
 
@@ -182,7 +182,7 @@ class Sam3:
             raise ValueError(f"{len(xy)} points but {len(flags)} labels")
         score, mask = self._native.segment_points(embedding, [(x, y, f) for (x, y), f in zip(xy, flags)])
         h, w = embedding.height, embedding.width
-        return PointMask(score=score, mask=np.frombuffer(mask, dtype=np.uint8).reshape(h, w).astype(bool))
+        return PointMask(score=score, mask=_bool_view(mask, 1, h, w)[0])
 
 
 def load_image(path: str | os.PathLike[str]) -> npt.NDArray[np.uint8]:
@@ -212,6 +212,12 @@ def _cuda_hint() -> Iterator[None]:
         if "cuBLAS" in str(e):
             e.add_note('with pip, install the cuda extra: pip install "sam3rs[cuda]"')
         raise
+
+
+def _bool_view(buffer: _native.HostBuffer, n: int, h: int, w: int) -> npt.NDArray[np.bool_]:
+    # the runtime writes only 0 and 1, which are valid numpy bools, so the masks are
+    # viewed in place: a converted copy is another fresh array of n full-size masks
+    return np.frombuffer(buffer, dtype=np.bool_).reshape(n, h, w)
 
 
 def _rgb(image: npt.ArrayLike) -> npt.NDArray[np.uint8]:

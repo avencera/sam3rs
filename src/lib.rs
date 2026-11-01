@@ -11,11 +11,14 @@
 //! let model = Sam3::load("models/sam3".as_ref(), 0, Precision::Bf16)?;
 //! let image = RgbImage::open("dogs.jpg".as_ref())?;
 //! let embedding = model.encode(&image)?;
-//! for det in model.detect(&embedding, "dog", &[])? {
-//!     println!("{:.3} {:?}", det.score, det.bbox);
+//! let dogs = model.detect(&embedding, "dog", &[])?;
+//! for (i, det) in dogs.iter().enumerate() {
+//!     // each mask is height * width bytes, 1 = foreground
+//!     let pixels = dogs.mask(i).iter().filter(|&&m| m != 0).count();
+//!     println!("{:.3} {:?} {pixels} px", det.score, det.bbox);
 //! }
 //! let exemplar = BoxPrompt::from_xyxy([1233.0, 376.0, 1649.0, 691.0], image.width(), image.height(), true)?;
-//! let dogs = model.detect(&embedding, VISUAL_PROMPT, &[exemplar])?;
+//! let similar = model.detect(&embedding, VISUAL_PROMPT, &[exemplar])?;
 //! # Ok(())
 //! # }
 //! ```
@@ -32,6 +35,7 @@ mod gpu;
 #[cfg(feature = "online")]
 mod hub;
 mod image;
+mod masks;
 mod nvtx;
 mod ops;
 mod pipeline;
@@ -50,5 +54,6 @@ pub use gpu::Precision;
 #[cfg(feature = "online")]
 pub use hub::{MODEL_FILES, MODEL_REPO, download_model};
 pub use image::{MAX_IMAGE_SIDE, RgbImage};
-pub use pipeline::{Detection, Embedding, PointMask, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
+pub use masks::MaskBuffer;
+pub use pipeline::{Detection, Detections, Embedding, PointMask, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
 pub use point::PointPrompt;

@@ -69,7 +69,8 @@ takes about 34 ms in BF16, 65 ms in TF32 and 119 ms in FP32; a point prompt 2.0 
 2.2 ms; a box prompt 5.6, 8.0 and 27 ms; and a text prompt 7.0, 9.4 and 29 ms.
 
 Calls release the GIL while the GPU works. Calls on one model from several threads
-take turns.
+take turns. Masks are writable numpy views of memory the runtime filled, not copies;
+once they are garbage collected, the model reuses that memory for later masks.
 
 ## Command line
 
