@@ -129,7 +129,7 @@ impl<'a> IntoIterator for &'a Detections {
 /// The best of the three candidate masks for a point prompt
 #[derive(Clone, Debug)]
 pub struct PointMask {
-    /// predicted IoU of the chosen mask
+    /// Predicted IoU of the chosen mask
     pub score: f32,
     /// `height * width` bytes, 1 = foreground
     pub mask: MaskBuffer,
@@ -148,15 +148,15 @@ pub struct Sam3 {
     text: TextEncoder,
     detector: Detector,
     pub(crate) point: PointDecoder,
-    /// memory attention, memory encoder and pointer heads of the video tracker
+    /// Memory attention, memory encoder and pointer heads of the video tracker
     pub(crate) tracker: Tracker,
     /// Text features of [`VISUAL_PROMPT`], encoded on first use: every box-only prompt
     /// would otherwise run the 24-layer text encoder on the same string
     visual: OnceCell<TextFeatures>,
-    /// detections the last `detect` call kept, the guess for how many masks of host
+    /// Detections the last `detect` call kept, the guess for how many masks of host
     /// memory to set aside ahead of the next
     last_kept: Cell<usize>,
-    /// host memory of dropped results, reused for later masks
+    /// Host memory of dropped results, reused for later masks
     masks: MaskPool,
     // last, so the layers free their weights before the GPU handles go
     pub(crate) gpu: Gpu,

@@ -381,7 +381,7 @@ impl LayerNorm {
 /// Softmax masking options for [`attention`]
 #[derive(Clone, Copy, Default)]
 pub struct Mask {
-    /// additive bias `[batch / bias_div, lq, lk]`
+    /// Additive bias `[batch / bias_div, lq, lk]`
     pub bias: u64,
     pub bias_div: usize,
     /// u8 per key, nonzero means the key is padding: `lk` bytes, or 0 for none
@@ -421,7 +421,7 @@ pub struct BoxRpb {
     pub dx: u64,
     /// `[heads, lq - 1, side]`
     pub dy: u64,
-    /// even, so the fused kernel reads each thread's key pair from one grid row
+    /// Grid side; even, so the fused kernel reads each thread's key pair from one grid row
     pub side: usize,
 }
 
@@ -687,9 +687,9 @@ pub fn attention_f16_qk256_v64(gpu: &Gpu, q: &Buf, k: &Buf, v: &Buf, lq: usize, 
 struct SplitAttention {
     name: &'static str,
     combine: &'static str,
-    /// value and output width
+    /// Value and output width
     dv: usize,
-    /// query rows per block
+    /// Query rows per block
     rows: usize,
 }
 

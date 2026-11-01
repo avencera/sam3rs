@@ -315,19 +315,19 @@ pub struct Gpu {
     lt: BlasLt,
     device: Arc<Device>,
     module: CUmodule,
-    /// the PTX `module` was loaded from, which the launch guard reads params from
+    /// The PTX `module` was loaded from, which the launch guard reads params from
     ptx: &'static str,
     functions: RefCell<HashMap<&'static str, Kernel>>,
     cublas: &'static Cublas,
     blas: blas::cublasHandle_t,
-    /// compute type of GEMMs with FP32 inputs
+    /// Compute type of GEMMs with FP32 inputs
     fp32_compute: blas::cublasComputeType_t,
-    /// the same for cuBLASLt linears with FP32 inputs
+    /// The same for cuBLASLt linears with FP32 inputs
     fp32_operands: Operands,
     precision: Precision,
-    /// streaming multiprocessors, for kernels that size their grids to whole waves
+    /// Streaming multiprocessors, for kernels that size their grids to whole waves
     sms: usize,
-    /// host sources of asynchronous uploads, kept until the stream next synchronizes
+    /// Host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
     pending_bytes: Cell<usize>,
 }

@@ -3,13 +3,13 @@
 
 use eyre::{Result, WrapErr, ensure, eyre};
 
-use crate::gpu::{Gpu, Precision, Tensor, blocks, launch};
+use crate::gpu::{Buf, Gpu, Precision, Tensor, blocks, launch};
 use crate::nvtx::range;
 use crate::ops::{
-    Act, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, concat_rows, ew, group_norm_stats,
-    upload_i32,
+    Act, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, concat_rows, ew,
+    group_norm_stats, upload_i32,
 };
-use crate::posenc::box_encoding;
+use crate::posenc::{box_encoding, sine_2d};
 use crate::text::TextFeatures;
 use crate::vision::{Fpn, GRID};
 use crate::weights::Weights;
@@ -94,7 +94,7 @@ struct EncoderLayer {
     norm3: LayerNorm,
     fc1: Linear,
     fc2: Linear,
-    /// the FFN runs in BF16 end to end (see [`EncoderLayer::load`])
+    /// The FFN runs in BF16 end to end (see [`EncoderLayer::load`])
     ffn16: bool,
 }
 
@@ -180,7 +180,7 @@ pub struct Detector {
     pixel_norms: Vec<(Tensor, Tensor)>,
     instance_proj: Linear,
     mask_embed: Mlp,
-    /// sine position encoding of the 72x72 grid `[5184, 256]`
+    /// Sine position encoding of the 72x72 grid `[5184, 256]`
     pos: Tensor,
 }
 
@@ -257,7 +257,7 @@ impl Detector {
                 .collect::<Result<_>>()?,
             instance_proj: Linear::load(gpu, wts, &format!("{m}.instance_projection"))?,
             mask_embed: Mlp::load_indexed(gpu, wts, &format!("{m}.mask_embedder"), 3, Act::Relu)?,
-            pos: gpu.upload(crate::posenc::sine_2d(GRID, 256), &[GRID * GRID, D])?,
+            pos: gpu.upload(sine_2d(GRID, 256), &[GRID * GRID, D])?,
         })
     }
 
@@ -299,7 +299,7 @@ impl Detector {
             let labels = upload_i32(gpu, labels)?;
             let label = gpu.empty(&[n, D])?;
             launch!(gpu, "gather_rows", ew(label.len()), B256, 0; &label, &g.label, labels.slice::<i32>(), D)?;
-            crate::ops::add_assign(gpu, &x, &label)?;
+            add_assign(gpu, &x, &label)?;
             concat_rows(gpu, &x, &g.cls)?
         };
 
@@ -377,7 +377,7 @@ impl Detector {
         // row 0 is the presence token, which has a zero query position
         let x = concat_rows(gpu, &self.presence_token, &self.query_embed)?;
         let mut boxes = gpu.clone_tensor(&self.reference_points)?;
-        crate::ops::bias_act(gpu, &boxes, None, Act::Sigmoid)?;
+        bias_act(gpu, &boxes, None, Act::Sigmoid)?;
         let mem_pos = add(gpu, memory, &self.pos)?;
         let qpos = gpu.zeros(&[n, D])?;
         let mut hs = None;
@@ -446,9 +446,9 @@ impl Detector {
         Ok([delta(0, &self.rpb_x)?, delta(1, &self.rpb_y)?])
     }
 
-    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &crate::gpu::Buf) -> Result<Tensor> {
+    fn score(&self, gpu: &Gpu, hs: &Tensor, prompt: &Tensor, pad: &Buf) -> Result<Tensor> {
         let p = self.text_mlp.forward(gpu, prompt)?;
-        crate::ops::add_assign(gpu, &p, prompt)?;
+        add_assign(gpu, &p, prompt)?;
         self.text_mlp_norm.forward_inplace(gpu, &p)?;
         let pooled = gpu.empty(&[1, D])?;
         // one thread per output column; the kernel takes the prompt length from p's rows

@@ -50,7 +50,7 @@ fn transpose(gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
-/// channels-last device tensor -> CHW host vector
+/// Channels-last device tensor -> CHW host vector
 fn chw(gpu: &Gpu, t: &Tensor) -> Result<Vec<f32>> {
     gpu.download(&transpose(gpu, t)?)
 }

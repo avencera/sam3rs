@@ -111,7 +111,7 @@ impl Backbone {
         })
     }
 
-    /// pixels `[3, 1008, 1008]` -> tokens `[72 * 72, 1024]`
+    /// Pixels `[3, 1008, 1008]` -> tokens `[72 * 72, 1024]`
     pub fn forward(&self, gpu: &Gpu, pixels: &Tensor) -> Result<Tensor> {
         let k = 3 * PATCH * PATCH;
         let patches = gpu.empty(&[GRID * GRID, k])?;

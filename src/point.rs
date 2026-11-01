@@ -7,13 +7,13 @@ use std::ops::Range;
 use eyre::{Result, ensure};
 
 use crate::gpu::{Arg, Buf, Gpu, Tensor, launch};
-use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew};
+use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, ew};
 use crate::vision::{Fpn, GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
 const D: usize = 256;
 const HEADS: usize = 8;
-/// side of the low-resolution mask logits
+/// Side of the low-resolution mask logits
 pub const LOW_RES: usize = 4 * GRID;
 /// Most mask pixels [`MaskResize`] resizes per launch: 1 GiB of FP32 staging
 const MASK_GROUP_ELEMENTS: usize = 1 << 28;
@@ -51,7 +51,7 @@ impl PointPrompt {
 
 /// Image features the point decoder reads, computed once per image
 pub struct PointImage {
-    /// tracker `fpn.coarse` + no-memory embedding `[72^2, 256]`
+    /// Tracker `fpn.coarse` + no-memory embedding `[72^2, 256]`
     pub embed: Tensor,
     /// conv_s0(tracker `fpn.fine`) `[288^2, 32]`
     pub feat_s0: Tensor,
@@ -102,7 +102,7 @@ pub struct PointDecoder {
     mask_ln2: LayerNorm,
     mask_conv3: Linear,
     dense_pe: Tensor,
-    /// obj score, iou and 4 mask tokens `[6, 256]`
+    /// Object score, IoU and 4 mask tokens `[6, 256]`
     output_tokens: Vec<f32>,
     layers: Vec<TwoWayLayer>,
     final_attn: Attention,
@@ -288,7 +288,7 @@ impl PointDecoder {
         let queries = gpu.clone_tensor(&prompt_pe)?;
 
         let keys = self.dense(gpu, mask_input)?;
-        crate::ops::add_assign(gpu, &keys, embed)?;
+        add_assign(gpu, &keys, embed)?;
         let none = Mask::default();
 
         let mut queries = queries;
@@ -308,7 +308,7 @@ impl PointDecoder {
             l.norm2.forward_inplace(gpu, &queries)?;
 
             let m = l.mlp.forward(gpu, &queries)?;
-            crate::ops::add_assign(gpu, &queries, &m)?;
+            add_assign(gpu, &queries, &m)?;
             l.norm3.forward_inplace(gpu, &queries)?;
 
             let q = add(gpu, &queries, &prompt_pe)?;
@@ -321,11 +321,11 @@ impl PointDecoder {
         self.final_norm.forward_inplace(gpu, &queries)?;
 
         let up = self.upscale1.forward(gpu, &keys, GRID, GRID)?;
-        crate::ops::add_assign(gpu, &up, &img.feat_s1)?;
+        add_assign(gpu, &up, &img.feat_s1)?;
         self.upscale_ln.forward_inplace(gpu, &up)?;
         bias_act(gpu, &up, None, Act::Gelu)?;
         let up = self.upscale2.forward(gpu, &up, 2 * GRID, 2 * GRID)?;
-        crate::ops::add_assign(gpu, &up, &img.feat_s0)?;
+        add_assign(gpu, &up, &img.feat_s0)?;
         bias_act(gpu, &up, None, Act::Gelu)?;
 
         // mask token 0 is the single-mask output, 1 to 3 the multimask ones

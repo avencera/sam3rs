@@ -736,10 +736,10 @@ pub struct VideoTracker<'a> {
     next_frame: usize,
     objects: usize,
     cond: Vec<MemFrame>,
-    /// the last frames (up to `min(num_frames, 16) - 1`) whose score passed
+    /// The last frames (up to `min(num_frames, 16) - 1`) whose score passed
     /// [`MEMORY_SCORE_THRESHOLD`], oldest first
     passing: VecDeque<MemFrame>,
-    /// the previous frame when its score didn't pass: upstream always keeps it
+    /// The previous frame when its score didn't pass: upstream always keeps it
     prev: Option<MemFrame>,
 }
 
