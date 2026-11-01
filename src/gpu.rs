@@ -279,16 +279,34 @@ pub enum Precision {
     Bf16,
 }
 
+impl Precision {
+    const ALL: [Self; 3] = [Self::Fp32, Self::Tf32, Self::Bf16];
+
+    /// The mode's name, which `parse` reads back: `"fp32"`, `"tf32"` or `"bf16"`
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Tf32 => "tf32",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
+
+/// Writes [`Precision::as_str`]
+impl std::fmt::Display for Precision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
 impl std::str::FromStr for Precision {
     type Err = eyre::Report;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "fp32" => Ok(Self::Fp32),
-            "tf32" => Ok(Self::Tf32),
-            "bf16" => Ok(Self::Bf16),
-            _ => bail!("unknown precision {s:?}, expected fp32, tf32 or bf16"),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s)
+            .ok_or_else(|| eyre!("unknown precision {s:?}, expected fp32, tf32 or bf16"))
     }
 }
 
