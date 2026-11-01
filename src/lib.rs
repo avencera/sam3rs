@@ -16,6 +16,10 @@
 //! There is also a Python package with numpy in and out; see
 //! [crates/sam3rs-python](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python).
 //!
+//! Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
+//! blocking client with rustls and the shared Python Hugging Face cache. The `online`
+//! feature enables downloads; local model loading works without it.
+//!
 //! # Precision modes
 //!
 //! - `bf16` (default): BF16 tensor-core GEMMs with FP32 accumulation for the backbone,
