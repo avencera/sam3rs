@@ -35,12 +35,16 @@ There is also a Python package with numpy in and out; see
   ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
   fused into cuBLASLt epilogues. The first call of each GEMM shape times cuBLASLt's top
   candidate algorithms and switches from its first choice only to one more than 5%
-  faster, so close calls keep the same algorithm from run to run. FP32 weights and
+  faster. A candidate near that margin can win in one run and lose in the next, so
+  outputs can differ slightly between runs (about 0.00001 in score). FP32 weights and
   activations. Attention without a causal mask or additive bias, the detector's
   box-biased cross-attention included, runs a fused flash-attention kernel on TF32
   tensor cores with an FP32 softmax; the rest stays materialized.
-- `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
-  is the reference path for parity checks.
+- `fp32`: strict FP32, with no TF32 or BF16 anywhere: cuBLAS GEMMs in pedantic math and
+  cuBLASLt linears with FP32 compute, with bias and activations fused into their
+  epilogues. The vision backbone's attention runs a fused flash-attention kernel on FP32
+  FMAs with an online softmax, so it never writes the score matrix; the detector's
+  attention stays materialized. This is the reference path for parity checks.
 
 ## Requirements
 
@@ -127,23 +131,23 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **63.9** | **1.9** | **8.0** | **8.0** | **9.3** |
-| PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.6 | 35.8 | 21.1 | 21.4 | 20.5 |
-| **sam3rs `bf16`** | **33.3** | **2.0** | **5.5** | **5.5** | **7.0** |
-| PyTorch 2.14.1 FP32 (TF32 off) | 129.2 | 23.8 | 33.4 | 33.7 | 31.8 |
-| sam3rs `fp32` | 143.1 | 2.3 | 27.2 | 27.5 | 29.5 |
+| **sam3rs `tf32`** | **64.8** | **2.0** | **8.0** | **8.0** | **9.4** |
+| PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
+| **sam3rs `bf16`** | **33.6** | **2.0** | **5.6** | **5.6** | **7.0** |
+| PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
+| **sam3rs `fp32`** | **118.7** | **2.2** | **26.9** | **27.3** | **29.2** |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
 - `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 10x on points,
   4.3x on box prompts and 3.8x on text prompts.
-- `bf16` against PyTorch BF16: 1.19x on encode, 18x on points, 3.8x on box prompts and
+- `bf16` against PyTorch BF16: 1.17x on encode, 18x on points, 3.9x on box prompts and
   2.9x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 11% faster. sam3rs is 10x
-  faster on points, 1.2x on box prompts and 1.08x on text prompts.
+- `fp32` against PyTorch FP32 with TF32 off: 1.09x on encode, 11x on points, 1.24x on
+  box prompts and 1.09x on text prompts.
 
-The sam3rs rows come from one queued session, three runs each, reporting the median of
-each column. The osam and PyTorch rows come from earlier sessions on the same machine.
+The sam3rs and PyTorch rows come from one queued session, three runs each, reporting the
+median of each column. The osam row comes from an earlier session on the same machine.
 
 Where the time goes:
 
@@ -161,6 +165,10 @@ Where the time goes:
   the card's dense BF16 rate with FP32 accumulation, so the margin over PyTorch BF16 is
   small. The rest is fused bias and GELU epilogues, BF16 activations fed straight into
   the next GEMM, and the fused attention kernel.
+- Strict FP32 has no tensor cores to lean on, so its encode is bound by the FP32 pipes.
+  The backbone's attention runs fused on them and takes about 16 ms of the encode,
+  where materializing the scores took 42 ms. Its linears run the same CUTLASS SIMT
+  GEMMs as PyTorch's, with bias and GELU fused into their epilogues.
 
 The bench example reproduces the sam3rs rows:
 

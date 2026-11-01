@@ -111,7 +111,7 @@ class Sam3:
         """Load ``model.safetensors``, ``vocab.json`` and ``merges.txt`` from a directory.
 
         ``bf16`` runs the vision backbone on BF16 tensor cores with fused attention;
-        ``fp32`` is the strict FP32 reference path, about 4x slower to encode; ``tf32``
+        ``fp32`` is the strict FP32 reference path, about 3.5x slower to encode; ``tf32``
         is the FP32 path with TF32 tensor-core GEMMs, as ONNX Runtime runs FP32 models.
         """
         prepare_libraries()

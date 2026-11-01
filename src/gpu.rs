@@ -257,7 +257,9 @@ impl Mat {
 /// Numeric mode for the whole pipeline
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// Strict FP32 GEMMs (no TF32) and materialized attention: the parity reference path
+    /// Strict FP32 (no TF32 or BF16 anywhere): the parity reference path. The vision
+    /// backbone's attention runs a fused flash-attention kernel on FP32 FMAs; the
+    /// detector's attention stays materialized
     Fp32,
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default
@@ -287,7 +289,7 @@ impl std::str::FromStr for Precision {
 
 pub struct Gpu {
     // first, so it is dropped while the context is still alive
-    lt: Option<BlasLt>,
+    lt: BlasLt,
     device: Arc<Device>,
     module: CUmodule,
     /// the PTX `module` was loaded from, which the launch guard reads params from
@@ -331,8 +333,9 @@ impl Gpu {
             check_blas(blas::cublasCreate_v2(&mut handle))?;
             check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
         }
-        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and for the
-        // FP32-input GEMMs of BF16 mode, tensor cores that may round inputs to BF16
+        // pedantic math for the parity reference (default math measured the same on an RTX
+        // 5090), TF32 tensor cores for Tf32, and for the FP32-input GEMMs of BF16 mode,
+        // tensor cores that may round inputs to BF16
         let (math, fp32_compute) = match precision {
             Precision::Fp32 => {
                 (blas::cublasMath_t::CUBLAS_PEDANTIC_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC)
@@ -349,12 +352,9 @@ impl Gpu {
         };
         unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
 
-        // FP32 mode stays on plain cuBLAS GEMMs as the reference; the others fuse bias and
-        // activation into cuBLASLt epilogues
-        let lt = match precision {
-            Precision::Fp32 => None,
-            Precision::Tf32 | Precision::Bf16 => Some(BlasLt::new()?),
-        };
+        // every mode fuses bias and activation into cuBLASLt epilogues; FP32 mode's run with
+        // plain FP32 compute, so the products are as strict as its cuBLAS GEMMs
+        let lt = BlasLt::new()?;
         let fp32_operands = match fp32_compute {
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => Operands::F32FastTf32,
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF => Operands::F32Fast16Bf,
@@ -572,13 +572,11 @@ impl Gpu {
         bias: u64,
         epilogue: Epilogue,
     ) -> Result<()> {
-        let lt = self.lt.as_ref().ok_or_else(|| eyre!("BF16 cuBLASLt linears need Precision::Bf16"))?;
-        lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
+        self.lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
     }
 
     /// [`Self::linear_bf16`] for FP32 `x`, `w` and `out`, with this precision's FP32
-    /// compute type. Returns false without launching anything when there is no cuBLASLt
-    /// handle (FP32 mode), so the caller falls back to [`Self::gemm`]
+    /// compute type
     #[allow(clippy::too_many_arguments)]
     pub fn linear_f32(
         &self,
@@ -590,10 +588,8 @@ impl Gpu {
         beta: f32,
         bias: u64,
         epilogue: Epilogue,
-    ) -> Result<bool> {
-        let Some(lt) = &self.lt else { return Ok(false) };
-        lt.linear(self.cu_stream(), self.fp32_operands, mnk, x, x_ld, w, (out, false), beta, bias, epilogue)?;
-        Ok(true)
+    ) -> Result<()> {
+        self.lt.linear(self.cu_stream(), self.fp32_operands, mnk, x, x_ld, w, (out, false), beta, bias, epilogue)
     }
 
     /// Row-major `C[m,n] = alpha * op(A)[m,k] @ op(B)[k,n] + beta * C`, batched by stride
