@@ -176,23 +176,24 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **64.8** | **2.0** | **8.0** | **8.0** | **9.4** |
+| **sam3rs `tf32`** | **64.7** | **1.9** | **7.9** | **7.8** | **9.2** |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
-| **sam3rs `bf16`** | **33.6** | **2.0** | **5.6** | **5.6** | **7.0** |
+| **sam3rs `bf16`** | **31.1** | **2.0** | **5.4** | **5.4** | **6.9** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
-| **sam3rs `fp32`** | **118.7** | **2.2** | **26.9** | **27.3** | **29.2** |
+| **sam3rs `fp32`** | **120.2** | **2.2** | **26.8** | **27.2** | **29.1** |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
 - `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 10x on points,
-  4.3x on box prompts and 3.8x on text prompts.
-- `bf16` against PyTorch BF16: 1.17x on encode, 18x on points, 3.9x on box prompts and
-  2.9x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: 1.09x on encode, 11x on points, 1.24x on
+  4.3x on box prompts and 3.9x on text prompts.
+- `bf16` against PyTorch BF16: 1.27x on encode, 18x on points, 4.0x on box prompts and
+  3.0x on text prompts.
+- `fp32` against PyTorch FP32 with TF32 off: 1.08x on encode, 12x on points, 1.24x on
   box prompts and 1.09x on text prompts.
 
-The sam3rs and PyTorch rows come from one queued session, three runs each, reporting the
-median of each column. The osam row comes from an earlier session on the same machine.
+The sam3rs rows come from three runs of one queued session, reporting the median of
+each column. The PyTorch rows come from an earlier queued session on the same machine,
+three runs each, and the osam row from another.
 
 Where the time goes:
 
@@ -238,10 +239,10 @@ the frame count.
 | PyTorch 2.14.1 `torch.compile` | 42.3 | 55.9 | 5.8-6.5 GB |
 | PyTorch 2.14.1 CUDA graphs | 45.1 | 59.7 | 10-20 GB |
 | ComfyUI core (SAM 3.1 multiplex) | 44.7 | 46.3 | 3.8-4.0 GB |
-| **sam3rs `bf16`** | **34.8** | **44.2** | **3.4-3.7 GB** |
-| sam3rs `fp32` | 174.6 | 241.1 | 6.0-6.2 GB |
+| **sam3rs `bf16`** | **35.0** | **44.5** | **3.4-3.7 GB** |
+| sam3rs `fp32` | 148.1 | 214.2 | 5.3-5.4 GB |
 
-At 1080p and 256 frames sam3rs takes 35.7 and 45.7 ms. The image encoder and tracker
+At 1080p and 256 frames sam3rs takes 35.8 and 46.1 ms. The image encoder and tracker
 neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,
 about 1.8 of them in the memory cross-attention kernel and 0.44 in the memory
 self-attention. The GPU is about 99% busy, so CUDA graphs would
@@ -269,7 +270,7 @@ Worst case over 43 checks:
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
 | `tf32` | 0.0052 | 0.19 px | 0.9987 |
-| `bf16` | 0.0046 | 0.71 px | 0.9914 |
+| `bf16` | 0.0070 | 1.26 px | 0.9964 |
 
 ```sh
 cargo test --release --test parity -- --nocapture
@@ -300,9 +301,9 @@ every stage's inputs and outputs on a few frames.
 
 | Mode | Worst stage rel L2 | Mean IoU per object (horses, 3 objects) | Grazing (1 object) |
 |---|---|---|---|
-| `fp32` | 1.8e-6 | 1.0000 / 1.0000 / 1.0000 | 1.0000 |
-| `tf32` | 3.5e-4 | 0.9996 / 0.9987 / 1.0000 | 0.9998 |
-| `bf16` | 3.0e-3 | 0.9949 / 0.9977 / 0.9999 | 0.9997 |
+| `fp32` | 2.3e-6 | 0.9999 / 1.0000 / 1.0000 | 1.0000 |
+| `tf32` | 8.0e-4 | 0.9996 / 0.9987 / 1.0000 | 0.9998 |
+| `bf16` | 4.4e-3 | 0.9949 / 0.9977 / 0.9999 | 0.9997 |
 | PyTorch BF16 | | 0.9760 / 0.9918 / 0.9963 | 0.9966 |
 
 ```sh
