@@ -59,7 +59,10 @@
 //! - Stable Rust (edition 2024)
 //!
 //! libcuda and cuBLAS load at run time. A missing driver, GPU or cuBLAS makes
-//! `Sam3::load` return an error rather than panic.
+//! `Sam3::load` return an error rather than panic. cuBLAS opens by those two sonames, so
+//! a copy already in the process, such as the pip wheel the Python package loads, is
+//! reused; otherwise the loader's search order picks one (`LD_LIBRARY_PATH`, then the
+//! ldconfig cache).
 //!
 //! Cargo features:
 //!
@@ -243,6 +246,7 @@
 #![warn(missing_docs)]
 
 mod blaslt;
+mod cublas;
 mod detector;
 mod gpu;
 #[cfg(feature = "online")]

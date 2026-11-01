@@ -29,7 +29,12 @@ if [[ "$repo" == facebook/sam3 ]]; then
     echo "\`hf auth login\` or set HF_TOKEN (or pass --mirror for our own testing)" >&2
     exit 1
   fi
-  auth=(-H "Authorization: Bearer $token")
+  # curl reads the header from a file only this user can read, since a command-line
+  # argument shows up in other users' ps
+  header_file="$(mktemp)"
+  trap 'rm -f "$header_file"' EXIT
+  printf 'Authorization: Bearer %s\n' "$token" > "$header_file"
+  auth=(-H "@$header_file")
 fi
 
 declare -A sha=(

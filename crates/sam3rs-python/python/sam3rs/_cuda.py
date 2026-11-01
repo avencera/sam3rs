@@ -4,8 +4,9 @@ sam3rs opens ``libcuda.so.1`` and cuBLAS 13 (``libcublas.so.13``,
 ``libcublasLt.so.13``) at run time by soname. The ``nvidia-cublas`` wheel
 installed by the ``cuda`` extra puts cuBLAS inside site-packages, where the
 dynamic loader does not look, so it is loaded here first with ``RTLD_GLOBAL``:
-glibc then resolves the runtime's soname lookups to the already-loaded copies.
-A system CUDA 13 toolkit on the loader path works without the extra.
+glibc then resolves the runtime's soname lookups to the already-loaded copies,
+even when a CUDA toolkit on the loader path has its own cuBLAS. A system CUDA 13
+toolkit on the loader path works without the extra.
 """
 
 from __future__ import annotations

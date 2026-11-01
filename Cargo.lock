@@ -766,6 +766,7 @@ dependencies = [
  "eyre",
  "hf-fetch",
  "image",
+ "libloading",
  "memmap2",
  "regex",
  "safetensors",

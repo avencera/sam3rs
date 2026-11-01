@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use bytemuck::Pod;
 use cudarc::cublas::sys as blas;
-use cudarc::cublaslt::sys as lt;
 use cudarc::driver::sys::{self as cu, CUdeviceptr, CUfunction, CUmemoryPool, CUmodule, CUstream};
 use cudarc::driver::{CudaContext, CudaStream, result as cur};
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 
 use crate::blaslt::{BlasLt, Epilogue, Operands};
+use crate::cublas::Cublas;
 
 /// Kernels from the cuda-oxide crate `crates/sam3rs-kernels` as PTX for compute
 /// capability 8.0, the first with the BF16 `mma.sync` the attention kernel uses. The
@@ -34,7 +34,6 @@ static PTX_SM120: &str = concat!(include_str!("../kernels/ptx/sam3.sm120.ptx"), 
 /// Oldest driver API cuBLAS 13 runs on, as `cuDriverGetVersion` reports it. The PTX (ISA 8.7
 /// at most) needs no newer one
 const MIN_DRIVER: i32 = 13000;
-const CUBLAS_MAJOR: i32 = 13;
 
 /// Host bytes of in-flight uploads kept alive before the stream is drained, so loading
 /// 3.4 GB of weights doesn't hold a second host copy of all of them
@@ -297,6 +296,7 @@ pub struct Gpu {
     /// the PTX `module` was loaded from, which the launch guard reads params from
     ptx: &'static str,
     functions: RefCell<HashMap<&'static str, Kernel>>,
+    cublas: &'static Cublas,
     blas: blas::cublasHandle_t,
     /// compute type of GEMMs with FP32 inputs
     fp32_compute: blas::cublasComputeType_t,
@@ -314,7 +314,7 @@ unsafe impl Send for Gpu {}
 
 impl Gpu {
     pub fn new(ordinal: usize, precision: Precision) -> Result<Self> {
-        check_libraries()?;
+        let cublas = check_libraries()?;
         let ctx = CudaContext::new(ordinal).wrap_err_with(|| format!("open CUDA device {ordinal}"))?;
         let (major, minor) = ctx.compute_capability()?;
         if major < 8 {
@@ -337,11 +337,14 @@ impl Gpu {
         );
 
         let mut raw = std::ptr::null_mut();
-        unsafe { check_blas(blas::cublasCreate_v2(&mut raw))? };
+        unsafe { check_blas((cublas.blas.create)(&mut raw))? };
+        // the guard takes a plain fn, so it reaches the table through the loaded static
         let handle = Unowned(raw, |h| unsafe {
-            blas::cublasDestroy_v2(h);
+            if let Ok(cublas) = Cublas::get() {
+                (cublas.blas.destroy)(h);
+            }
         });
-        unsafe { check_blas(blas::cublasSetStream_v2(handle.0, device.stream.cu_stream() as _))? };
+        unsafe { check_blas((cublas.blas.set_stream)(handle.0, device.stream.cu_stream() as _))? };
         // pedantic math for the parity reference (default math measured the same on an RTX
         // 5090), TF32 tensor cores for Tf32, and for the FP32-input GEMMs of BF16 mode,
         // tensor cores that may round inputs to BF16
@@ -359,11 +362,11 @@ impl Gpu {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF)
             }
         };
-        unsafe { check_blas(blas::cublasSetMathMode(handle.0, math))? };
+        unsafe { check_blas((cublas.blas.set_math_mode)(handle.0, math))? };
 
         // every mode fuses bias and activation into cuBLASLt epilogues; FP32 mode's run with
         // plain FP32 compute, so the products are as strict as its cuBLAS GEMMs
-        let lt = BlasLt::new()?;
+        let lt = BlasLt::new(&cublas.lt)?;
         let fp32_operands = match fp32_compute {
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => Operands::F32FastTf32,
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF => Operands::F32Fast16Bf,
@@ -376,6 +379,7 @@ impl Gpu {
             module: module.into_inner(),
             ptx,
             functions: RefCell::new(HashMap::new()),
+            cublas,
             blas: handle.into_inner(),
             fp32_compute,
             fp32_operands,
@@ -613,7 +617,7 @@ impl Gpu {
             (blas::cudaDataType::CUDA_R_32F, self.fp32_compute)
         };
         let status = unsafe {
-            blas::cublasGemmStridedBatchedEx(
+            (self.cublas.blas.gemm_strided_batched_ex)(
                 self.blas,
                 op(b.trans),
                 op(a.trans),
@@ -667,7 +671,7 @@ impl Drop for Gpu {
         }
         unsafe {
             let _ = self.device.stream.synchronize();
-            blas::cublasDestroy_v2(self.blas);
+            (self.cublas.blas.destroy)(self.blas);
             let _ = cur::module::unload(self.module);
         }
     }
@@ -762,9 +766,10 @@ fn create_pool(ctx: &CudaContext) -> Result<CUmemoryPool> {
     Ok(pool)
 }
 
-/// Checks the run-time libraries before cudarc touches them: its loader panics on a
-/// missing library or symbol, and it also accepts older cuBLAS sonames whose ABI differs
-fn check_libraries() -> Result<()> {
+/// Checks the driver before cudarc touches it, since its loader panics on a missing
+/// library or symbol, then opens cuBLAS by its 13 sonames, which also pins the major
+/// version
+fn check_libraries() -> Result<&'static Cublas> {
     unsafe {
         if !cu::is_culib_present() {
             bail!("no NVIDIA driver found (libcuda.so.1); sam3rs needs an NVIDIA GPU with driver r580 or newer");
@@ -778,25 +783,11 @@ fn check_libraries() -> Result<()> {
                 version % 1000 / 10
             );
         }
-
-        let hint =
-            "install the CUDA 13 toolkit or `pip install nvidia-cublas`, and put its lib directory on LD_LIBRARY_PATH";
-        if !blas::is_culib_present() || !lt::is_culib_present() {
-            bail!("cuBLAS 13 not found (libcublas.so.13, libcublasLt.so.13): {hint}");
-        }
-        let mut major = 0;
-        check_blas(blas::cublasGetProperty(blas::libraryPropertyType::MAJOR_VERSION, &mut major))?;
-        let mut lt_major = 0;
-        if lt::cublasLtGetProperty(lt::libraryPropertyType::MAJOR_VERSION, &mut lt_major)
-            != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
-        {
-            bail!("cuBLASLt version query failed");
-        }
-        if major != CUBLAS_MAJOR || lt_major != CUBLAS_MAJOR {
-            bail!("found cuBLAS {major} and cuBLASLt {lt_major}, sam3rs needs version {CUBLAS_MAJOR}: {hint}");
-        }
     }
-    Ok(())
+
+    let hint =
+        "install the CUDA 13 toolkit or `pip install nvidia-cublas`, and put its lib directory on LD_LIBRARY_PATH";
+    Cublas::get().map_err(|e| eyre!("cuBLAS 13 not found (libcublas.so.13, libcublasLt.so.13): {e:#}; {hint}"))
 }
 
 fn check_blas(status: blas::cublasStatus_t) -> Result<()> {
