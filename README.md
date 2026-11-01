@@ -39,8 +39,9 @@ There is also a Python package with numpy in and out; see
   activations. Attention without a causal mask or additive bias, the detector's
   box-biased cross-attention included, runs a fused flash-attention kernel on TF32
   tensor cores with an FP32 softmax; the rest stays materialized.
-- `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
-  is the reference path for parity checks.
+- `fp32`: strict FP32, with no TF32 or BF16 anywhere: cuBLAS GEMMs in pedantic math and
+  cuBLASLt linears with FP32 compute, with bias and activations fused into their
+  epilogues. Attention stays materialized. This is the reference path for parity checks.
 
 ## Requirements
 

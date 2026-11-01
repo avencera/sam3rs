@@ -160,15 +160,9 @@ impl Linear {
         let (epilogue, fused) = self.epilogue(act);
         let bias = self.b.as_ref().map_or(0, Tensor::ptr);
         let mnk = (rows, self.out_features(), self.in_features());
-        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), out.ptr(), 0.0, bias, epilogue)? {
-            if !fused {
-                bias_act(gpu, &out, None, act)?;
-            }
-            return Ok(out);
-        }
-        self.forward_raw(gpu, x.ptr(), x.cols(), rows, out.ptr(), 0.0)?;
-        if self.b.is_some() || act != ACT_NONE {
-            bias_act(gpu, &out, self.b.as_ref(), act)?;
+        gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), out.ptr(), 0.0, bias, epilogue)?;
+        if !fused {
+            bias_act(gpu, &out, None, act)?;
         }
         Ok(out)
     }
@@ -196,14 +190,7 @@ impl Linear {
         let (epilogue, _) = self.epilogue(ACT_NONE);
         let bias = self.b.as_ref().map_or(0, Tensor::ptr);
         let mnk = (x.rows(), self.out_features(), self.in_features());
-        if gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), residual.ptr(), 1.0, bias, epilogue)? {
-            return Ok(());
-        }
-        self.forward_raw(gpu, x.ptr(), x.cols(), x.rows(), residual.ptr(), 1.0)?;
-        if self.b.is_some() {
-            bias_act(gpu, residual, self.b.as_ref(), ACT_NONE)?;
-        }
-        Ok(())
+        gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), residual.ptr(), 1.0, bias, epilogue)
     }
 
     /// FP32 input: converts to BF16, then [`Self::forward_lt`]
@@ -636,10 +623,7 @@ impl Conv3x3 {
             let input = Mat::new(xp.ptr() + ((dy * wp + dx) * c * 4) as u64, c);
             let weight = Mat::new(self.w.at(t * o * c), c).t();
             let beta = if t == 0 { 0.0 } else { 1.0 };
-            // cuBLASLt where there is a handle (TF32 mode), for its tuned algorithm choice
-            if !gpu.linear_f32((h * wp, o, c), input.ptr, c, weight.ptr, yp.ptr(), beta, 0, Epilogue::None)? {
-                gpu.gemm(h * wp, o, c, input, weight, Mat::new(yp.ptr(), o), 1, 1.0, beta)?;
-            }
+            gpu.linear_f32((h * wp, o, c), input.ptr, c, weight.ptr, yp.ptr(), beta, 0, Epilogue::None)?;
         }
         let y = gpu.empty(&[h * w, o])?;
         launch!(gpu, "crop_bias", ew(y.len()), B256, 0; &y, &yp, &self.b, w, o)?;
