@@ -17,7 +17,7 @@ use crate::ops::{B256, ew};
 use crate::point::{PointDecoder, PointPrompt, clamped_mask, full_res_masks};
 use crate::text::TextEncoder;
 use crate::tokenizer::Tokenizer;
-use crate::vision::{Backbone, Neck};
+use crate::vision::{Backbone, Neck, Trunk};
 use crate::weights::Weights;
 
 fn fixture(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
@@ -88,7 +88,7 @@ fn stages() -> Result<()> {
     compare("trunk", &chw(&gpu, &trunk)?, &fixture(&st, "trunk")?);
 
     let trunk = gpu.upload(fixture(&st, "trunk")?, &[1024, 72 * 72])?;
-    let trunk = transpose(&gpu, &trunk)?;
+    let trunk = Trunk::new(&gpu, transpose(&gpu, &trunk)?)?;
     let neck = Neck::load(&gpu, &wts, "detector_model.vision_encoder.neck")?;
     let fpn = neck.forward(&gpu, &trunk)?;
     for (i, f) in fpn.iter().enumerate() {

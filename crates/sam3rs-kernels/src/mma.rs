@@ -16,7 +16,7 @@ use cuda_device::shared::cvta_generic_to_shared_u32;
 use cuda_device::thread::threadIdx_x;
 use cuda_device::wmma::{
     ldmatrix_x4_shared_u32, ldmatrix_x4_trans_shared_u32, mma_m16n8k8_f32_tf32, mma_m16n8k16_f16_f16,
-    mma_m16n8k16_f32_bf16,
+    mma_m16n8k16_f32_bf16, mma_m16n8k16_f32_f16,
 };
 
 use crate::common::{Bf16, F16, pack_f16};
@@ -56,6 +56,65 @@ pub unsafe fn sts4(addr: SharedAddr, v: [u32; 4]) {
             clobber("memory"),
         );
     }
+}
+
+/// Starts a 16-byte copy from global `src` to shared `dst` that bypasses L1 (`cp.async.cg`);
+/// with `full` false it reads nothing and writes 16 zero bytes
+///
+/// # Safety
+/// `dst` is 16-byte aligned inside its tile, and `src` is 16-byte aligned with 16 readable
+/// bytes when `full`. No thread touches `dst` until this thread has waited on the copy
+/// ([`cp_async_wait_all`]) and a barrier has followed
+#[inline(always)]
+pub unsafe fn cp_async16(dst: SharedAddr, src: *const u8, full: bool) {
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %1; cp.async.cg.shared.global [%0], [g], 16, %2; }",
+            in("r") dst.0,
+            in("l") src as u64,
+            in("r") if full { 16u32 } else { 0u32 },
+            clobber("memory"),
+        );
+    }
+}
+
+/// Closes the group of this thread's copies started since the last commit
+///
+/// # Safety
+/// None beyond [`cp_async16`]'s, but kept unsafe to sit with the copies it orders
+#[inline(always)]
+pub unsafe fn cp_async_commit() {
+    unsafe { ptx_asm!("cp.async.commit_group;", clobber("memory")) };
+}
+
+/// Waits until every copy this thread started has landed; other threads' copies need a
+/// barrier after it
+///
+/// # Safety
+/// As [`cp_async_commit`]
+#[inline(always)]
+pub unsafe fn cp_async_wait_all() {
+    unsafe { ptx_asm!("cp.async.wait_group 0;", clobber("memory")) };
+}
+
+/// Waits until every copy group this thread committed has landed except the newest, so
+/// one prefetched tile can stay in flight; other threads' copies need a barrier after it
+///
+/// # Safety
+/// As [`cp_async_commit`]
+#[inline(always)]
+pub unsafe fn cp_async_wait_one() {
+    unsafe { ptx_asm!("cp.async.wait_group 1;", clobber("memory")) };
+}
+
+/// `c += a @ b` on FP16 operands with FP32 accumulation, half the FP16-accumulate rate on
+/// GeForce parts, for sums too long to round in FP16
+///
+/// # Safety
+/// All 32 lanes of the warp call it together
+#[inline(always)]
+pub unsafe fn mma_f16_acc_f32(c: [f32; 4], a: FragA<F16>, b: FragB<F16>) -> [f32; 4] {
+    unsafe { mma_m16n8k16_f32_f16(c, a.0, b.0) }
 }
 
 /// A 16-bit tensor-core operand format and the m16n8k16 MMA on it

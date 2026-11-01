@@ -12,7 +12,9 @@
 #![no_std]
 
 pub mod attention;
+pub mod attention_d256;
 pub mod attention_fp32;
+pub mod attention_mem;
 pub mod attention_tf32;
 pub mod common;
 pub mod conv;
@@ -21,4 +23,5 @@ pub mod elementwise;
 pub mod mma;
 pub mod norm;
 pub mod preprocess;
+pub mod tracker;
 pub mod vision;

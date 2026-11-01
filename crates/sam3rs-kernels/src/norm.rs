@@ -125,6 +125,46 @@ pub fn layernorm_bf16(mut out: DisjointSlice<Bf16>, x: &[f32], w: &[f32], b: &[f
     unsafe { layernorm_into(&mut out, x, w, b, cols, eps, addr_of_mut!(SCRATCH) as *mut f32) };
 }
 
+/// `x += add`, then [`layernorm_bf16`] of the sum, for a residual branch whose GEMM
+/// wrote BF16: one pass instead of cuBLASLt's separate FP32 epilogue kernel and a
+/// LayerNorm that re-reads the sum
+///
+/// Each thread adds the columns it later normalizes (`tid, tid + blockDim, ...`), so the
+/// sum needs no barrier before the row statistics read it
+#[kernel]
+pub fn add_layernorm_bf16(
+    mut out: DisjointSlice<Bf16>,
+    mut x: DisjointSlice<f32>,
+    add: &[Bf16],
+    w: &[f32],
+    b: &[f32],
+    cols: u32,
+    eps: f32,
+) {
+    static mut SCRATCH: SharedArray<f32, 32> = SharedArray::UNINIT;
+    // block-uniform, so a block that fails it never reaches a barrier
+    let end = (blockIdx_x() as usize + 1) * cols as usize;
+    if cols == 0 || end > x.len() || end > add.len() || end > out.len() {
+        return;
+    }
+    let base = blockIdx_x() * cols;
+    let row = x.as_mut_ptr().wrapping_add(base as usize);
+
+    let mut c = threadIdx_x();
+    while c < cols {
+        // SAFETY: the check above and `c < cols` keep `base + c` inside `x` and `add`,
+        // and column `c` is only visited by thread `c % blockDim` of this block
+        unsafe { *row.add(c as usize) += add.get_unchecked((base + c) as usize).widen() };
+        c += blockDim_x();
+    }
+
+    // SAFETY, for both closures: as above, and `out` covers the same row
+    let load = |c: u32| unsafe { *row.add(c as usize) };
+    let store = |c: u32, y: f32| *unsafe { out.get_unchecked_mut((base + c) as usize) } = Bf16::narrow(y);
+    // SAFETY: SCRATCH is used by nothing else, and every thread of the block runs this
+    unsafe { layernorm_row(cols, eps, w, b, addr_of_mut!(SCRATCH) as *mut f32, load, store) };
+}
+
 /// [`layernorm`] over `x` itself
 #[kernel]
 pub fn layernorm_inplace(mut x: DisjointSlice<f32>, w: &[f32], b: &[f32], cols: u32, eps: f32) {

@@ -1,6 +1,7 @@
 //! A native Rust/CUDA runtime for [Meta SAM 3](https://github.com/facebookresearch/sam3)
-//! image inference. It loads the official Hugging Face `model.safetensors` checkpoint and
-//! runs the whole image path on one CUDA stream without ONNX Runtime or PyTorch:
+//! image inference and click-to-track video. It loads the official Hugging Face
+//! `model.safetensors` checkpoint and runs the whole image path and the video tracker on
+//! one CUDA stream without ONNX Runtime or PyTorch:
 //!
 //! - Perception Encoder ViT backbone (32 blocks, windowed and global attention with RoPE)
 //!   and both SimpleFPN necks
@@ -8,6 +9,8 @@
 //! - geometry (box) encoder, fusion encoder, DETR decoder with the presence token,
 //!   dot-product scoring and the segmentation head
 //! - SAM 2 style point decoder with the two-pass mask refinement and hole filling
+//! - the SAM 3 video tracker: memory attention over a bank of past frames, the memory
+//!   encoder, object pointers and upstream's memory selection
 //!
 //! Image features stay on the GPU between prompts. Kernels that cuBLAS doesn't cover are
 //! Rust, written with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) in
@@ -137,6 +140,36 @@
 //! back to the model, so the next call writes its masks into pages that are already
 //! mapped. Faulting in fresh memory for 27 masks at 2560 px took about 27 ms.
 //!
+//! ## Video tracking
+//!
+//! Click objects on the first frame, then feed the frames one at a time:
+//!
+//! ```no_run
+//! use sam3rs::{PointPrompt, Precision, RgbImage, Sam3};
+//!
+//! # fn main() -> eyre::Result<()> {
+//! # #[cfg(feature = "online")]
+//! let model = Sam3::from_pretrained(0, Precision::Bf16)?;
+//! # #[cfg(not(feature = "online"))]
+//! # let model = Sam3::load("models/sam3".as_ref(), 0, Precision::Bf16)?;
+//! let frames: Vec<RgbImage> = vec![/* decoded frames, all one size */];
+//! // one Vec of clicks per object, in the first frame's pixels
+//! let clicks = vec![vec![PointPrompt::new(640.0, 360.0, true)?]];
+//! let (mut tracker, first) = model.track(&frames[0], &clicks, frames.len())?;
+//! for frame in &frames[1..] {
+//!     let out = tracker.next(frame)?;
+//!     for obj in &out.objects {
+//!         // obj.score > 0 means present; obj.mask is height * width bytes
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The tracker keeps a fixed-size memory bank, so memory use doesn't grow with the video's
+//! length. Clicks go on frame 0 only; new clicks on later frames, adding objects mid-video
+//! and SAM 3.1's multiplex tracker aren't implemented.
+//!
 //! # Results
 //!
 //! Milliseconds on an RTX 5090 (driver 595.99, CUDA 13.2), following the osam benchmark
@@ -150,23 +183,24 @@
 //! | Runtime | Encode | Point | Box | Neg box | Text |
 //! |---|---|---|---|---|---|
 //! | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-//! | **sam3rs `tf32`** | **64.8** | **2.0** | **8.0** | **8.0** | **9.4** |
+//! | **sam3rs `tf32`** | **64.7** | **1.9** | **7.9** | **7.8** | **9.2** |
 //! | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
-//! | **sam3rs `bf16`** | **33.6** | **2.0** | **5.6** | **5.6** | **7.0** |
+//! | **sam3rs `bf16`** | **31.1** | **2.0** | **5.4** | **5.4** | **6.9** |
 //! | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
-//! | **sam3rs `fp32`** | **118.7** | **2.2** | **26.9** | **27.3** | **29.2** |
+//! | **sam3rs `fp32`** | **120.6** | **2.2** | **26.8** | **27.2** | **29.1** |
 //!
 //! Each sam3rs row sits under the runtime that uses the same numerics:
 //!
 //! - `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 10x on points,
-//!   4.3x on box prompts and 3.8x on text prompts.
-//! - `bf16` against PyTorch BF16: 1.17x on encode, 18x on points, 3.9x on box prompts and
-//!   2.9x on text prompts.
-//! - `fp32` against PyTorch FP32 with TF32 off: 1.09x on encode, 11x on points, 1.24x on
+//!   4.3x on box prompts and 3.9x on text prompts.
+//! - `bf16` against PyTorch BF16: 1.27x on encode, 18x on points, 4.0x on box prompts and
+//!   3.0x on text prompts.
+//! - `fp32` against PyTorch FP32 with TF32 off: 1.07x on encode, 12x on points, 1.24x on
 //!   box prompts and 1.09x on text prompts.
 //!
-//! The sam3rs and PyTorch rows come from one queued session, three runs each, reporting the
-//! median of each column. The osam row comes from an earlier session on the same machine.
+//! The sam3rs rows come from three runs of one queued session, reporting the median of
+//! each column. The PyTorch rows come from an earlier queued session on the same machine,
+//! three runs each, and the osam row from another.
 //!
 //! Where the time goes:
 //!
@@ -197,6 +231,38 @@
 //! cargo run --release --example bench -- --precision fp32
 //! ```
 //!
+//! ## Video
+//!
+//! Steady-state milliseconds a frame on the same RTX 5090, BF16, one click per object on
+//! frame 0, masks at the video's size on the host: the median over frames 8 onward of a
+//! 64-frame 720p clip (`horses`), after one warm-up run. PyTorch runs upstream's
+//! tracker-only path (`build_sam3_video_model().tracker`) under BF16 autocast; ComfyUI is
+//! the core `SAM3_VideoTrack` node with SAM 3.1 multiplex FP16 weights, its node time over
+//! the frame count.
+//!
+//! | Runtime | 1 object | 3 objects | Peak VRAM |
+//! |---|---|---|---|
+//! | PyTorch 2.14.1 eager | 45.5 | 60.1 | 5.6-6.0 GB |
+//! | PyTorch 2.14.1 `torch.compile` | 42.3 | 55.9 | 5.8-6.5 GB |
+//! | PyTorch 2.14.1 CUDA graphs | 45.1 | 59.7 | 10-20 GB |
+//! | ComfyUI core (SAM 3.1 multiplex) | 44.7 | 46.3 | 3.8-4.0 GB |
+//! | **sam3rs `bf16`** | **34.8** | **44.2** | **3.4-3.7 GB** |
+//! | sam3rs `fp32` | 148.5 | 214.0 | 5.3-5.4 GB |
+//!
+//! At 1080p and 256 frames sam3rs takes 35.7 and 45.6 ms. The image encoder and tracker
+//! neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,
+//! about 1.8 of them in the memory cross-attention kernel and 0.44 in the memory
+//! self-attention. The GPU is about 99% busy, so CUDA graphs would
+//! save little. ComfyUI's multiplex tracker costs the same for 1 to 16 objects.
+//!
+//! ```sh
+//! cargo run --release --example bench_video -- --frames DIR --clip horses --objects 3
+//! ```
+//!
+//! `--frames` is a directory of decoded frames, read in name order. Clicks come from
+//! `tests/video_prompts.json` (`--prompts`). `--outputs DIR` writes the last run's
+//! scores and masks for an A/B gate.
+//!
 //! # Parity
 //!
 //! `tests/parity.rs` runs four images and 13 prompts (text, box, negative box, points)
@@ -211,7 +277,7 @@
 //! |---|---|---|---|
 //! | `fp32` | 0.0008 | 0.02 px | 0.9987 |
 //! | `tf32` | 0.0052 | 0.19 px | 0.9987 |
-//! | `bf16` | 0.0046 | 0.71 px | 0.9914 |
+//! | `bf16` | 0.0070 | 1.26 px | 0.9964 |
 //!
 //! ```sh
 //! cargo test --release --test parity -- --nocapture
@@ -221,6 +287,37 @@
 //! compares every intermediate stage (pixels, trunk, FPN levels, text features, scores,
 //! boxes, mask logits) for one fixture.
 //!
+//! The video tracker's gates are ignored tests in `src/video_tests.rs`, against fixtures
+//! from `scripts/video_reference.py dump`: upstream's tracker in true FP32 on a clip, with
+//! every stage's inputs and outputs on a few frames.
+//!
+//! - `video_stages` runs each stage (memory attention, memory encoder, decoder, pointer
+//!   MLP) on the reference's exact inputs: rel L2 within 1e-4 in `fp32` and 5e-3 in
+//!   `tf32` and `bf16` (4e-2 for the backbone and neck, the image path's encoder).
+//! - `video_e2e` tracks the whole clip and needs the reference's memory length, pointer
+//!   count and object presence on every frame, plus a mask IoU per object against FP32:
+//!   at least 0.99 in `fp32`, and in the reduced modes no worse than PyTorch's own BF16
+//!   run (mean minus 0.01, and its worst frame). Up to two frames an object are excused
+//!   from the worst-frame limit where the decoder's top two candidates were within 0.005
+//!   predicted IoU.
+//! - `video_e2e` in `bf16` also runs each checked frame's memory attention over the cached
+//!   per-frame keys against the FP32 model's on the same inputs (rel L2 within 5e-3).
+//! - `attention_d256` checks the two fused attention kernels (values of 256 for
+//!   self-attention, of 64 for the memory cross-attention) against an f64 softmax: rel L2
+//!   within 1e-3.
+//!
+//! | Mode | Worst stage rel L2 | Mean IoU per object (horses, 3 objects) | Grazing (1 object) |
+//! |---|---|---|---|
+//! | `fp32` | 2.3e-6 | 0.9999 / 1.0000 / 1.0000 | 1.0000 |
+//! | `tf32` | 8.0e-4 | 0.9996 / 0.9987 / 1.0000 | 0.9998 |
+//! | `bf16` | 4.4e-3 | 0.9949 / 0.9977 / 0.9999 | 0.9997 |
+//! | PyTorch BF16 | | 0.9760 / 0.9918 / 0.9963 | 0.9966 |
+//!
+//! ```sh
+//! SAM3RS_VIDEO=models/video-parity/horses-720p-64-o3-fp32.safetensors SAM3RS_PRECISION=bf16 \
+//!     cargo test --release --lib video_tests -- --ignored --nocapture --test-threads 1
+//! ```
+//!
 //! # Known differences
 //!
 //! - JPEG decoding uses the `image` crate, which differs from PIL's libjpeg-turbo on a few
@@ -228,7 +325,11 @@
 //!   reference's decoded RGB to isolate the model.
 //! - Text cleaning lowercases and collapses whitespace but doesn't port `ftfy` or HTML
 //!   unescaping.
-//! - Only the image path is implemented: no video tracking or memory bank.
+//! - Video tracking follows SAM 3's tracker-only path ("SAM 3 for SAM 2 video task")
+//!   from clicks on the first frame. The session predictors' per-frame detector, text
+//!   prompts on video, and SAM 3.1 aren't implemented.
+//! - In `bf16`, upstream rounds the memory's sine position encoding to BF16 under
+//!   autocast, and sam3rs keeps it in FP32.
 //! - The lowest `bf16` mask IoU (0.9914, a point prompt) comes from hole filling. A
 //!   rounding difference flips one low-resolution pixel, which cuts a 64-pixel background
 //!   region off from the rest. Hole filling turns background regions of up to 256 pixels
@@ -238,6 +339,7 @@
 //!
 //! - Only measured on one RTX 5090 (sm_120) with CUDA 13.2. The compute_80 PTX that other
 //!   GPUs load passes parity on the 5090 but hasn't run on another architecture.
+//! - Video parity covers two clips (720p, 64 frames, 1 and 3 objects).
 //! - Timings use one image and one prompt of each kind. Scaling with many box exemplars
 //!   or long text prompts hasn't been measured.
 //! - Parity covers four images and 13 prompts, and the BF16 worst score delta is within
@@ -260,11 +362,14 @@ mod point;
 mod posenc;
 mod text;
 mod tokenizer;
+mod video;
 mod vision;
 mod weights;
 
 #[cfg(test)]
 mod stage_tests;
+#[cfg(test)]
+mod video_tests;
 
 pub use detector::BoxPrompt;
 pub use gpu::Precision;
@@ -274,3 +379,4 @@ pub use image::{MAX_IMAGE_SIDE, RgbImage};
 pub use masks::MaskBuffer;
 pub use pipeline::{Detection, Detections, Embedding, PointMask, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
 pub use point::PointPrompt;
+pub use video::{TrackedFrame, TrackedObject, VideoTracker};

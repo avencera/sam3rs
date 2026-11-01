@@ -8,7 +8,7 @@
 
 use cuda_device::{DisjointSlice, kernel, launch_contract, thread};
 
-use crate::common::{Bf16, activate, math, pack_bf16};
+use crate::common::{Bf16, Elem, activate, math, pack_bf16};
 
 /// `x[r, c] = act(x[r, c] + bias[c])` in place, for rows of `bias.len()`; an empty
 /// `bias` only applies the activation
@@ -44,6 +44,17 @@ pub fn add_assign(mut x: DisjointSlice<f32>, b: &[f32]) {
     let i = t.get() as usize;
     if let Some(mut x) = x.element_thread32(t) {
         x.write(x.read() + b[i]);
+    }
+}
+
+/// `x += b` with a BF16 `b`, the output of a BF16-out GEMM
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn add_assign_bf16(mut x: DisjointSlice<f32>, b: &[Bf16]) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get() as usize;
+    if let Some(mut x) = x.element_thread32(t) {
+        x.write(x.read() + b[i].widen());
     }
 }
 
