@@ -326,6 +326,11 @@ pub struct Mask {
     pub rpb: Option<BoxRpb>,
 }
 
+/// Dynamic shared memory of `flash_attn_f32_d64`: 64-row Q, K (then P) and V tiles with
+/// rows of 64, 68 and 64 floats, small enough for two blocks an SM on parts with 100 KB.
+/// The kernel traps if a launch passes less
+const F32_D64_SMEM_BYTES: u32 = (64 * 64 + 64 * 68 + 64 * 64) * 4;
+
 /// Key splits for the fused box-RPB attention
 const RPB_SPLITS: usize = 16;
 
@@ -384,6 +389,18 @@ pub fn attention(
     };
     // the box RPB's dx and dy are `[heads, lq - 1, side]` each, heads being the batch
     let rpb_len = |r: BoxRpb| batch * (lq - 1) * r.side;
+
+    if f32_flash_ok(gpu, &[q, k, v, out], hd, &mask) {
+        let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
+        let view = |(m, rows): (Mat, usize)| [Arg::slice(m.ptr, extent(m, rows)), Arg::from(m.ld), Arg::from(m.stride)];
+        let args = [(out, lq), (q, lq), (k, lk), (v, lk)]
+            .into_iter()
+            .flat_map(view)
+            .chain([Arg::from(lq), Arg::from(lk), Arg::from(scale_log2)])
+            .collect();
+        let grid = (lq.div_ceil(64) as u32, batch as u32, 1);
+        return gpu.launch("flash_attn_f32_d64", grid, (128, 1, 1), F32_D64_SMEM_BYTES, args);
+    }
 
     let tf32 = tf32_flash_ok(gpu, &[q, k, v, out], hd, &mask);
     if tf32 || flash_ok(gpu, &[q, k, v, out], hd, &mask) {
@@ -479,6 +496,22 @@ pub fn attention(
     launch!(gpu, "softmax", ((batch * lq) as u32, 1, 1), B256, 0;
         &scores, lq, bias_arg, bias_div, key_pad, mask.causal as i32)?;
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
+}
+
+/// FP32 mode fuses unmasked head-dim-64 attention, the backbone's, on the FP32 pipes; the
+/// detector's masked and head-dim-32 attentions stay materialized. The kernel loads and
+/// stores in 16-byte chunks
+fn f32_flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
+    let aligned =
+        |m: &Mat| !m.trans && m.ptr.is_multiple_of(16) && m.ld.is_multiple_of(4) && m.stride.is_multiple_of(4);
+    gpu.precision() == Precision::Fp32
+        && !q.bf16
+        && hd == 64
+        && mask.rpb.is_none()
+        && mask.key_pad == 0
+        && mask.bias == 0
+        && !mask.causal
+        && [q, k, v, out].into_iter().all(aligned)
 }
 
 /// TF32 mode fuses attention for FP32 q/k/v with head dims 32 and 64 on TF32 tensor

@@ -257,7 +257,9 @@ impl Mat {
 /// Numeric mode for the whole pipeline
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// Strict FP32 GEMMs (no TF32) and materialized attention: the parity reference path
+    /// Strict FP32 (no TF32 or BF16 anywhere): the parity reference path. The vision
+    /// backbone's attention runs a fused flash-attention kernel on FP32 FMAs; the
+    /// detector's attention stays materialized
     Fp32,
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default

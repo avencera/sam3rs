@@ -41,7 +41,9 @@ There is also a Python package with numpy in and out; see
   tensor cores with an FP32 softmax; the rest stays materialized.
 - `fp32`: strict FP32, with no TF32 or BF16 anywhere: cuBLAS GEMMs in pedantic math and
   cuBLASLt linears with FP32 compute, with bias and activations fused into their
-  epilogues. Attention stays materialized. This is the reference path for parity checks.
+  epilogues. The vision backbone's attention runs a fused flash-attention kernel on FP32
+  FMAs with an online softmax, so it never writes the score matrix; the detector's
+  attention stays materialized. This is the reference path for parity checks.
 
 ## Requirements
 
