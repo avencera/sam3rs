@@ -357,6 +357,17 @@ pub fn row(gpu: &Gpu, x: &Tensor, r: usize) -> Result<Tensor> {
     Ok(out)
 }
 
+/// First index of the maximum, like `torch.argmax`
+pub fn argmax(v: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, x) in v.iter().enumerate() {
+        if *x > v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
 /// One low-res mask `[288^2]` clamped to +-32, as the next pass's mask input
 pub fn clamped_mask(gpu: &Gpu, low_res: &Tensor, index: usize) -> Result<Tensor> {
     let n = LOW_RES * LOW_RES;

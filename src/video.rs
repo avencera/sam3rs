@@ -18,7 +18,7 @@ use crate::image::{AaResize, RgbImage, preprocess};
 use crate::nvtx::range;
 use crate::ops::{Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha};
 use crate::pipeline::Sam3;
-use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, PointPrompt, row};
+use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, PointPrompt, argmax, row};
 use crate::posenc::sine_2d;
 use crate::vision::{GRID, IMAGE_SIZE, Trunk};
 use crate::weights::Weights;
@@ -1140,7 +1140,6 @@ fn stability(logits: &[f32]) -> f32 {
     if union > 0 { inter as f32 / union as f32 } else { 1.0 }
 }
 
-/// First index of the maximum, like `torch.argmax`
 /// All the clicks, or the first and last half of [`MAX_CLICKS`] when there are more
 fn cap_clicks(points: &[PointPrompt]) -> Vec<PointPrompt> {
     if points.len() <= MAX_CLICKS {
@@ -1148,14 +1147,4 @@ fn cap_clicks(points: &[PointPrompt]) -> Vec<PointPrompt> {
     }
     let first = MAX_CLICKS / 2;
     points[..first].iter().chain(&points[points.len() - (MAX_CLICKS - first)..]).copied().collect()
-}
-
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    for (i, x) in v.iter().enumerate() {
-        if *x > v[best] {
-            best = i;
-        }
-    }
-    best
 }

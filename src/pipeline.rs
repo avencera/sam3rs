@@ -13,7 +13,7 @@ use crate::image::{RgbImage, preprocess};
 use crate::masks::{MaskBuffer, MaskPool};
 use crate::nvtx::range;
 use crate::ops::{B256, ew, upload_i32};
-use crate::point::{LOW_RES, MaskResize, PointDecoder, PointImage, PointPrompt, clamped_mask, full_res_masks};
+use crate::point::{LOW_RES, MaskResize, PointDecoder, PointImage, PointPrompt, argmax, clamped_mask, full_res_masks};
 use crate::text::{TextEncoder, TextFeatures};
 use crate::tokenizer::Tokenizer;
 use crate::video::Tracker;
@@ -329,15 +329,4 @@ impl Sam3 {
         full_res_masks(gpu, &low_res, 1, w, h, &mut mask)?;
         Ok(PointMask { score: second.iou[best], mask })
     }
-}
-
-/// First index of the maximum, like `torch.argmax`
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    for (i, x) in v.iter().enumerate() {
-        if *x > v[best] {
-            best = i;
-        }
-    }
-    best
 }
