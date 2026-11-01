@@ -17,8 +17,8 @@ use crate::gpu::{Arg, Buf, Gpu, Precision, Tensor, launch};
 use crate::image::{AaResize, RgbImage, preprocess};
 use crate::nvtx::range;
 use crate::ops::{Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha};
-use crate::pipeline::{MASK_GROUP_ELEMENTS, Sam3};
-use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, PointImage, PointPrompt, row};
+use crate::pipeline::Sam3;
+use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, PointPrompt, row};
 use crate::posenc::sine_2d;
 use crate::vision::{GRID, IMAGE_SIZE, Trunk};
 use crate::weights::Weights;
@@ -1095,20 +1095,14 @@ impl VideoTracker<'_> {
         let gpu = &self.model.gpu;
         let _r = range(c"postprocess");
         let (w, h) = (self.width, self.height);
-        // objects in groups of at most MASK_GROUP_ELEMENTS pixels, so a launch stays under
-        // the 2^32 threads `ew` allows and the GPU never holds every object's FP32 plane
-        let (plane, side) = (w * h, LOW_RES * LOW_RES);
-        let group = (MASK_GROUP_ELEMENTS / plane).max(1).min(self.objects);
-        let up = gpu.empty(&[group, plane])?;
-        let mask = gpu.alloc_bytes(group * plane)?;
+        // each group is downloaded before the next, so the GPU holds one group's bytes
+        let resize = MaskResize::new(gpu, self.objects, w, h)?;
+        let plane = w * h;
+        let mask = gpu.alloc_bytes(resize.group() * plane)?;
         let mut masks = Vec::with_capacity(self.objects);
-        for start in (0..self.objects).step_by(group) {
-            let k = group.min(self.objects - start);
-            let n = k * plane;
-            let input = Arg::slice(low_res.at(start * side), k * side);
-            launch!(gpu, "resize_bilinear", ew(n), B256, 0; Arg::slice(up.ptr(), n), input, LOW_RES, LOW_RES, h, w)?;
-            // sigmoid(x) > 0.5 is x > 0
-            launch!(gpu, "threshold_u8", ew(n), B256, 0; Arg::slice(mask.ptr(), n), Arg::slice(up.ptr(), n), 0.0f32)?;
+        for range in resize.groups() {
+            let n = range.len() * plane;
+            resize.run(gpu, &low_res, range, Arg::slice(mask.ptr(), n))?;
             let mut bytes = vec![0u8; n];
             gpu.download_into(&mask, &mut bytes)?;
             masks.extend(bytes.chunks_exact(plane).map(<[u8]>::to_vec));
