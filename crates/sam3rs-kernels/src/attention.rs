@@ -1222,6 +1222,15 @@ pub fn flash_combine_d32(o: DisjointSlice<f32>, o_ld: u32, o_stride: u32, part: 
     flash_combine::<32, 1>(o, o_ld, o_stride, part, batch, lq, t.get());
 }
 
+/// [`flash_combine`] for 64-wide outputs ([`crate::attention_mem`]), one warp per output
+/// row
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn flash_combine_d64(o: DisjointSlice<f32>, o_ld: u32, o_stride: u32, part: &[f32], batch: u32, lq: u32) {
+    let t = thread::index_1d_u32(lc);
+    flash_combine::<64, 2>(o, o_ld, o_stride, part, batch, lq, t.get());
+}
+
 /// [`flash_combine`] for head dim 256, one warp per output row
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32)]

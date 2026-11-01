@@ -238,12 +238,13 @@ the frame count.
 | PyTorch 2.14.1 `torch.compile` | 42.3 | 55.9 | 5.8-6.5 GB |
 | PyTorch 2.14.1 CUDA graphs | 45.1 | 59.7 | 10-20 GB |
 | ComfyUI core (SAM 3.1 multiplex) | 44.7 | 46.3 | 3.8-4.0 GB |
-| **sam3rs `bf16`** | **39.7** | **54.3** | **3.2-3.3 GB** |
-| sam3rs `fp32` | 176.5 | 242.3 | 6.0-6.1 GB |
+| **sam3rs `bf16`** | **34.8** | **44.2** | **3.4-3.7 GB** |
+| sam3rs `fp32` | 174.6 | 241.1 | 6.0-6.2 GB |
 
-At 1080p and 256 frames sam3rs takes 40.6 and 55.8 ms. The image encoder, shared by
-all objects, is 33 ms of each frame. Each object adds 6.4 ms, 4.2 of them in the
-head-dim-256 memory attention kernel. The GPU is about 99% busy, so CUDA graphs would
+At 1080p and 256 frames sam3rs takes 35.7 and 45.7 ms. The image encoder and tracker
+neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,
+about 1.8 of them in the memory cross-attention kernel and 0.44 in the memory
+self-attention. The GPU is about 99% busy, so CUDA graphs would
 save little. ComfyUI's multiplex tracker costs the same for 1 to 16 objects.
 
 ```sh
@@ -268,7 +269,7 @@ Worst case over 43 checks:
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
 | `tf32` | 0.0052 | 0.19 px | 0.9987 |
-| `bf16` | 0.0046 | 0.71 px | 0.9914 |
+| `bf16` | 0.0070 | 1.26 px | 0.9964 |
 
 ```sh
 cargo test --release --test parity -- --nocapture
@@ -291,13 +292,17 @@ every stage's inputs and outputs on a few frames.
   run (mean minus 0.01, and its worst frame). Up to two frames an object are excused
   from the worst-frame limit where the decoder's top two candidates were within 0.005
   predicted IoU.
-- `attention_d256` checks the fused attention kernel against an f64 softmax.
+- `video_e2e` in `bf16` also runs each checked frame's memory attention over the cached
+  per-frame keys against the FP32 model's on the same inputs (rel L2 within 5e-3).
+- `attention_d256` checks the two fused attention kernels (values of 256 for
+  self-attention, of 64 for the memory cross-attention) against an f64 softmax: rel L2
+  within 1e-3.
 
 | Mode | Worst stage rel L2 | Mean IoU per object (horses, 3 objects) | Grazing (1 object) |
 |---|---|---|---|
 | `fp32` | 1.8e-6 | 1.0000 / 1.0000 / 1.0000 | 1.0000 |
 | `tf32` | 3.5e-4 | 0.9996 / 0.9987 / 1.0000 | 0.9998 |
-| `bf16` | 2.6e-3 | 0.9970 / 0.9955 / 0.9999 | 0.9998 |
+| `bf16` | 3.0e-3 | 0.9949 / 0.9977 / 0.9999 | 0.9997 |
 | PyTorch BF16 | | 0.9760 / 0.9918 / 0.9963 | 0.9966 |
 
 ```sh

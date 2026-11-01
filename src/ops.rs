@@ -216,6 +216,14 @@ impl Linear {
         Ok(out)
     }
 
+    /// BF16 `x16 @ W^T + b` to FP32: what [`Self::forward`] computes in BF16 mode once
+    /// it has converted its FP32 input
+    pub fn forward_from16(&self, gpu: &Gpu, x16: &Bf16) -> Result<Tensor> {
+        let out = gpu.empty(&[x16.rows, self.out_features()])?;
+        self.forward_lt(gpu, x16, (out.ptr(), false), 0.0, ACT_NONE)?;
+        Ok(out)
+    }
+
     /// `residual += x16 @ W^T + b`
     pub fn forward16_residual(&self, gpu: &Gpu, x16: &Bf16, residual: &Tensor) -> Result<()> {
         assert_eq!((residual.rows(), residual.cols()), (x16.rows, self.out_features()));
@@ -611,40 +619,74 @@ pub fn mha(
 /// Dynamic shared memory of `flash_attn_f16_d256`: Q, K and V tiles of 64 rows of 264
 /// FP16 values
 const FLASH_D256_SMEM: u32 = 3 * 64 * 264 * 2;
-/// Most key splits of the d256 attention
+/// Most key splits of the head-dim-256 attentions (`flash_attn_f16_d256` and
+/// `flash_attn_f16_qk256_v64`)
 const D256_MAX_SPLITS: usize = 8;
 
 /// Single-head attention with head dim 256 over FP16 `q [lq, 256]` and `k`, `v [lk, 256]`
 /// (rows packed), through the fused kernel, which needs a GPU with 99 KB of shared memory
 /// per block (sm_86 and up)
 pub fn attention_f16_d256(gpu: &Gpu, q: &Buf, k: &Buf, v: &Buf, lq: usize, lk: usize) -> Result<Tensor> {
-    const D: usize = 256;
-    assert!(lk > 0 && q.bytes() >= lq * D * 2 && k.bytes() >= lk * D * 2 && v.bytes() >= lk * D * 2);
-    let out = gpu.empty(&[lq, D])?;
-    // one block per SM at this much shared memory, so split the keys into the count whose
-    // grid wastes the least of its last wave, the fewest on ties
-    let qblocks = lq.div_ceil(64);
-    let cost = |s: usize| (qblocks * s).div_ceil(gpu.sms()) as f64 / s as f64;
-    let splits =
-        (1..=D256_MAX_SPLITS).filter(|s| lk >= s * 64).fold(1, |best, s| if cost(s) < cost(best) { s } else { best });
-    let chunk = lk.div_ceil(splits).next_multiple_of(64);
-    let splits = lk.div_ceil(chunk);
-    let part = if splits > 1 { Some(gpu.empty(&[splits, 1, lq, D + 2])?) } else { None };
+    let kernel = SplitAttention { name: "flash_attn_f16_d256", combine: "flash_combine_d256", dv: 256, rows: 64 };
+    kernel.run(gpu, q, k, v, lq, lk, (128, FLASH_D256_SMEM))
+}
 
-    let view = |ptr: u64, rows: usize| [Arg::slice(ptr, rows * D), Arg::from(D), Arg::from(0usize)];
-    let mut args: Vec<Arg> = [(out.ptr(), lq), (q.ptr(), lq), (k.ptr(), lk), (v.ptr(), lk)]
-        .into_iter()
-        .flat_map(|(p, r)| view(p, r))
-        .collect();
-    let scale_log2 = std::f32::consts::LOG2_E / (D as f32).sqrt();
-    args.extend([Arg::from(lq), Arg::from(lk), Arg::from(scale_log2)]);
-    args.extend([part.as_ref().map_or(Arg::EMPTY, Arg::from), Arg::from(chunk)]);
-    gpu.launch("flash_attn_f16_d256", (qblocks as u32, 1, splits as u32), (128, 1, 1), FLASH_D256_SMEM, args)?;
-    if let Some(part) = part {
-        // the kernel takes the split count from the length of `part`
-        launch!(gpu, "flash_combine_d256", (blocks(lq * 32, 256), 1, 1), B256, 0; &out, D, 0usize, &part, 1usize, lq)?;
+/// Dynamic shared memory of `flash_attn_f16_qk256_v64`: two K tiles of 64 rows of 264
+/// FP16 values and two V tiles of 64 rows of 72
+const FLASH_MEM_SMEM: u32 = 2 * 64 * 264 * 2 + 2 * 64 * 72 * 2;
+
+/// Single-head attention of FP16 `q [lq, 256]` over keys `k [lk, 256]` and 64-wide values
+/// `v [lk, 64]` (rows packed), `[lq, 64]` out: the tracker's memory cross-attention with
+/// `v_proj` folded into the output projection. Needs 84 KB of shared memory per block
+pub fn attention_f16_qk256_v64(gpu: &Gpu, q: &Buf, k: &Buf, v: &Buf, lq: usize, lk: usize) -> Result<Tensor> {
+    let kernel = SplitAttention { name: "flash_attn_f16_qk256_v64", combine: "flash_combine_d64", dv: 64, rows: 128 };
+    kernel.run(gpu, q, k, v, lq, lk, (256, FLASH_MEM_SMEM))
+}
+
+/// A fused single-head attention with 256-wide queries and keys that runs one block per
+/// SM, so it splits the keys across blocks and merges the splits after
+struct SplitAttention {
+    name: &'static str,
+    combine: &'static str,
+    /// value and output width
+    dv: usize,
+    /// query rows per block
+    rows: usize,
+}
+
+impl SplitAttention {
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, gpu: &Gpu, q: &Buf, k: &Buf, v: &Buf, lq: usize, lk: usize, block: (u32, u32)) -> Result<Tensor> {
+        const D: usize = 256;
+        let dv = self.dv;
+        assert!(lk > 0 && q.bytes() >= lq * D * 2 && k.bytes() >= lk * D * 2 && v.bytes() >= lk * dv * 2);
+        let out = gpu.empty(&[lq, dv])?;
+        // one block per SM at this much shared memory, so split the keys into the count
+        // whose grid wastes the least of its last wave, the fewest on ties
+        let qblocks = lq.div_ceil(self.rows);
+        let cost = |s: usize| (qblocks * s).div_ceil(gpu.sms()) as f64 / s as f64;
+        let splits = (1..=D256_MAX_SPLITS)
+            .filter(|s| lk >= s * 64)
+            .fold(1, |best, s| if cost(s) < cost(best) { s } else { best });
+        let chunk = lk.div_ceil(splits).next_multiple_of(64);
+        let splits = lk.div_ceil(chunk);
+        let part = if splits > 1 { Some(gpu.empty(&[splits, 1, lq, dv + 2])?) } else { None };
+
+        let view = |ptr: u64, rows: usize, w: usize| [Arg::slice(ptr, rows * w), Arg::from(w), Arg::from(0usize)];
+        let mut args: Vec<Arg> = [(out.ptr(), lq, dv), (q.ptr(), lq, D), (k.ptr(), lk, D), (v.ptr(), lk, dv)]
+            .into_iter()
+            .flat_map(|(p, r, w)| view(p, r, w))
+            .collect();
+        let scale_log2 = std::f32::consts::LOG2_E / (D as f32).sqrt();
+        args.extend([Arg::from(lq), Arg::from(lk), Arg::from(scale_log2)]);
+        args.extend([part.as_ref().map_or(Arg::EMPTY, Arg::from), Arg::from(chunk)]);
+        gpu.launch(self.name, (qblocks as u32, 1, splits as u32), (block.0, 1, 1), block.1, args)?;
+        if let Some(part) = part {
+            // the kernel takes the split count from the length of `part`
+            launch!(gpu, self.combine, (blocks(lq * 32, 256), 1, 1), B256, 0; &out, dv, 0usize, &part, 1usize, lq)?;
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// Output pixels per im2col chunk in BF16 mode: 16Ki rows of 9 x 256 BF16 channels is a
@@ -838,6 +880,22 @@ impl ConvT2x2 {
         let o = n / 4;
         let y = gpu.empty(&[4 * h * w, o])?;
         launch!(gpu, "convt2x2_scatter", ew(y.len()), B256, 0; &y, &g, &self.b, w, o)?;
+        Ok(y)
+    }
+
+    /// BF16 mode from a BF16 input to `act(y)` in BF16, for a following BF16 GEMM: the
+    /// values [`Self::forward`] then `bias_act` and a BF16 conversion would give, without
+    /// the FP32 map between them
+    pub fn forward16(&self, gpu: &Gpu, x16: &Bf16, h: usize, w: usize, act: i32) -> Result<Bf16> {
+        let w16 = self.w16.as_ref().ok_or_else(|| eyre!("transposed conv has no BF16 weights"))?;
+        let (c, n) = (self.w.shape()[0], self.w.shape()[1]);
+        assert_eq!((x16.rows, x16.cols), (h * w, c));
+        let g = gpu.empty(&[h * w, n])?;
+        let (input, weight) = (Mat::new(x16.buf.ptr(), c).bf16(), Mat::new(w16.ptr(), n).bf16());
+        gpu.gemm(h * w, n, c, input, weight, Mat::new(g.ptr(), n), 1, 1.0, 0.0)?;
+        let o = n / 4;
+        let y = Bf16::empty(gpu, 4 * h * w, o)?;
+        launch!(gpu, "convt2x2_scatter_bf16", ew(4 * h * w * o), B256, 0; &y, &g, &self.b, w, o, act)?;
         Ok(y)
     }
 }

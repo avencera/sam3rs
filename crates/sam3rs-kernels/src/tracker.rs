@@ -5,6 +5,7 @@
 //! index, and index math is 32-bit as in the elementwise kernels. Feature maps are
 //! channels-last `[h * w, c]`; map heights come from slice lengths
 
+use cuda_device::convert::cvt_f32x2_f16x2;
 use cuda_device::{DisjointSlice, kernel, launch_contract, thread};
 
 use crate::common::{activate, math, pack_bf16, pack_f16};
@@ -55,6 +56,27 @@ pub fn rope_rows_f16(mut out: DisjointSlice<u32>, x: &[f32], cos: &[f32], sin: &
     let k = ((row % positions) * half + c / 2) as usize;
     // the same products as rope_rows, rounded once
     out.write(pack_f16(re * cos[k] - im * sin[k], re * sin[k] + im * cos[k]));
+}
+
+/// One memory frame's keys for one slot of the bank: `kc + rope(c)` per row, into FP16
+///
+/// `kc [positions, 256]` is the frame's cached `rope(Wk (m + pos) + bk)` in FP16, and `c
+/// [256]` is `Wk tpos` for the slot's temporal encoding, a constant over the frame's
+/// tokens that rotates with each row's position. RoPE is linear, so the sum equals
+/// `rope(Wk (m + pos + tpos) + bk)`, the key upstream computes, up to rounding. One
+/// thread per pair; `cos` and `sin` are `[positions, 128]`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn slot_keys_f16(mut out: DisjointSlice<u32>, kc: &[u32], c: &[f32], cos: &[f32], sin: &[f32]) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let Some(mut out) = out.element_thread32(t) else { return };
+    let (pair, k) = ((i % 128) as usize, i as usize);
+    let (re, im) = (c[2 * pair], c[2 * pair + 1]);
+    let (cs, sn) = (cos[k], sin[k]);
+    let (a, b) = cvt_f32x2_f16x2(kc[k]);
+    // the same products as rope_rows_f16, added to the cached key and rounded once
+    out.write(pack_f16(a + (re * cs - im * sn), b + (re * sn + im * cs)));
 }
 
 /// 3x3 conv, stride 2, padding 1: `x [ih * iw, cin] -> out [(ih / 2) * (iw / 2), cout]`

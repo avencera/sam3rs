@@ -274,21 +274,51 @@ impl Neck {
         Ok(Self { levels })
     }
 
-    /// trunk `[72 * 72, 1024]` -> `[288^2, 256]`, `[144^2, 256]`, `[72^2, 256]`
-    pub fn forward(&self, gpu: &Gpu, trunk: &Tensor) -> Result<Vec<Tensor>> {
+    /// trunk `[72 * 72, 1024]` -> `[288^2, 256]`, `[144^2, 256]`, `[72^2, 256]`. In BF16
+    /// mode pass the trunk's BF16 copy too ([`Trunk::new`]): every GEMM up to `proj1`
+    /// then reads BF16 its producer wrote, rather than an FP32 map converted again per level
+    pub fn forward(&self, gpu: &Gpu, trunk: &Trunk) -> Result<Vec<Tensor>> {
         let mut out = Vec::new();
         for level in &self.levels {
-            let (h, side) = match &level.scale {
-                Scale::Up4(a, b) => {
-                    let h = a.forward(gpu, trunk, GRID, GRID)?;
+            let (h, side) = match (&level.scale, &trunk.bf16) {
+                (Scale::Up4(a, b), Some(t16)) => {
+                    let h16 = a.forward16(gpu, t16, GRID, GRID, ACT_GELU)?;
+                    let y16 = b.forward16(gpu, &h16, 2 * GRID, 2 * GRID, ACT_NONE)?;
+                    (level.proj1.forward_from16(gpu, &y16)?, 4 * GRID)
+                }
+                (Scale::Up2(a), Some(t16)) => {
+                    (level.proj1.forward_from16(gpu, &a.forward16(gpu, t16, GRID, GRID, ACT_NONE)?)?, 2 * GRID)
+                }
+                (Scale::Same, Some(t16)) => (level.proj1.forward_from16(gpu, t16)?, GRID),
+                (Scale::Up4(a, b), None) => {
+                    let h = a.forward(gpu, &trunk.f32, GRID, GRID)?;
                     bias_act(gpu, &h, None, ACT_GELU)?;
                     (level.proj1.forward(gpu, &b.forward(gpu, &h, 2 * GRID, 2 * GRID)?)?, 4 * GRID)
                 }
-                Scale::Up2(a) => (level.proj1.forward(gpu, &a.forward(gpu, trunk, GRID, GRID)?)?, 2 * GRID),
-                Scale::Same => (level.proj1.forward(gpu, trunk)?, GRID),
+                (Scale::Up2(a), None) => {
+                    (level.proj1.forward(gpu, &a.forward(gpu, &trunk.f32, GRID, GRID)?)?, 2 * GRID)
+                }
+                (Scale::Same, None) => (level.proj1.forward(gpu, &trunk.f32)?, GRID),
             };
             out.push(level.proj2.forward(gpu, &h, side, side)?);
         }
         Ok(out)
+    }
+}
+
+/// The backbone's output tokens `[72 * 72, 1024]` as the necks read them
+pub struct Trunk {
+    pub f32: Tensor,
+    /// BF16 copy in BF16 mode, converted once for every neck level
+    pub bf16: Option<Bf16>,
+}
+
+impl Trunk {
+    pub fn new(gpu: &Gpu, f32: Tensor) -> Result<Self> {
+        let bf16 = match gpu.precision() {
+            Precision::Bf16 => Some(Bf16::from_f32(gpu, &f32)?),
+            Precision::Fp32 | Precision::Tf32 => None,
+        };
+        Ok(Self { f32, bf16 })
     }
 }

@@ -30,6 +30,20 @@ pub fn convt2x2_scatter(mut y: DisjointSlice<f32>, g: &[f32], bias: &[f32], w: u
     y.write(g[src as usize] + b);
 }
 
+/// [`convt2x2_scatter`] to BF16 with `act` after the bias, for a following BF16 GEMM:
+/// the same sum, activation and nearest-even rounding as `bias_act` then `f32_to_bf16`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn convt2x2_scatter_bf16(mut y: DisjointSlice<Bf16>, g: &[f32], bias: &[f32], w: u32, o: u32, act: i32) {
+    let t = thread::index_1d_u32(lc);
+    let (oc, p) = (t.get() % o, t.get() / o);
+    let (yy, xx) = (p / (2 * w), p % (2 * w));
+    let src = ((yy >> 1) * w + (xx >> 1)) * o * 4 + oc * 4 + (yy & 1) * 2 + (xx & 1);
+    let Some(mut y) = y.element_thread32(t) else { return };
+    let b = if bias.is_empty() { 0.0 } else { bias[oc as usize] };
+    y.write(Bf16(pack_bf16(activate(g[src as usize] + b, act), 0.0) as u16));
+}
+
 /// `x [h * w, c] -> xp [(h + 2) * (w + 2) + 2, c]` zero-padded, one thread per element of
 /// `xp`. With the padded row width, the input of every 3x3 tap is one contiguous matrix
 /// at a fixed offset

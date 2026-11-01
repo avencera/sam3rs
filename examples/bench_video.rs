@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use eyre::{Result, eyre};
+use eyre::{Result, ensure, eyre};
 use sam3rs::{PointPrompt, Precision, RgbImage, Sam3};
 
 /// Frames before steady state, as in the PyTorch harness
@@ -55,6 +55,8 @@ fn main() -> Result<()> {
     let mut paths: Vec<PathBuf> =
         std::fs::read_dir(&args.frames)?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
     paths.sort();
+    // steady-state timing needs at least one tracked frame after the prompted one
+    ensure!(paths.len() >= 2, "{} holds {} frames; the bench needs at least 2", args.frames.display(), paths.len());
     let frames: Vec<RgbImage> = paths.iter().map(|p| RgbImage::open(p)).collect::<Result<_>>()?;
     let (w, h) = (frames[0].width() as f32, frames[0].height() as f32);
 

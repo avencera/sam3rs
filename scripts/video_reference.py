@@ -703,6 +703,7 @@ def compare(args) -> None:
     mask_dir = pathlib.Path(args.dir) / "masks"
     files = sorted(mask_dir.glob("*.npz"))
     groups = {}
+    failed = compared = 0
     for f in files:
         stem = f.stem
         for variant in ("eager", "compile", "graphs"):
@@ -711,25 +712,50 @@ def compare(args) -> None:
     for config, variants in sorted(groups.items()):
         ref_key = next((k for k in variants if k.startswith("eager")), None)
         if ref_key is None:
-            continue
+            raise SystemExit(f"{config} has no eager run to compare against")
         ref = np.load(variants[ref_key])
         for key, f in sorted(variants.items()):
             if key == ref_key:
                 continue
             other = np.load(f)
             ious = []
-            n = min(len(ref.files), len(other.files)) - 1
-            for k in range(n):
-                a = np.unpackbits(ref[f"f{k}"], axis=-1).astype(bool)
-                b = np.unpackbits(other[f"f{k}"], axis=-1).astype(bool)
-                for o in range(min(len(a), len(b))):
+            # a frame or object only one run produced counts as IoU 0, so a dropped
+            # object can't hide behind the ones both runs kept
+            n_ref, n_other = len(ref["ids"]), len(other["ids"])
+            missing = abs(n_ref - n_other)
+            ious.extend([0.0] * missing)
+            for k in range(min(n_ref, n_other)):
+                a = _masks_by_id(ref, k)
+                b = _masks_by_id(other, k)
+                for o in sorted(a.keys() | b.keys()):
+                    if o not in a or o not in b:
+                        missing += 1
+                        ious.append(0.0)
+                        continue
                     union = (a[o] | b[o]).sum()
                     ious.append(1.0 if union == 0 else (a[o] & b[o]).sum() / union)
             ious = np.array(ious)
             print(
-                f"{config} {key} vs {ref_key}: frames {n}, mean IoU {ious.mean():.5f}, "
-                f"min {ious.min():.5f}, <0.99: {(ious < 0.99).sum()} of {len(ious)}"
+                f"{config} {key} vs {ref_key}: frames {n_ref} vs {n_other}, mean IoU {ious.mean():.5f}, "
+                f"min {ious.min():.5f}, <0.99: {(ious < 0.99).sum()} of {len(ious)}, missing {missing}"
             )
+            compared += 1
+            # graph capture and compile change rounding only, so a mean below the limit
+            # means a variant tracked something else
+            failed += missing > 0 or ious.mean() < args.min_mean_iou
+    if not compared:
+        raise SystemExit(f"no variant to compare against an eager run in {mask_dir}")
+    if failed:
+        raise SystemExit(f"{failed} comparisons are missing frames or objects or below mean IoU {args.min_mean_iou}")
+
+
+def _masks_by_id(npz, k: int) -> dict:
+    """Frame k's masks keyed by object ID, failing when IDs and mask planes disagree"""
+    ids = json.loads(npz["ids"][k])
+    planes = np.unpackbits(npz[f"f{k}"], axis=-1).astype(bool)
+    if len(ids) != len(planes):
+        raise RuntimeError(f"frame {k}: {len(ids)} object IDs but {len(planes)} masks")
+    return dict(zip(ids, planes))
 
 
 # ---------------------------------------------------------------------------- dump
@@ -823,7 +849,8 @@ def dump(args) -> None:
             clear_old_points=True,
         )
     for frame_idx, obj_ids, low_res, video_res, scores in p.propagate_in_video(
-        state, start_frame_idx=0, max_frame_num_to_track=n_frames, reverse=False, tqdm_disable=True, propagate_preflight=True
+        # upstream's end frame is inclusive: start + max_frame_num_to_track
+        state, start_frame_idx=0, max_frame_num_to_track=n_frames - 1, reverse=False, tqdm_disable=True, propagate_preflight=True
     ):
         t = frame_idx
         full = args.precision == "fp32" and t in full_frames
@@ -880,6 +907,8 @@ def dump(args) -> None:
             np.packbits((video_res[:, 0] > 0).cpu().numpy(), axis=-1)
         )
         meta["per_frame"].append(frame_meta)
+    if len(meta["per_frame"]) != n_frames:
+        raise RuntimeError(f"tracked {len(meta['per_frame'])} frames, the fixture declares {n_frames}")
     for h in handles:
         h.remove()
     name = f"{clip}-o{n_obj}-{args.precision}"
@@ -909,6 +938,7 @@ def main() -> None:
     b.add_argument("--keep-masks", action="store_true")
     c = sub.add_parser("compare")
     c.add_argument("dir")
+    c.add_argument("--min-mean-iou", type=float, default=0.95, help="fail a variant whose mean IoU is lower")
     d = sub.add_parser("dump")
     d.add_argument("--clip", default="horses-720p-64")
     d.add_argument("--objects", type=int, default=3)

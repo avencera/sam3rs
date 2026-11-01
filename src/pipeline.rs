@@ -17,7 +17,7 @@ use crate::point::{LOW_RES, PointDecoder, PointImage, PointPrompt, clamped_mask,
 use crate::text::{TextEncoder, TextFeatures};
 use crate::tokenizer::Tokenizer;
 use crate::video::Tracker;
-use crate::vision::{Backbone, Neck};
+use crate::vision::{Backbone, Neck, Trunk};
 use crate::weights::Weights;
 
 /// `Sam3Processor.confidence_threshold`
@@ -233,6 +233,7 @@ impl Sam3 {
         };
         drop(pixels);
         let _r = range(c"necks");
+        let trunk = Trunk::new(gpu, trunk)?;
         let point = self.point.prepare_image(gpu, &self.tracker_neck.forward(gpu, &trunk)?)?;
         let detector = self.detector.prepare_image(gpu, self.neck.forward(gpu, &trunk)?)?;
         gpu.synchronize()?;

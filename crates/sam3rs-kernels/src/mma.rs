@@ -97,6 +97,16 @@ pub unsafe fn cp_async_wait_all() {
     unsafe { ptx_asm!("cp.async.wait_group 0;", clobber("memory")) };
 }
 
+/// Waits until every copy group this thread committed has landed except the newest, so
+/// one prefetched tile can stay in flight; other threads' copies need a barrier after it
+///
+/// # Safety
+/// As [`cp_async_commit`]
+#[inline(always)]
+pub unsafe fn cp_async_wait_one() {
+    unsafe { ptx_asm!("cp.async.wait_group 1;", clobber("memory")) };
+}
+
 /// `c += a @ b` on FP16 operands with FP32 accumulation, half the FP16-accumulate rate on
 /// GeForce parts, for sums too long to round in FP16
 ///

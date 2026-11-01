@@ -92,6 +92,12 @@ impl Fixture {
         self.meta["frames"].as_u64().unwrap() as usize
     }
 
+    /// Frames in the whole clip, which sets the tracker's temporal scale even when the
+    /// fixture dumped fewer
+    fn video_frames(&self) -> usize {
+        self.meta["video"]["frames"].as_u64().unwrap() as usize
+    }
+
     fn size(&self) -> (usize, usize) {
         let v = &self.meta["video"];
         (v["width"].as_u64().unwrap() as usize, v["height"].as_u64().unwrap() as usize)
@@ -364,7 +370,8 @@ fn unpack(packed: &[u8], b: usize, (w, h): (usize, usize)) -> Vec<u8> {
 }
 
 /// The whole tracker over the clip from the reference's pixels: memory sizes must match
-/// the reference's exactly, and the masks closely
+/// the reference's exactly, and the masks closely. In BF16 mode it also checks the
+/// memory attention over cached keys against the FP32 model's on the same inputs
 #[test]
 #[ignore = "needs a CUDA GPU, the weights and the video fixtures"]
 fn video_e2e() -> Result<()> {
@@ -404,8 +411,12 @@ fn video_e2e() -> Result<()> {
             .collect::<Result<_>>()?
     };
     let full_check = m.precision() == Precision::Fp32;
+    let mut cached_checks = 0;
+    // FP32 model for the cached-key check, loaded on first use
+    let mut reference: Option<Sam3> = None;
 
-    let (mut tracker, mut out): (VideoTracker, _) = m.track_pixels(&pixels(gpu, &fx, 0)?, w, h, &clicks, frames)?;
+    let (mut tracker, mut out): (VideoTracker, _) =
+        m.track_pixels(&pixels(gpu, &fx, 0)?, w, h, &clicks, fx.video_frames())?;
     for t in 0..frames {
         if t > 0 {
             if full_check
@@ -426,6 +437,40 @@ fn video_e2e() -> Result<()> {
                         STAGE_REL_L2,
                     );
                     rel_l2(&format!("f{t} prompt o{b} (drift)"), &gpu.download(mem)?, &seq_object(&prompt, &ps, b));
+                }
+            }
+            if m.precision() == Precision::Bf16 && [1, 2, 8, 16, frames - 1].contains(&t) {
+                // BF16 attends from each frame's cached keys plus the slot's rotated
+                // temporal key, from layer 0's shared start. The drifted memory has no
+                // fixture, so FP32 memory attention on the same inputs is the truth; the
+                // cached path must meet the BF16 stage limit against it, as the assembled
+                // path does in video_stages (printed alongside)
+                if reference.is_none() {
+                    reference = Some(Sam3::load("models/sam3".as_ref(), 0, Precision::Fp32)?);
+                }
+                let fp32 = reference.as_ref().expect("loaded above");
+                let rg = &fp32.gpu;
+                let to_ref = |x: &Tensor| -> Result<Tensor> { rg.upload(gpu.download(x)?, x.shape()) };
+                let feats = m.video_features(&pixels(gpu, &fx, t)?)?;
+                let (sel, inputs) = (tracker.selection()?, tracker.memory_inputs()?);
+                let ptr_tokens = sel.ptr_tokens();
+                let start = m.tracker.mem_attn.frame_start(gpu, &feats.fpn2)?;
+                let src32 = to_ref(&feats.fpn2)?;
+                for (b, (mem, mem_pos)) in inputs.objects.iter().enumerate() {
+                    let truth =
+                        fp32.tracker.mem_attn.forward(rg, &src32, &to_ref(mem)?, &to_ref(mem_pos)?, ptr_tokens)?;
+                    let truth = rg.download(&truth)?;
+                    let cached = tracker.memory_attention_cached(&sel, b, &start)?;
+                    let assembled = m.tracker.mem_attn.forward(gpu, &feats.fpn2, mem, mem_pos, ptr_tokens)?;
+                    rel_l2(&format!("f{t} assembled o{b}"), &gpu.download(&assembled)?, &truth);
+                    check(
+                        &mut failures,
+                        &format!("f{t} cached keys o{b}"),
+                        &gpu.download(&cached)?,
+                        &truth,
+                        REDUCED_REL_L2,
+                    );
+                    cached_checks += 1;
                 }
             }
             out = tracker.next_pixels(&pixels(gpu, &fx, t)?)?;
@@ -509,6 +554,9 @@ fn video_e2e() -> Result<()> {
             ));
         }
     }
+    if m.precision() == Precision::Bf16 {
+        ensure!(cached_checks > 0, "BF16 cached-key memory attention never checked");
+    }
     ensure!(failures.is_empty(), "{} checks failed:\n{}", failures.len(), failures.join("\n"));
     Ok(())
 }
@@ -523,13 +571,16 @@ const NEAR_TIE_MIN_IOU: f32 = 0.8;
 const NEAR_TIE_FRAMES: usize = 2;
 
 /// Error bound of the fused d256 attention against exact math: FP16 probabilities and
-/// per-tile FP16 sums in P @ V, on inputs FP16 holds exactly
+/// per-tile FP16 sums in P @ V, on inputs FP16 holds exactly. The memory cross-attention
+/// kernel (64-wide values, FP16 sums of 16 terms in both products) is held to the same
+/// bound
 const ATTENTION_D256_REL_L2: f32 = 1e-3;
 
-/// The fused d256 attention (`attention_f16_d256`) against an f64 softmax, on FP16-exact
-/// inputs with the memory attention's logit spread: 200 queries over 36,348 keys (split
+/// The fused head-dim-256 attentions against an f64 softmax, on FP16-exact inputs with
+/// the memory attention's logit spread: `attention_f16_d256` (values of 256) and
+/// `attention_f16_qk256_v64` (values of 64), each at 200 queries over 36,348 keys (split
 /// keys, a partial last tile and a partial query block), and 5,184 queries over 100 keys
-/// (one unsplit launch)
+/// (one unsplit launch, a partial last query block of the 128-row kernel)
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn attention_d256() -> Result<()> {
@@ -548,52 +599,59 @@ fn attention_d256() -> Result<()> {
             .map(|v| v / scale)
             .collect()
     };
-    let to_f16 = |gpu: &Gpu, x: &[f32]| -> Result<Buf> {
-        let t = gpu.upload(x.to_vec(), &[x.len() / D, D])?;
+    let to_f16 = |gpu: &Gpu, x: &[f32], w: usize| -> Result<Buf> {
+        let t = gpu.upload(x.to_vec(), &[x.len() / w, w])?;
         let out = gpu.alloc_bytes(x.len() * 2)?;
         // rope_rows = 0 only converts, so the angle tables are never read
         launch!(gpu, "rope_rows_f16", crate::ops::ew(x.len() / 2), crate::ops::B256, 0;
-            out.slice::<u32>(), &t, &t, &t, D, 0usize)?;
+            out.slice::<u32>(), &t, &t, &t, w, 0usize)?;
         Ok(out)
     };
 
-    for (lq, lk) in [(200, 36_348), (5184, 100)] {
-        // logits q.k / 16 with a spread of about 2.7, as peaked as the tracker's
-        let (q, k, v) = (values(lq * D, 512.0), values(lk * D, 256.0), values(lk * D, 256.0));
-        let out =
-            crate::ops::attention_f16_d256(&gpu, &to_f16(&gpu, &q)?, &to_f16(&gpu, &k)?, &to_f16(&gpu, &v)?, lq, lk)?;
-        let got = gpu.download(&out)?;
+    for dv in [D, 64] {
+        for (lq, lk) in [(200, 36_348), (5184, 100)] {
+            // logits q.k / 16 with a spread of about 2.7, as peaked as the tracker's
+            let (q, k, v) = (values(lq * D, 512.0), values(lk * D, 256.0), values(lk * dv, 256.0));
+            let (q16, k16, v16) = (to_f16(&gpu, &q, D)?, to_f16(&gpu, &k, D)?, to_f16(&gpu, &v, dv)?);
+            let out = if dv == D {
+                crate::ops::attention_f16_d256(&gpu, &q16, &k16, &v16, lq, lk)?
+            } else {
+                crate::ops::attention_f16_qk256_v64(&gpu, &q16, &k16, &v16, lq, lk)?
+            };
+            ensure!(out.shape() == [lq, dv], "output shape {:?}", out.shape());
+            let got = gpu.download(&out)?;
 
-        let mut want = vec![0f32; lq * D];
-        let mut p = vec![0f64; lk];
-        for i in 0..lq {
-            let qi = &q[i * D..][..D];
-            for (j, pj) in p.iter_mut().enumerate() {
-                *pj = qi.iter().zip(&k[j * D..][..D]).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() / 16.0;
-            }
-            let mx = p.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let total: f64 = p
-                .iter_mut()
-                .map(|x| {
-                    *x = (*x - mx).exp();
-                    *x
-                })
-                .sum();
-            let mut row = vec![0f64; D];
-            for (j, pj) in p.iter().enumerate() {
-                for (r, vj) in row.iter_mut().zip(&v[j * D..][..D]) {
-                    *r += pj * *vj as f64;
+            let mut want = vec![0f32; lq * dv];
+            let mut p = vec![0f64; lk];
+            for i in 0..lq {
+                let qi = &q[i * D..][..D];
+                for (j, pj) in p.iter_mut().enumerate() {
+                    *pj = qi.iter().zip(&k[j * D..][..D]).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() / 16.0;
+                }
+                let mx = p.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let total: f64 = p
+                    .iter_mut()
+                    .map(|x| {
+                        *x = (*x - mx).exp();
+                        *x
+                    })
+                    .sum();
+                let mut row = vec![0f64; dv];
+                for (j, pj) in p.iter().enumerate() {
+                    for (r, vj) in row.iter_mut().zip(&v[j * dv..][..dv]) {
+                        *r += pj * *vj as f64;
+                    }
+                }
+                for (w, r) in want[i * dv..][..dv].iter_mut().zip(row) {
+                    *w = (r / total) as f32;
                 }
             }
-            for (w, r) in want[i * D..][..D].iter_mut().zip(row) {
-                *w = (r / total) as f32;
-            }
+            let rel = rel_l2(&format!("dv{dv} {lq}x{lk}"), &got, &want);
+            ensure!(
+                rel <= ATTENTION_D256_REL_L2,
+                "values of {dv}, {lq} queries over {lk} keys: rel L2 {rel:.3e} > {ATTENTION_D256_REL_L2:.0e}"
+            );
         }
-        let rel = rel_l2(&format!("d256 {lq}x{lk}"), &got, &want);
-        ensure!(
-            rel <= ATTENTION_D256_REL_L2,
-            "{lq} queries over {lk} keys: rel L2 {rel:.3e} > {ATTENTION_D256_REL_L2:.0e}"
-        );
     }
     Ok(())
 }
