@@ -324,7 +324,10 @@ jobs:
             sleep 30
           done
           uv pip install --python .venv-release numpy
-          .venv-release/bin/python -I -c "import sam3rs; assert sam3rs.__version__ == '${version}'"
+          # the distribution carries the PEP 440 version; __version__ is the crate's SemVer one
+          .venv-release/bin/python -I -c "import importlib.metadata, sam3rs
+          assert importlib.metadata.version('sam3rs') == '${version}'
+          assert sam3rs.__version__ == '${GITHUB_REF_NAME#v}'"
           .venv-release/bin/sam3rs --help
 
   pypi-publish:
