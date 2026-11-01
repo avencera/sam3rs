@@ -25,19 +25,29 @@
 //!
 //! # Precision modes
 //!
-//! - `bf16` (default): tensor-core GEMMs with FP32 accumulation everywhere, bias and
-//!   activations fused into cuBLASLt epilogues, and a fused flash-attention kernel. The
-//!   backbone, necks, text encoder MLP and fusion encoder FFN keep BF16 weights and
-//!   activations. The rest of the text encoder and fusion encoder, the detector and the
-//!   point decoder keep FP32 ones, and cuBLAS may round their GEMM inputs to BF16, though
-//!   on an RTX 5090 it picks TF32 kernels for most of them. Their unmasked attention, and
-//!   the detector's box-biased cross-attention, also run the fused kernel, which rounds q,
-//!   k and v to FP16 and sums scores and P @ V tiles in FP16.
+//! - `bf16` (default): tensor-core GEMMs with FP32 accumulation, bias and activations
+//!   fused into cuBLASLt epilogues, and a fused flash-attention kernel. The backbone,
+//!   necks, text encoder MLP and fusion encoder FFN keep BF16 weights and activations.
+//!   The rest of the text encoder and fusion encoder, the detector and the point decoder
+//!   keep FP32 ones, and cuBLAS may round their GEMM inputs to BF16, though on an RTX 5090
+//!   it picks TF32 kernels for most of them. Their unmasked attention, and the detector's
+//!   box-biased cross-attention, also run the fused kernel, which rounds q, k and v to
+//!   FP16 and sums scores in FP16. In every fused attention, v is FP16 and each 64-key
+//!   P @ V tile is summed in FP16 before it is added to FP32 totals.
 //! - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
-//!   ONNX Runtime's CUDA provider runs FP32 models by default. FP32 weights and
-//!   activations, materialized attention.
-//! - `fp32`: strict FP32 (cuBLAS pedantic math, no TF32) with materialized attention. This
-//!   is the reference path for parity checks.
+//!   ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
+//!   fused into cuBLASLt epilogues. The first call of each GEMM shape times cuBLASLt's top
+//!   candidate algorithms and switches from its first choice only to one more than 5%
+//!   faster. A candidate near that margin can win in one run and lose in the next, so
+//!   outputs can differ slightly between runs (about 0.00001 in score). FP32 weights and
+//!   activations. Attention without a causal mask or additive bias, the detector's
+//!   box-biased cross-attention included, runs a fused flash-attention kernel on TF32
+//!   tensor cores with an FP32 softmax; the rest stays materialized.
+//! - `fp32`: strict FP32, with no TF32 or BF16 anywhere: cuBLAS GEMMs in pedantic math and
+//!   cuBLASLt linears with FP32 compute, with bias and activations fused into their
+//!   epilogues. The vision backbone's attention runs a fused flash-attention kernel on FP32
+//!   FMAs with an online softmax, so it never writes the score matrix; the detector's
+//!   attention stays materialized. This is the reference path for parity checks.
 //!
 //! # Requirements
 //!
@@ -106,16 +116,23 @@
 //! # let model = Sam3::load("models/sam3".as_ref(), 0, Precision::Bf16)?;
 //! let image = RgbImage::open("dogs.jpg".as_ref())?;
 //! let embedding = model.encode(&image)?;
-//! for det in model.detect(&embedding, "dog", &[])? {
-//!     println!("{:.3} {:?}", det.score, det.bbox);
+//! let dogs = model.detect(&embedding, "dog", &[])?;
+//! for (i, det) in dogs.iter().enumerate() {
+//!     // each mask is height * width bytes, 1 = foreground
+//!     let pixels = dogs.mask(i).iter().filter(|&&m| m != 0).count();
+//!     println!("{:.3} {:?} {pixels} px", det.score, det.bbox);
 //! }
 //!
 //! // box exemplars: find more objects like the positive box
 //! let exemplar = BoxPrompt::from_xyxy([1233.0, 376.0, 1649.0, 691.0], image.width(), image.height(), true)?;
-//! let dogs = model.detect(&embedding, VISUAL_PROMPT, &[exemplar])?;
+//! let similar = model.detect(&embedding, VISUAL_PROMPT, &[exemplar])?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! All of a call's masks share one host buffer. Dropping the result hands that memory
+//! back to the model, so the next call writes its masks into pages that are already
+//! mapped. Faulting in fresh memory for 27 masks at 2560 px took about 27 ms.
 //!
 //! # Results
 //!
@@ -130,23 +147,23 @@
 //! | Runtime | Encode | Point | Box | Neg box | Text |
 //! |---|---|---|---|---|---|
 //! | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-//! | **sam3rs `tf32`** | **91.9** | **2.1** | **21.8** | **21.9** | **23.3** |
-//! | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.6 | 35.8 | 21.1 | 21.4 | 20.5 |
-//! | **sam3rs `bf16`** | **33.4** | **2.0** | **5.5** | **5.5** | **7.1** |
-//! | PyTorch 2.14.1 FP32 (TF32 off) | 129.2 | 23.8 | 33.4 | 33.7 | 31.8 |
-//! | sam3rs `fp32` | 143.3 | 2.3 | 27.2 | 27.5 | 29.5 |
+//! | **sam3rs `tf32`** | **64.8** | **2.0** | **8.0** | **8.0** | **9.4** |
+//! | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
+//! | **sam3rs `bf16`** | **33.6** | **2.0** | **5.6** | **5.6** | **7.0** |
+//! | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
+//! | **sam3rs `fp32`** | **118.7** | **2.2** | **26.9** | **27.3** | **29.2** |
 //!
 //! Each sam3rs row sits under the runtime that uses the same numerics:
 //!
-//! - `tf32` against osam, both FP32 with TF32 matmuls: 1.5x on encode, 9.5x on points,
-//!   1.6x on box prompts and 1.5x on text prompts.
-//! - `bf16` against PyTorch BF16: 1.19x on encode, 18x on points, 3.8x on box prompts and
+//! - `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 10x on points,
+//!   4.3x on box prompts and 3.8x on text prompts.
+//! - `bf16` against PyTorch BF16: 1.17x on encode, 18x on points, 3.9x on box prompts and
 //!   2.9x on text prompts.
-//! - `fp32` against PyTorch FP32 with TF32 off: PyTorch encodes 11% faster. sam3rs is 11x
-//!   faster on points, 1.2x on box prompts and 1.08x on text prompts.
+//! - `fp32` against PyTorch FP32 with TF32 off: 1.09x on encode, 11x on points, 1.24x on
+//!   box prompts and 1.09x on text prompts.
 //!
-//! The sam3rs rows come from one queued session, three runs each, reporting the median of
-//! each column. The osam and PyTorch rows come from earlier sessions on the same machine.
+//! The sam3rs and PyTorch rows come from one queued session, three runs each, reporting the
+//! median of each column. The osam row comes from an earlier session on the same machine.
 //!
 //! Where the time goes:
 //!
@@ -159,11 +176,16 @@
 //!   busy. sam3rs issues about 0.6k GPU operations for a box prompt and 0.95k for a text
 //!   prompt, and keeps the GPU about 91% busy. A BF16 box prompt spends about 1.8 ms in the
 //!   fusion encoder, 1.6 ms in the mask head and 1.2 ms in the DETR decoder, then about
-//!   0.3 ms per kept mask copying it to the host.
+//!   0.3 ms per kept mask copying it to the host, into memory reused from earlier calls.
+//!   The Python package views those bytes as numpy bool arrays without copying them.
 //! - Encode is GEMM-bound. The backbone MLP and qkv GEMMs run at 195-210 TFLOPS, close to
 //!   the card's dense BF16 rate with FP32 accumulation, so the margin over PyTorch BF16 is
 //!   small. The rest is fused bias and GELU epilogues, BF16 activations fed straight into
 //!   the next GEMM, and the fused attention kernel.
+//! - Strict FP32 has no tensor cores to lean on, so its encode is bound by the FP32 pipes.
+//!   The backbone's attention runs fused on them and takes about 16 ms of the encode,
+//!   where materializing the scores took 42 ms. Its linears run the same CUTLASS SIMT
+//!   GEMMs as PyTorch's, with bias and GELU fused into their epilogues.
 //!
 //! The bench example reproduces the sam3rs rows:
 //!
@@ -185,7 +207,7 @@
 //! | Mode | Max score delta | Max box delta | Min mask IoU |
 //! |---|---|---|---|
 //! | `fp32` | 0.0008 | 0.02 px | 0.9987 |
-//! | `tf32` | 0.0053 | 0.19 px | 0.9987 |
+//! | `tf32` | 0.0052 | 0.19 px | 0.9987 |
 //! | `bf16` | 0.0046 | 0.71 px | 0.9914 |
 //!
 //! ```sh
@@ -226,6 +248,7 @@ mod gpu;
 #[cfg(feature = "online")]
 mod hub;
 mod image;
+mod masks;
 mod nvtx;
 mod ops;
 mod pipeline;
@@ -244,5 +267,6 @@ pub use gpu::Precision;
 #[cfg(feature = "online")]
 pub use hub::{MODEL_FILES, MODEL_REPO, download_model};
 pub use image::{MAX_IMAGE_SIDE, RgbImage};
-pub use pipeline::{Detection, Embedding, PointMask, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
+pub use masks::MaskBuffer;
+pub use pipeline::{Detection, Detections, Embedding, PointMask, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
 pub use point::PointPrompt;

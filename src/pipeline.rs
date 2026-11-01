@@ -4,13 +4,13 @@
 use std::cell::{Cell, OnceCell};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::JoinHandle;
 
-use eyre::{Result, ensure, eyre};
+use eyre::{Result, ensure};
 
 use crate::detector::{BoxPrompt, Detector, DetectorImage, QUERIES};
-use crate::gpu::{Gpu, Precision, launch};
+use crate::gpu::{Arg, Gpu, Precision, launch};
 use crate::image::{RgbImage, preprocess};
+use crate::masks::{MaskBuffer, MaskPool};
 use crate::nvtx::range;
 use crate::ops::{B256, ew, upload_i32};
 use crate::point::{LOW_RES, PointDecoder, PointImage, PointPrompt, clamped_mask, full_res_masks};
@@ -24,6 +24,9 @@ pub const SCORE_THRESHOLD: f32 = 0.5;
 
 /// Text used for box-only prompts, as in upstream and osam
 pub const VISUAL_PROMPT: &str = "visual";
+
+/// Mask outputs resized per group in `detect`: 1 GiB of FP32 staging
+const MASK_GROUP_ELEMENTS: usize = 1 << 28;
 
 /// Tells models apart, so an embedding is only used with the model that made it
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(0);
@@ -49,17 +52,80 @@ impl Embedding {
     }
 }
 
-/// One detected instance
+/// One detected instance; its mask is [`Detections::mask`]
 #[derive(Clone, Debug)]
 pub struct Detection {
     /// sigmoid(logit) * sigmoid(presence)
     pub score: f32,
     /// `[x0, y0, x1, y1]` in pixels, not clamped to the image
     pub bbox: [f32; 4],
-    /// `height * width` bytes, 1 = foreground
-    pub mask: Vec<u8>,
     /// Index of the DETR query (0 to 199) that produced it
     pub query: usize,
+}
+
+/// The instances [`Sam3::detect`] found, in DETR query order, with all their masks in
+/// one buffer
+///
+/// One buffer lets callers take every mask without copying it again: at 2560 px a mask
+/// is 5 MB, and copying a stack of them into fresh memory cost more than the detection
+#[derive(Clone, Debug, Default)]
+pub struct Detections {
+    instances: Vec<Detection>,
+    masks: MaskBuffer,
+}
+
+impl Detections {
+    /// Number of instances
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Whether nothing scored above [`SCORE_THRESHOLD`]
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    /// The instances, without their masks
+    pub fn iter(&self) -> std::slice::Iter<'_, Detection> {
+        self.instances.iter()
+    }
+
+    /// Mask of instance `i`: `height * width` bytes, 1 = foreground
+    ///
+    /// Panics if `i` is out of range
+    pub fn mask(&self, i: usize) -> &[u8] {
+        assert!(i < self.len(), "mask {i} of {} detections", self.len());
+        let pixels = self.masks.len() / self.len();
+        &self.masks[i * pixels..][..pixels]
+    }
+
+    /// Every mask in instance order: `len * height * width` bytes, 1 = foreground
+    pub fn masks(&self) -> &[u8] {
+        &self.masks
+    }
+
+    /// Splits into the instances and the mask buffer of [`Detections::masks`]
+    pub fn into_parts(self) -> (Vec<Detection>, MaskBuffer) {
+        (self.instances, self.masks)
+    }
+}
+
+impl IntoIterator for Detections {
+    type Item = Detection;
+    type IntoIter = std::vec::IntoIter<Detection>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.instances.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Detections {
+    type Item = &'a Detection;
+    type IntoIter = std::slice::Iter<'a, Detection>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 /// The best of the three candidate masks for a point prompt
@@ -68,7 +134,7 @@ pub struct PointMask {
     /// predicted IoU of the chosen mask
     pub score: f32,
     /// `height * width` bytes, 1 = foreground
-    pub mask: Vec<u8>,
+    pub mask: MaskBuffer,
 }
 
 /// The loaded model on one GPU
@@ -87,9 +153,11 @@ pub struct Sam3 {
     /// Text features of [`VISUAL_PROMPT`], encoded on first use: every box-only prompt
     /// would otherwise run the 24-layer text encoder on the same string
     visual: OnceCell<TextFeatures>,
-    /// detections the last `detect` call kept, the guess for how many mask buffers to
-    /// fault in ahead of the next
+    /// detections the last `detect` call kept, the guess for how many masks of host
+    /// memory to set aside ahead of the next
     last_kept: Cell<usize>,
+    /// host memory of dropped results, reused for later masks
+    masks: MaskPool,
     // last, so the layers free their weights before the GPU handles go
     gpu: Gpu,
 }
@@ -129,6 +197,7 @@ impl Sam3 {
             point: PointDecoder::load(&gpu, &wts)?,
             visual: OnceCell::new(),
             last_kept: Cell::new(0),
+            masks: MaskPool::default(),
             gpu,
         };
         model.gpu.synchronize()?;
@@ -170,12 +239,13 @@ impl Sam3 {
     /// for boxes alone), keeping those scoring above [`SCORE_THRESHOLD`] in query order.
     /// Each call runs the text encoder on `text`, except for [`VISUAL_PROMPT`], whose
     /// features are encoded on the first call and reused
-    pub fn detect(&self, emb: &Embedding, text: &str, boxes: &[BoxPrompt]) -> Result<Vec<Detection>> {
+    pub fn detect(&self, emb: &Embedding, text: &str, boxes: &[BoxPrompt]) -> Result<Detections> {
         self.check(emb)?;
         let gpu = &self.gpu;
         let _r = range(c"detect");
         let (w, h) = (emb.width, emb.height);
-        let spare = prefault(self.last_kept.get(), w * h);
+        // one mask more than last time, since a box being dragged out tends to gain them
+        let reserved = self.masks.reserve((self.last_kept.get() + 1) * w * h);
         let encode = || {
             let _r = range(c"text");
             self.text.forward(gpu, &self.tokenizer.tokenize(text)?)
@@ -205,7 +275,8 @@ impl Sam3 {
             (0..QUERIES).map(|i| (i, sigmoid(logits[i]) * presence)).filter(|(_, p)| *p > SCORE_THRESHOLD).collect();
         self.last_kept.set(kept.len());
         if kept.is_empty() {
-            return Ok(vec![]);
+            self.masks.release(reserved);
+            return Ok(Detections::default());
         }
 
         let side = LOW_RES * LOW_RES;
@@ -213,31 +284,37 @@ impl Sam3 {
         let idx = upload_i32(gpu, idx)?;
         let picked = gpu.empty(&[kept.len(), side])?;
         launch!(gpu, "gather_rows", ew(picked.len()), B256, 0; &picked, &out.masks, idx.slice::<i32>(), side)?;
-        let up = gpu.empty(&[kept.len(), h * w])?;
-        launch!(gpu, "resize_bilinear", ew(up.len()), B256, 0; &up, &picked, LOW_RES, LOW_RES, h, w)?;
-        // sigmoid(x) > 0.5 is x > 0
-        let mask = gpu.alloc_bytes(up.len())?;
-        launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
-        let mut masks = join(spare)?;
-        masks.truncate(kept.len());
-        // calloc per mask: cloning one zeroed Vec would touch every page up front
-        masks.resize_with(kept.len(), || vec![0u8; h * w]);
-        gpu.download_split(&mask, &mut masks)?;
+        // masks go through in groups whose FP32 staging stays bounded and whose element
+        // count fits the kernels' 32-bit thread index; one mask at the largest image size
+        // is 2^28 elements, so a group always holds at least one
+        let plane = h * w;
+        let group = (MASK_GROUP_ELEMENTS / plane).max(1);
+        let up = gpu.empty(&[group.min(kept.len()), plane])?;
+        let mask = gpu.alloc_bytes(kept.len() * plane)?;
+        for start in (0..kept.len()).step_by(group) {
+            let n = group.min(kept.len() - start) * plane;
+            let input = Arg::slice(picked.at(start * side), n / plane * side);
+            launch!(gpu, "resize_bilinear", ew(n), B256, 0; Arg::slice(up.ptr(), n), input, LOW_RES, LOW_RES, h, w)?;
+            // sigmoid(x) > 0.5 is x > 0
+            let out = Arg::slice(mask.ptr() + (start * plane) as u64, n);
+            launch!(gpu, "threshold_u8", ew(n), B256, 0; out, Arg::slice(up.ptr(), n), 0.0f32)?;
+        }
+        let mut masks = self.masks.take(reserved, kept.len() * h * w)?;
+        gpu.download_into(&mask, &mut masks)?;
 
-        Ok(kept
+        let instances = kept
             .iter()
-            .zip(masks)
-            .map(|(&(i, score), mask)| {
+            .map(|&(i, score)| {
                 let [cx, cy, bw, bh] = [boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2], boxes[i * 4 + 3]];
                 let (wf, hf) = (w as f32, h as f32);
                 Detection {
                     score,
                     bbox: [(cx - bw / 2.0) * wf, (cy - bh / 2.0) * hf, (cx + bw / 2.0) * wf, (cy + bh / 2.0) * hf],
-                    mask,
                     query: i,
                 }
             })
-            .collect())
+            .collect();
+        Ok(Detections { instances, masks })
     }
 
     /// Segments the object under the clicks: a first pass without a mask, then a second
@@ -249,7 +326,7 @@ impl Sam3 {
         let gpu = &self.gpu;
         let _r = range(c"segment_points");
         let (w, h) = (emb.width, emb.height);
-        let spare = prefault(1, w * h);
+        let reserved = self.masks.reserve(w * h);
         let first = self.point.forward(gpu, &emb.point, points, w, h, None)?;
         let mask_input = clamped_mask(gpu, &first.low_res, argmax(&first.iou))?;
         let second = self.point.forward(gpu, &emb.point, points, w, h, Some(&mask_input))?;
@@ -259,34 +336,10 @@ impl Sam3 {
         let side = LOW_RES * LOW_RES;
         let low_res = gpu.empty(&[1, side])?;
         gpu.copy_dtod(second.low_res.at(best * side), low_res.ptr(), side * 4)?;
-        let out = join(spare)?.pop().expect("one prefaulted buffer");
-        let mask = full_res_masks(gpu, &low_res, 1, w, h, out)?;
+        let mut mask = self.masks.take(reserved, w * h)?;
+        full_res_masks(gpu, &low_res, 1, w, h, &mut mask)?;
         Ok(PointMask { score: second.iou[best], mask })
     }
-}
-
-/// Makes `count` zeroed host buffers of `len` bytes with every page already faulted in, on
-/// another thread while the GPU works. The driver's pageable copy into fresh pages takes
-/// the faults itself, about 0.24 ms per full-resolution mask with the GPU idle
-fn prefault(count: usize, len: usize) -> Option<JoinHandle<Vec<Vec<u8>>>> {
-    (count > 0).then(|| {
-        std::thread::spawn(move || {
-            (0..count)
-                .map(|_| {
-                    let mut buf = vec![0u8; len];
-                    // black_box, or the compiler drops stores of zero into calloc'd memory
-                    for byte in buf.iter_mut().step_by(4096) {
-                        *std::hint::black_box(byte) = 0;
-                    }
-                    buf
-                })
-                .collect()
-        })
-    })
-}
-
-fn join(spare: Option<JoinHandle<Vec<Vec<u8>>>>) -> Result<Vec<Vec<u8>>> {
-    spare.map_or(Ok(Vec::new()), |t| t.join().map_err(|_| eyre!("mask buffer thread panicked")))
 }
 
 /// First index of the maximum, like `torch.argmax`

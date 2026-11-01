@@ -12,6 +12,8 @@
 #![no_std]
 
 pub mod attention;
+pub mod attention_fp32;
+pub mod attention_tf32;
 pub mod common;
 pub mod conv;
 pub mod detector;

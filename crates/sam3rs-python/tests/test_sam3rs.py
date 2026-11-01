@@ -104,6 +104,7 @@ def test_matches_pytorch(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], 
             best = int(np.argmax(want_iou))
             assert abs(got.score - want_iou[best]) <= SCORE_TOL, key
             assert _iou(got.mask, masks[best] != 0) >= MIN_IOU, key
+            _check_bool_view(got.mask[None], height, width)
             checked += 1
             continue
 
@@ -121,6 +122,7 @@ def test_matches_pytorch(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], 
         np.testing.assert_allclose(got.boxes, tensors[f"{key}.boxes_xyxy"], atol=box_tol, err_msg=key)
         for i, mask in enumerate(got.masks):
             assert _iou(mask, masks[i] != 0) >= MIN_IOU, f"{key} det {i}"
+        _check_bool_view(got.masks, height, width)
         checked += 1
     assert checked == len(prompts) > 0
 
@@ -150,3 +152,10 @@ def test_rejects_bad_prompts(model: sam3rs.Sam3) -> None:
         model.segment_points(emb, [(1, 2)], labels=[1, 0])
     with pytest.raises(ValueError):
         model.segment_points(emb, [(1, 2)], labels=[-1])
+
+
+def _check_bool_view(masks: np.ndarray, height: int, width: int) -> None:
+    # masks view the runtime's bytes as bool, valid only while every byte is 0 or 1
+    assert masks.dtype == np.bool_ and masks.shape[1:] == (height, width)
+    assert masks.view(np.uint8).max(initial=0) <= 1
+    assert masks.flags.writeable and masks.flags.c_contiguous

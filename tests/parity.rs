@@ -168,7 +168,7 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
             check(true, format!("kept queries {got_queries:?}"));
             // both sides keep detections in query order
             for (i, d) in got.iter().enumerate() {
-                let mask_iou = iou(&d.mask, &want_masks[i * hw..][..hw])?;
+                let mask_iou = iou(got.mask(i), &want_masks[i * hw..][..hw])?;
                 let dscore = (d.score - want_scores[i]).abs();
                 let dbox = max_abs_diff(&d.bbox, &want_boxes[i * 4..][..4]);
                 worst.checks += 1;

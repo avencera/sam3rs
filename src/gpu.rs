@@ -257,18 +257,22 @@ impl Mat {
 /// Numeric mode for the whole pipeline
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// Strict FP32 GEMMs (no TF32) and materialized attention: the parity reference path
+    /// Strict FP32 (no TF32 or BF16 anywhere): the parity reference path. The vision
+    /// backbone's attention runs a fused flash-attention kernel on FP32 FMAs; the
+    /// detector's attention stays materialized
     Fp32,
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default
     Tf32,
-    /// Tensor-core GEMMs with FP32 accumulation everywhere. The vision backbone, necks
-    /// and text encoder MLP keep BF16 weights and activations; the rest of the text
-    /// encoder, the fusion encoder, detector and point decoder keep FP32 ones, and cuBLAS
-    /// may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though it
-    /// picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
-    /// and the detector's box-biased cross-attention, run the fused kernel, which rounds
-    /// q, k and v to BF16
+    /// Tensor-core GEMMs with FP32 accumulation. The vision backbone, necks, text encoder
+    /// MLP and fusion encoder FFN keep BF16 weights and activations; the rest of the text
+    /// encoder and fusion encoder, the detector and point decoder keep FP32 ones, and
+    /// cuBLAS may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though
+    /// it picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
+    /// and the detector's box-biased cross-attention, run the fused kernel. It computes
+    /// scores from BF16 q and k as they are, or rounds FP32 q and k to FP16 and sums
+    /// their scores in FP16; either way it rounds v to FP16 and sums each 64-key P @ V
+    /// tile in FP16 before adding it to FP32 totals
     Bf16,
 }
 
@@ -287,7 +291,7 @@ impl std::str::FromStr for Precision {
 
 pub struct Gpu {
     // first, so it is dropped while the context is still alive
-    lt: Option<BlasLt>,
+    lt: BlasLt,
     device: Arc<Device>,
     module: CUmodule,
     /// the PTX `module` was loaded from, which the launch guard reads params from
@@ -323,16 +327,24 @@ impl Gpu {
 
         // PTX JIT-compiles forward to any newer GPU, never back to an older one
         let ptx = if major >= 12 { PTX_SM120 } else { PTX_SM80 };
-        let module =
-            unsafe { cur::module::load_data(ptx.as_ptr().cast()) }.wrap_err("JIT-compile the sam3rs kernels")?;
+        // the module and cuBLAS handle are raw, so until `Gpu` owns them a failed step
+        // below frees them here; `Gpu::drop` only runs once construction finishes
+        let module = Unowned(
+            unsafe { cur::module::load_data(ptx.as_ptr().cast()) }.wrap_err("JIT-compile the sam3rs kernels")?,
+            |m| unsafe {
+                let _ = cur::module::unload(m);
+            },
+        );
 
-        let mut handle = std::ptr::null_mut();
-        unsafe {
-            check_blas(blas::cublasCreate_v2(&mut handle))?;
-            check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
-        }
-        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and for the
-        // FP32-input GEMMs of BF16 mode, tensor cores that may round inputs to BF16
+        let mut raw = std::ptr::null_mut();
+        unsafe { check_blas(blas::cublasCreate_v2(&mut raw))? };
+        let handle = Unowned(raw, |h| unsafe {
+            blas::cublasDestroy_v2(h);
+        });
+        unsafe { check_blas(blas::cublasSetStream_v2(handle.0, device.stream.cu_stream() as _))? };
+        // pedantic math for the parity reference (default math measured the same on an RTX
+        // 5090), TF32 tensor cores for Tf32, and for the FP32-input GEMMs of BF16 mode,
+        // tensor cores that may round inputs to BF16
         let (math, fp32_compute) = match precision {
             Precision::Fp32 => {
                 (blas::cublasMath_t::CUBLAS_PEDANTIC_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC)
@@ -347,12 +359,11 @@ impl Gpu {
                 (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF)
             }
         };
-        unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
+        unsafe { check_blas(blas::cublasSetMathMode(handle.0, math))? };
 
-        let lt = match precision {
-            Precision::Fp32 | Precision::Tf32 => None,
-            Precision::Bf16 => Some(BlasLt::new()?),
-        };
+        // every mode fuses bias and activation into cuBLASLt epilogues; FP32 mode's run with
+        // plain FP32 compute, so the products are as strict as its cuBLAS GEMMs
+        let lt = BlasLt::new()?;
         let fp32_operands = match fp32_compute {
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => Operands::F32FastTf32,
             blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF => Operands::F32Fast16Bf,
@@ -362,10 +373,10 @@ impl Gpu {
         Ok(Self {
             lt,
             device,
-            module,
+            module: module.into_inner(),
             ptx,
             functions: RefCell::new(HashMap::new()),
-            blas: handle,
+            blas: handle.into_inner(),
             fp32_compute,
             fp32_operands,
             precision,
@@ -473,19 +484,6 @@ impl Gpu {
         self.synchronize()
     }
 
-    /// Copies consecutive runs of `src` into each of `hosts` in turn and waits once, so
-    /// results land in their final buffers without a staging copy
-    pub fn download_split(&self, src: &Buf, hosts: &mut [Vec<u8>]) -> Result<()> {
-        let total: usize = hosts.iter().map(Vec::len).sum();
-        ensure!(total <= src.bytes, "download of {total} bytes from a {} byte buffer", src.bytes);
-        let mut offset = 0;
-        for host in hosts.iter_mut().filter(|h| !h.is_empty()) {
-            unsafe { cur::memcpy_dtoh_async(host.as_mut_slice(), src.ptr + offset as u64, self.cu_stream())? };
-            offset += host.len();
-        }
-        self.synchronize()
-    }
-
     pub fn download(&self, t: &Tensor) -> Result<Vec<f32>> {
         let mut host = vec![0f32; t.len()];
         self.download_into(&t.buf, &mut host)?;
@@ -570,13 +568,11 @@ impl Gpu {
         bias: u64,
         epilogue: Epilogue,
     ) -> Result<()> {
-        let lt = self.lt.as_ref().ok_or_else(|| eyre!("cuBLASLt linears need Precision::Bf16"))?;
-        lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
+        self.lt.linear(self.cu_stream(), Operands::Bf16, mnk, x, x_ld, w, out, beta, bias, epilogue)
     }
 
     /// [`Self::linear_bf16`] for FP32 `x`, `w` and `out`, with this precision's FP32
-    /// compute type. Returns false without launching anything when there is no cuBLASLt
-    /// handle (FP32 and TF32 modes), so the caller falls back to [`Self::gemm`]
+    /// compute type
     #[allow(clippy::too_many_arguments)]
     pub fn linear_f32(
         &self,
@@ -588,10 +584,8 @@ impl Gpu {
         beta: f32,
         bias: u64,
         epilogue: Epilogue,
-    ) -> Result<bool> {
-        let Some(lt) = &self.lt else { return Ok(false) };
-        lt.linear(self.cu_stream(), self.fp32_operands, mnk, x, x_ld, w, (out, false), beta, bias, epilogue)?;
-        Ok(true)
+    ) -> Result<()> {
+        self.lt.linear(self.cu_stream(), self.fp32_operands, mnk, x, x_ld, w, (out, false), beta, bias, epilogue)
     }
 
     /// Row-major `C[m,n] = alpha * op(A)[m,k] @ op(B)[k,n] + beta * C`, batched by stride
@@ -646,6 +640,23 @@ impl Gpu {
             )
         };
         check_blas(status).wrap_err_with(|| format!("gemm m={m} n={n} k={k} batch={batch}"))
+    }
+}
+
+/// A raw handle `Gpu::new` frees with its function unless the finished `Gpu` takes it
+struct Unowned<T: Copy>(T, fn(T));
+
+impl<T: Copy> Unowned<T> {
+    fn into_inner(self) -> T {
+        let value = self.0;
+        std::mem::forget(self);
+        value
+    }
+}
+
+impl<T: Copy> Drop for Unowned<T> {
+    fn drop(&mut self) {
+        (self.1)(self.0);
     }
 }
 
