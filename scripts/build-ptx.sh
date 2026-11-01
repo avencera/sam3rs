@@ -8,10 +8,11 @@
 # cargo-oxide and its codegen backend come from the cuda-rust commit that
 # crates/sam3rs-kernels/Cargo.lock pins, installed under their own CARGO_HOME so other
 # projects' cuda-oxide installs at other commits are left alone. Needs Linux, the crate's
-# rust-toolchain.toml toolchain, LLVM 21's llc (CUDA_OXIDE_LLC) with the opt and llvm-link
-# beside it, libclang, and a CUDA toolkit's libdevice (CUDA_OXIDE_LIBDEVICE). Their
-# versions and libdevice's hash go to kernels/ptx/tools.txt, which the source manifest
-# covers, so a rebuild with other tools shows up in the diff
+# rust-toolchain.toml toolchain, LLVM 21's llc (CUDA_OXIDE_LLC) with opt and llvm-link
+# (CUDA_OXIDE_OPT, CUDA_OXIDE_LLVM_LINK, beside llc by default), libclang, and a CUDA
+# toolkit's libdevice (CUDA_OXIDE_LIBDEVICE). Their versions and libdevice's hash go to
+# kernels/ptx/tools.txt, which the source manifest covers, so a rebuild with other tools
+# shows up in the diff
 #
 #   scripts/build-ptx.sh
 set -euo pipefail
@@ -28,6 +29,10 @@ fi
 export CARGO_HOME="${SAM3RS_OXIDE_HOME:-$HOME/.cache/sam3rs/cargo-oxide}"
 export PATH="$CARGO_HOME/bin:$PATH"
 export CUDA_OXIDE_LLC="${CUDA_OXIDE_LLC:-/usr/bin/llc-21}"
+# the backend reads its own overrides for opt and llvm-link; pinning them here keeps the
+# tools it runs the ones tools.txt records
+export CUDA_OXIDE_OPT="${CUDA_OXIDE_OPT:-${CUDA_OXIDE_LLC/llc/opt}}"
+export CUDA_OXIDE_LLVM_LINK="${CUDA_OXIDE_LLVM_LINK:-${CUDA_OXIDE_LLC/llc/llvm-link}}"
 export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-21/lib}"
 export CUDA_OXIDE_LIBDEVICE="${CUDA_OXIDE_LIBDEVICE:-${CUDA_HOME:-/usr/local/cuda}/nvvm/libdevice/libdevice.10.bc}"
 # a cargo or rustup environment inherited from a parent build would pick another toolchain
@@ -39,17 +44,25 @@ if [[ "$(cat "$stamp" 2>/dev/null)" != "$rev" ]]; then
   echo "$rev" > "$stamp"
 fi
 
-# cuda-oxide runs the opt and llvm-link beside llc and links libdevice into kernels that
-# call math functions, so all four shape the PTX
+# llc, opt, llvm-link and the libdevice linked into kernels that call math functions all
+# shape the PTX. Each value is a checked assignment, since a failure inside the echo of
+# a command substitution would write an empty field and exit 0
 llvm_version() {
-  "$1" --version | sed -n 's/^ *\(.*LLVM version .*\)$/\1/p'
+  local version
+  version="$("$1" --version | sed -n 's/^ *\(.*LLVM version .*\)$/\1/p')"
+  if [[ -z "$version" ]]; then
+    echo "no LLVM version from $1 --version" >&2
+    return 1
+  fi
+  echo "$version"
 }
-{
-  echo "llc: $(llvm_version "$CUDA_OXIDE_LLC")"
-  echo "opt: $(llvm_version "${CUDA_OXIDE_LLC/llc/opt}")"
-  echo "llvm-link: $(llvm_version "${CUDA_OXIDE_LLC/llc/llvm-link}")"
-  echo "libdevice: $(sha256sum < "$CUDA_OXIDE_LIBDEVICE" | cut -d' ' -f1)"
-} > "$root/kernels/ptx/tools.txt"
+llc_version="$(llvm_version "$CUDA_OXIDE_LLC")"
+opt_version="$(llvm_version "$CUDA_OXIDE_OPT")"
+link_version="$(llvm_version "$CUDA_OXIDE_LLVM_LINK")"
+libdevice_hash="$(sha256sum < "$CUDA_OXIDE_LIBDEVICE")"
+libdevice_hash="${libdevice_hash%% *}"
+printf 'llc: %s\nopt: %s\nllvm-link: %s\nlibdevice: %s\n' \
+  "$llc_version" "$opt_version" "$link_version" "$libdevice_hash" > "$root/kernels/ptx/tools.txt"
 
 cd "$crate"
 for arch in 80 120; do
