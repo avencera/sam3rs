@@ -60,8 +60,8 @@ An embedding works only with the model that made it, and costs nothing to reuse,
 encode once and run as many prompts as you need against it.
 
 `precision="bf16"` (the default) runs the vision backbone, the text encoder's MLP and
-the fusion encoder's feed-forward layers in BF16 with fused attention, and every other
-matrix multiply on tensor cores with BF16 or TF32 inputs. `precision="tf32"` keeps FP32
+the fusion encoder's feed-forward layers in BF16, every other matrix multiply on tensor
+cores with BF16 or TF32 inputs, and most attention fused on FP16 tensor cores. `precision="tf32"` keeps FP32
 weights and activations but runs the matrix multiplies on TF32 tensor cores, as ONNX
 Runtime does for FP32 models, with most attention fused on TF32 tensor cores.
 `precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image

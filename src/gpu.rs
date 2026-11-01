@@ -264,13 +264,15 @@ pub enum Precision {
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
     /// Runtime's CUDA provider runs FP32 models by default
     Tf32,
-    /// Tensor-core GEMMs with FP32 accumulation everywhere. The vision backbone, necks
-    /// and text encoder MLP keep BF16 weights and activations; the rest of the text
-    /// encoder, the fusion encoder, detector and point decoder keep FP32 ones, and cuBLAS
-    /// may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though it
-    /// picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
-    /// and the detector's box-biased cross-attention, run the fused kernel, which rounds
-    /// q, k and v to BF16
+    /// Tensor-core GEMMs with FP32 accumulation. The vision backbone, necks, text encoder
+    /// MLP and fusion encoder FFN keep BF16 weights and activations; the rest of the text
+    /// encoder and fusion encoder, the detector and point decoder keep FP32 ones, and
+    /// cuBLAS may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though
+    /// it picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
+    /// and the detector's box-biased cross-attention, run the fused kernel. It computes
+    /// scores from BF16 q and k as they are, or rounds FP32 q and k to FP16 and sums
+    /// their scores in FP16; either way it rounds v to FP16 and sums each 64-key P @ V
+    /// tile in FP16 before adding it to FP32 totals
     Bf16,
 }
 
