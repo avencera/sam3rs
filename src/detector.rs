@@ -1,7 +1,7 @@
 //! SAM 3 detector: geometry (box) encoder, fusion encoder, DETR decoder with presence
 //! token, dot-product scoring and the segmentation head
 
-use eyre::{Result, WrapErr, ensure};
+use eyre::{Result, WrapErr, ensure, eyre};
 
 use crate::gpu::{Gpu, Precision, Tensor, blocks, launch};
 use crate::nvtx::range;
@@ -381,7 +381,6 @@ impl Detector {
         let mem_pos = add(gpu, memory, &self.pos)?;
         let qpos = gpu.zeros(&[n, D])?;
         let mut hs = None;
-        let mut presence = None;
 
         for (i, l) in self.decoder.iter().enumerate() {
             let sine = gpu.empty(&[QUERIES, 2 * D])?;
@@ -415,15 +414,19 @@ impl Detector {
             launch!(gpu, "box_refine", ew(refined.len()), B256, 0; &refined, &boxes, &delta)?;
             boxes = refined;
 
-            if i == self.decoder.len() - 1 {
-                let p = gpu.empty(&[1, D])?;
-                gpu.copy_dtod(x.ptr(), p.ptr(), D * 4)?;
-                let p = self.presence_norm.forward(gpu, &p)?;
-                presence = Some(self.presence_head.forward(gpu, &p)?);
+            // only the last layer's queries are kept, so earlier ones free before the next layer
+            if i + 1 == self.decoder.len() {
                 hs = Some(normed);
             }
         }
-        Ok((hs.unwrap(), boxes, presence.unwrap()))
+        let hs = hs.ok_or_else(|| eyre!("the detector has no decoder layers"))?;
+
+        // the presence token is row 0 of the last layer's output
+        let p = gpu.empty(&[1, D])?;
+        gpu.copy_dtod(x.ptr(), p.ptr(), D * 4)?;
+        let p = self.presence_norm.forward(gpu, &p)?;
+        let presence = self.presence_head.forward(gpu, &p)?;
+        Ok((hs, boxes, presence))
     }
 
     /// Box relative position bias for the image cross-attention in factored form, `dx`
