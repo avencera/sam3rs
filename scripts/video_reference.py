@@ -69,6 +69,8 @@ CKPT = {"sam3": ROOT / "models/sam3/sam3.pt", "sam3.1": ROOT / "models/sam3.1/sa
 CLIP_QUERIES = {"horses": ("horse", 3), "cyclists": ("person", 3), "grazing": ("horse", 1)}
 # steady-state statistics skip the prompted frame and the frames that fill the memory bank
 WARM_FRAMES = 8
+# NVTX mark inside the `frame N` range whose next() found the video exhausted
+END_MARK = "frames exhausted"
 
 
 def clip_path(name: str) -> pathlib.Path:
@@ -625,6 +627,8 @@ def bench(args) -> None:
                         _fi, obj_ids, masks = next(it)
                     except StopIteration:
                         if args.nvtx:
+                            # this range held no frame; nsys_frames.py drops ranges with this mark
+                            nvtx.mark(END_MARK)
                             nvtx.range_pop()
                         break
                     torch.cuda.synchronize()
