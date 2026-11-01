@@ -1063,6 +1063,12 @@ mod tests {
     #[test]
     fn act_numbers_match_the_kernels() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/crates/sam3rs-kernels/src/common.rs");
+        // cargo leaves the nested kernel crate out of the published package, so only a
+        // checkout of the repository can run this check
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipped: {path} is not in the packaged crate");
+            return;
+        }
         let source = std::fs::read_to_string(path).unwrap();
         let mut kernel: Vec<(&str, i32)> = source
             .lines()
