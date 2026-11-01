@@ -16,9 +16,7 @@ use eyre::{Result, ensure, eyre};
 use crate::gpu::{Arg, Buf, Gpu, Precision, Tensor, launch};
 use crate::image::{AaResize, RgbImage, preprocess};
 use crate::nvtx::range;
-use crate::ops::{
-    ACT_GELU, ACT_RELU, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha,
-};
+use crate::ops::{Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha};
 use crate::pipeline::{MASK_GROUP_ELEMENTS, Sam3};
 use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, PointImage, PointPrompt, row};
 use crate::posenc::sine_2d;
@@ -445,11 +443,11 @@ impl MemoryAttention {
             }
             if bf16 {
                 // the 2048-wide hidden stays BF16 between the two GEMMs
-                let hidden = l.linear1.forward16_act16(gpu, &l.norm3.forward16(gpu, &x)?, ACT_RELU)?;
+                let hidden = l.linear1.forward16_act16(gpu, &l.norm3.forward16(gpu, &x)?, Act::Relu)?;
                 l.linear2.forward16_residual(gpu, &hidden, &x)?;
             } else {
                 let h = l.norm3.forward(gpu, &x)?;
-                l.linear2.forward_residual(gpu, &l.linear1.forward_act(gpu, &h, ACT_RELU)?, &x)?;
+                l.linear2.forward_residual(gpu, &l.linear1.forward_act(gpu, &h, Act::Relu)?, &x)?;
             }
         }
         self.norm.forward(gpu, &x)
@@ -569,7 +567,7 @@ impl MemoryEncoder {
                 }
             };
             let n = &l.norm;
-            launch!(gpu, "layernorm_act_rows", ew(side * side), B256, 0; &y, &n.w, &n.b, l.cout, n.eps, ACT_GELU)?;
+            launch!(gpu, "layernorm_act_rows", ew(side * side), B256, 0; &y, &n.w, &n.b, l.cout, n.eps, Act::Gelu)?;
             x = y;
         }
         assert_eq!(side, GRID);
@@ -579,7 +577,7 @@ impl MemoryEncoder {
             let y = gpu.empty(x.shape())?;
             launch!(gpu, "dwconv7x7", ew(y.len()), B256, 0; &y, &x, &b.dw_w, &b.dw_b, GRID)?;
             b.norm.forward_inplace(gpu, &y)?;
-            b.fc2.forward_residual(gpu, &b.fc1.forward_act(gpu, &y, ACT_GELU)?, &x)?;
+            b.fc2.forward_residual(gpu, &b.fc1.forward_act(gpu, &y, Act::Gelu)?, &x)?;
         }
         self.out_proj.forward(gpu, &x)
     }
@@ -624,7 +622,7 @@ impl Tracker {
         Ok(Self {
             mem_attn: MemoryAttention::load(gpu, wts)?,
             mem_enc: MemoryEncoder::load(gpu, wts)?,
-            obj_ptr_proj: Mlp::load_in_out(gpu, wts, &format!("{p}.object_pointer_proj"), 3, ACT_RELU)?,
+            obj_ptr_proj: Mlp::load_in_out(gpu, wts, &format!("{p}.object_pointer_proj"), 3, Act::Relu)?,
             tpos_proj: Linear::load(gpu, wts, &format!("{p}.temporal_positional_encoding_projection_layer"))?,
             no_obj_ptr: wts.get(gpu, &format!("{p}.no_object_pointer"))?,
             no_obj_spatial: no_obj_spatial.reshape(&[MEM_D]),

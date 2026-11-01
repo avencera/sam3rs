@@ -6,9 +6,7 @@ use std::f64::consts::PI;
 use eyre::{Result, ensure};
 
 use crate::gpu::{Gpu, Tensor, launch};
-use crate::ops::{
-    ACT_GELU, ACT_RELU, ACT_SIGMOID, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew,
-};
+use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew};
 use crate::vision::{GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
@@ -157,7 +155,7 @@ impl PointDecoder {
                 norm1: ln("layer_norm1")?,
                 token_to_image: at("cross_attn_token_to_image")?,
                 norm2: ln("layer_norm2")?,
-                mlp: Mlp::load(gpu, wts, &[format!("{l}.mlp.proj_in"), format!("{l}.mlp.proj_out")], ACT_RELU)?,
+                mlp: Mlp::load(gpu, wts, &[format!("{l}.mlp.proj_in"), format!("{l}.mlp.proj_out")], Act::Relu)?,
                 norm3: ln("layer_norm3")?,
                 image_to_token: at("cross_attn_image_to_token")?,
                 norm4: ln("layer_norm4")?,
@@ -183,10 +181,10 @@ impl PointDecoder {
             upscale_ln: LayerNorm::load(gpu, wts, &format!("{md}.upscale_layer_norm"), 1e-6)?,
             upscale2: ConvT2x2::load(gpu, wts, &format!("{md}.upscale_conv2"))?,
             hyper: (0..4)
-                .map(|i| Mlp::load_in_out(gpu, wts, &format!("{md}.output_hypernetworks_mlps.{i}"), 3, ACT_RELU))
+                .map(|i| Mlp::load_in_out(gpu, wts, &format!("{md}.output_hypernetworks_mlps.{i}"), 3, Act::Relu))
                 .collect::<Result<_>>()?,
-            iou_head: Mlp::load_in_out(gpu, wts, &format!("{md}.iou_prediction_head"), 3, ACT_RELU)?,
-            obj_score_head: Mlp::load_in_out(gpu, wts, &format!("{md}.pred_obj_score_head"), 3, ACT_RELU)?,
+            iou_head: Mlp::load_in_out(gpu, wts, &format!("{md}.iou_prediction_head"), 3, Act::Relu)?,
+            obj_score_head: Mlp::load_in_out(gpu, wts, &format!("{md}.pred_obj_score_head"), 3, Act::Relu)?,
             no_mem: wts.get(gpu, "tracker_model.no_memory_embedding")?,
             conv_s0: Linear::load(gpu, wts, &format!("{md}.conv_s0"))?,
             conv_s1: Linear::load(gpu, wts, &format!("{md}.conv_s1"))?,
@@ -246,7 +244,7 @@ impl PointDecoder {
             side /= 2;
             x = conv.forward(gpu, &patches)?;
             ln.forward_inplace(gpu, &x)?;
-            bias_act(gpu, &x, None, ACT_GELU)?;
+            bias_act(gpu, &x, None, Act::Gelu)?;
         }
         self.mask_conv3.forward(gpu, &x)
     }
@@ -322,10 +320,10 @@ impl PointDecoder {
         let up = self.upscale1.forward(gpu, &keys, GRID, GRID)?;
         crate::ops::add_assign(gpu, &up, &img.feat_s1)?;
         self.upscale_ln.forward_inplace(gpu, &up)?;
-        bias_act(gpu, &up, None, ACT_GELU)?;
+        bias_act(gpu, &up, None, Act::Gelu)?;
         let up = self.upscale2.forward(gpu, &up, 2 * GRID, 2 * GRID)?;
         crate::ops::add_assign(gpu, &up, &img.feat_s0)?;
-        bias_act(gpu, &up, None, ACT_GELU)?;
+        bias_act(gpu, &up, None, Act::Gelu)?;
 
         // mask token 0 is the single-mask output, 1 to 3 the multimask ones
         let side = LOW_RES * LOW_RES;
@@ -337,7 +335,7 @@ impl PointDecoder {
         }
 
         let iou = self.iou_head.forward(gpu, &row(gpu, &queries, 1)?)?;
-        bias_act(gpu, &iou, None, ACT_SIGMOID)?;
+        bias_act(gpu, &iou, None, Act::Sigmoid)?;
         Ok(Decoded { low_res, iou, tokens: queries })
     }
 

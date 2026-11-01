@@ -7,11 +7,41 @@ use crate::blaslt::Epilogue;
 use crate::gpu::{Arg, Buf, Gpu, Mat, Precision, Tensor, blocks, launch};
 use crate::weights::Weights;
 
-pub const ACT_NONE: i32 = 0;
-pub const ACT_RELU: i32 = 1;
-pub const ACT_GELU: i32 = 2;
-pub const ACT_GELU_TANH: i32 = 3;
-pub const ACT_SIGMOID: i32 = 4;
+/// An activation a kernel or a cuBLASLt epilogue applies; the discriminants are the
+/// kernels' `ACT_*` numbers (crates/sam3rs-kernels/src/common.rs)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Act {
+    None = 0,
+    Relu = 1,
+    /// Exact erf GELU
+    Gelu = 2,
+    /// GELU's tanh approximation
+    GeluTanh = 3,
+    Sigmoid = 4,
+}
+
+impl Act {
+    /// The cuBLASLt epilogue that adds the bias, if any, then applies this activation, or
+    /// `None` when cuBLASLt has no epilogue for it
+    fn epilogue(self, has_bias: bool) -> Option<Epilogue> {
+        Some(match (self, has_bias) {
+            (Self::None, false) => Epilogue::None,
+            (Self::None, true) => Epilogue::Bias,
+            (Self::Relu, false) => Epilogue::Relu,
+            (Self::Relu, true) => Epilogue::ReluBias,
+            (Self::GeluTanh, false) => Epilogue::Gelu,
+            (Self::GeluTanh, true) => Epilogue::GeluBias,
+            (Self::Gelu | Self::Sigmoid, _) => return None,
+        })
+    }
+}
+
+impl From<Act> for Arg {
+    fn from(act: Act) -> Self {
+        Arg::I32(act as i32)
+    }
+}
 
 /// Grid for an elementwise kernel over `n` outputs: one thread each, in blocks of 256.
 /// The kernels have no grid-stride loop, so the grid can't be capped
@@ -23,7 +53,7 @@ pub fn ew(n: usize) -> (u32, u32, u32) {
 
 pub const B256: (u32, u32, u32) = (256, 1, 1);
 
-pub fn bias_act(gpu: &Gpu, x: &Tensor, bias: Option<&Tensor>, act: i32) -> Result<()> {
+pub fn bias_act(gpu: &Gpu, x: &Tensor, bias: Option<&Tensor>, act: Act) -> Result<()> {
     // the kernel takes the bias length as the row width
     assert!(
         bias.is_none_or(|b| b.len() == x.cols()),
@@ -79,22 +109,26 @@ impl From<&Bf16> for Arg {
 
 /// A dense layer `y = x @ W^T + b` with W stored `[out, in]` like PyTorch
 pub struct Linear {
-    /// FP32 `[out, in]`, dropped once [`Self::bf16`] replaces it
-    w: Option<Tensor>,
+    w: LinearWeights,
     /// `[out, in]`
     shape: [usize; 2],
     pub b: Option<Tensor>,
-    /// BF16 copies of `w` and `b` in `Precision::Bf16`, for the cuBLASLt path; a BF16
-    /// output needs a BF16 bias
-    w16: Option<Buf>,
-    b16: Option<Buf>,
+}
+
+/// The weights a [`Linear`] multiplies by
+enum LinearWeights {
+    /// FP32 `[out, in]`
+    Fp32(Tensor),
+    /// BF16 copies of the weights and bias for the cuBLASLt path, which replace the FP32
+    /// weights in `Precision::Bf16`; a BF16 output needs a BF16 bias
+    Bf16 { w: Buf, b: Option<Buf> },
 }
 
 impl Linear {
     /// A linear over existing device weights, run in FP32 whatever the precision
     pub fn new(w: Tensor, b: Option<Tensor>) -> Self {
         let shape = [w.rows(), w.cols()];
-        Self { w: Some(w), shape, b, w16: None, b16: None }
+        Self { w: LinearWeights::Fp32(w), shape, b }
     }
 
     /// In BF16 mode, keeps only a BF16 copy of the weights and runs this linear through
@@ -104,19 +138,26 @@ impl Linear {
     /// memory keys; the other detector layers keep FP32 activations and weights
     pub fn bf16(mut self, gpu: &Gpu) -> Result<Self> {
         if gpu.precision() == Precision::Bf16
-            && let Some(w) = self.w.take()
+            && let LinearWeights::Fp32(w) = &self.w
         {
-            self.w16 = Some(to_bf16(gpu, &w, w.cols(), w.rows(), w.cols())?);
-            if let Some(b) = &self.b {
-                self.b16 = Some(to_bf16(gpu, b, b.len(), 1, b.len())?);
-            }
+            let w16 = to_bf16(gpu, w, w.cols(), w.rows(), w.cols())?;
+            let b16 = self.b.as_ref().map(|b| to_bf16(gpu, b, b.len(), 1, b.len())).transpose()?;
+            self.w = LinearWeights::Bf16 { w: w16, b: b16 };
         }
         Ok(self)
     }
 
+    /// Whether [`Self::bf16`] moved this linear onto BF16 weights
+    fn is_bf16(&self) -> bool {
+        matches!(self.w, LinearWeights::Bf16 { .. })
+    }
+
     /// FP32 weights; a linear converted by [`Self::bf16`] has none
     fn w(&self) -> &Tensor {
-        self.w.as_ref().expect("FP32 path of a linear that keeps only BF16 weights")
+        match &self.w {
+            LinearWeights::Fp32(w) => w,
+            LinearWeights::Bf16 { .. } => panic!("FP32 path of a linear that keeps only BF16 weights"),
+        }
     }
 
     pub fn load(gpu: &Gpu, wts: &Weights, prefix: &str) -> Result<Self> {
@@ -151,14 +192,14 @@ impl Linear {
     }
 
     pub fn forward(&self, gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
-        self.forward_act(gpu, x, ACT_NONE)
+        self.forward_act(gpu, x, Act::None)
     }
 
-    pub fn forward_act(&self, gpu: &Gpu, x: &Tensor, act: i32) -> Result<Tensor> {
+    pub fn forward_act(&self, gpu: &Gpu, x: &Tensor, act: Act) -> Result<Tensor> {
         assert_eq!(x.cols(), self.in_features(), "linear input {:?} vs weight {:?}", x.shape(), self.shape);
         let rows = x.rows();
         let out = gpu.empty(&[rows, self.out_features()])?;
-        if self.w16.is_some() {
+        if self.is_bf16() {
             if !self.forward_bf16(gpu, x, out.ptr(), 0.0, act)? {
                 bias_act(gpu, &out, None, act)?;
             }
@@ -176,13 +217,11 @@ impl Linear {
 
     /// The cuBLASLt epilogue for this layer's bias and `act`, and whether it applies
     /// `act`; if not, only the bias is fused
-    fn epilogue(&self, act: i32) -> (Epilogue, bool) {
+    fn epilogue(&self, act: Act) -> (Epilogue, bool) {
         let has_bias = self.b.is_some();
-        match act {
-            ACT_NONE => (if has_bias { Epilogue::Bias } else { Epilogue::None }, true),
-            ACT_RELU => (if has_bias { Epilogue::ReluBias } else { Epilogue::Relu }, true),
-            ACT_GELU_TANH => (if has_bias { Epilogue::GeluBias } else { Epilogue::Gelu }, true),
-            _ => (if has_bias { Epilogue::Bias } else { Epilogue::None }, false),
+        match act.epilogue(has_bias) {
+            Some(epilogue) => (epilogue, true),
+            None => (if has_bias { Epilogue::Bias } else { Epilogue::None }, false),
         }
     }
 
@@ -190,28 +229,28 @@ impl Linear {
     pub fn forward_residual(&self, gpu: &Gpu, x: &Tensor, residual: &Tensor) -> Result<()> {
         assert_eq!(residual.cols(), self.out_features());
         assert_eq!(x.rows(), residual.rows());
-        if self.w16.is_some() {
-            self.forward_bf16(gpu, x, residual.ptr(), 1.0, ACT_NONE)?;
+        if self.is_bf16() {
+            self.forward_bf16(gpu, x, residual.ptr(), 1.0, Act::None)?;
             return Ok(());
         }
-        let (epilogue, _) = self.epilogue(ACT_NONE);
+        let (epilogue, _) = self.epilogue(Act::None);
         let bias = self.b.as_ref().map_or(0, Tensor::ptr);
         let mnk = (x.rows(), self.out_features(), self.in_features());
         gpu.linear_f32(mnk, x.ptr(), x.cols(), self.w().ptr(), residual.ptr(), 1.0, bias, epilogue)
     }
 
     /// FP32 input: converts to BF16, then [`Self::forward_lt`]
-    fn forward_bf16(&self, gpu: &Gpu, x: &Tensor, out: u64, beta: f32, act: i32) -> Result<bool> {
+    fn forward_bf16(&self, gpu: &Gpu, x: &Tensor, out: u64, beta: f32, act: Act) -> Result<bool> {
         let x16 = Bf16::from_f32(gpu, x)?;
         self.forward_lt(gpu, &x16, (out, false), beta, act)
     }
 
     /// BF16 `act(x16 @ W^T + b)`, for a following BF16 linear; `act` must be one the
     /// epilogue fuses
-    pub fn forward16_act16(&self, gpu: &Gpu, x16: &Bf16, act: i32) -> Result<Bf16> {
+    pub fn forward16_act16(&self, gpu: &Gpu, x16: &Bf16, act: Act) -> Result<Bf16> {
         let out = Bf16::empty(gpu, x16.rows, self.out_features())?;
         if !self.forward_lt(gpu, x16, (out.buf.ptr(), true), 0.0, act)? {
-            bail!("activation {act} has no cuBLASLt epilogue");
+            bail!("activation {act:?} has no cuBLASLt epilogue");
         }
         Ok(out)
     }
@@ -220,24 +259,24 @@ impl Linear {
     /// it has converted its FP32 input
     pub fn forward_from16(&self, gpu: &Gpu, x16: &Bf16) -> Result<Tensor> {
         let out = gpu.empty(&[x16.rows, self.out_features()])?;
-        self.forward_lt(gpu, x16, (out.ptr(), false), 0.0, ACT_NONE)?;
+        self.forward_lt(gpu, x16, (out.ptr(), false), 0.0, Act::None)?;
         Ok(out)
     }
 
     /// `residual += x16 @ W^T + b`
     pub fn forward16_residual(&self, gpu: &Gpu, x16: &Bf16, residual: &Tensor) -> Result<()> {
         assert_eq!((residual.rows(), residual.cols()), (x16.rows, self.out_features()));
-        self.forward_lt(gpu, x16, (residual.ptr(), false), 1.0, ACT_NONE)?;
+        self.forward_lt(gpu, x16, (residual.ptr(), false), 1.0, Act::None)?;
         Ok(())
     }
 
     /// `out = act(x16 @ W^T + b) + beta * out` through cuBLASLt. Returns whether the
     /// epilogue applied `act`; if not, only the bias was added
-    fn forward_lt(&self, gpu: &Gpu, x16: &Bf16, out: (u64, bool), beta: f32, act: i32) -> Result<bool> {
-        let w16 = self.w16.as_ref().ok_or_else(|| eyre!("linear has no BF16 weights"))?;
+    fn forward_lt(&self, gpu: &Gpu, x16: &Bf16, out: (u64, bool), beta: f32, act: Act) -> Result<bool> {
+        let LinearWeights::Bf16 { w: w16, b: b16 } = &self.w else { bail!("linear has no BF16 weights") };
         assert_eq!(x16.cols, self.in_features());
         let (m, n, k) = (x16.rows, self.out_features(), self.in_features());
-        let bias = if out.1 { self.b16.as_ref().map_or(0, Buf::ptr) } else { self.b.as_ref().map_or(0, Tensor::ptr) };
+        let bias = if out.1 { b16.as_ref().map_or(0, Buf::ptr) } else { self.b.as_ref().map_or(0, Tensor::ptr) };
         let (epilogue, fused) = self.epilogue(act);
         gpu.linear_bf16((m, n, k), x16.buf.ptr(), k, w16.ptr(), out, beta, bias, epilogue)?;
         Ok(fused)
@@ -253,29 +292,29 @@ impl Linear {
 /// A stack of linears with an activation between them (not after the last)
 pub struct Mlp {
     pub layers: Vec<Linear>,
-    pub act: i32,
+    pub act: Act,
 }
 
 impl Mlp {
-    pub fn load(gpu: &Gpu, wts: &Weights, prefixes: &[String], act: i32) -> Result<Self> {
+    pub fn load(gpu: &Gpu, wts: &Weights, prefixes: &[String], act: Act) -> Result<Self> {
         let layers = prefixes.iter().map(|p| Linear::load(gpu, wts, p)).collect::<Result<_>>()?;
         Ok(Self { layers, act })
     }
 
     /// `prefix.layer1 .. prefix.layerN`
-    pub fn load_numbered(gpu: &Gpu, wts: &Weights, prefix: &str, n: usize, act: i32) -> Result<Self> {
+    pub fn load_numbered(gpu: &Gpu, wts: &Weights, prefix: &str, n: usize, act: Act) -> Result<Self> {
         let prefixes: Vec<String> = (1..=n).map(|i| format!("{prefix}.layer{i}")).collect();
         Self::load(gpu, wts, &prefixes, act)
     }
 
     /// `prefix.layers.0 .. prefix.layers.{N-1}`
-    pub fn load_indexed(gpu: &Gpu, wts: &Weights, prefix: &str, n: usize, act: i32) -> Result<Self> {
+    pub fn load_indexed(gpu: &Gpu, wts: &Weights, prefix: &str, n: usize, act: Act) -> Result<Self> {
         let prefixes: Vec<String> = (0..n).map(|i| format!("{prefix}.layers.{i}")).collect();
         Self::load(gpu, wts, &prefixes, act)
     }
 
     /// `prefix.proj_in`, `prefix.layers.*`, `prefix.proj_out`
-    pub fn load_in_out(gpu: &Gpu, wts: &Weights, prefix: &str, n: usize, act: i32) -> Result<Self> {
+    pub fn load_in_out(gpu: &Gpu, wts: &Weights, prefix: &str, n: usize, act: Act) -> Result<Self> {
         let mut prefixes = vec![format!("{prefix}.proj_in")];
         prefixes.extend((0..n - 2).map(|i| format!("{prefix}.layers.{i}")));
         prefixes.push(format!("{prefix}.proj_out"));
@@ -284,9 +323,9 @@ impl Mlp {
 
     pub fn forward(&self, gpu: &Gpu, x: &Tensor) -> Result<Tensor> {
         let last = self.layers.len() - 1;
-        let mut h = self.layers[0].forward_act(gpu, x, if last == 0 { ACT_NONE } else { self.act })?;
+        let mut h = self.layers[0].forward_act(gpu, x, if last == 0 { Act::None } else { self.act })?;
         for (i, layer) in self.layers.iter().enumerate().skip(1) {
-            h = layer.forward_act(gpu, &h, if i == last { ACT_NONE } else { self.act })?;
+            h = layer.forward_act(gpu, &h, if i == last { Act::None } else { self.act })?;
         }
         Ok(h)
     }
@@ -790,7 +829,7 @@ impl Conv3x3 {
         // empty stats mean no norm
         let (stats, gw, gb) = norm
             .map_or((Arg::EMPTY, Arg::EMPTY, Arg::EMPTY), |n| (Arg::from(&n.stats), Arg::from(n.w), Arg::from(n.b)));
-        let (groups, eps, act) = norm.map_or((1, 0.0, ACT_NONE), |n| (n.groups, n.eps, n.act));
+        let (groups, eps, act) = norm.map_or((1, 0.0, Act::None), |n| (n.groups, n.eps, n.act));
         self.im2col_gemm(gpu, w16, h, w, |cols, p0, n| {
             launch!(gpu, "im2col3x3_up_bf16", ew(n * 9 * c / 8), B256, 0;
                 cols, fine, coarse, stats, gw, gb, groups, eps, act, w, c, p0)
@@ -886,7 +925,7 @@ impl ConvT2x2 {
     /// BF16 mode from a BF16 input to `act(y)` in BF16, for a following BF16 GEMM: the
     /// values [`Self::forward`] then `bias_act` and a BF16 conversion would give, without
     /// the FP32 map between them
-    pub fn forward16(&self, gpu: &Gpu, x16: &Bf16, h: usize, w: usize, act: i32) -> Result<Bf16> {
+    pub fn forward16(&self, gpu: &Gpu, x16: &Bf16, h: usize, w: usize, act: Act) -> Result<Bf16> {
         let w16 = self.w16.as_ref().ok_or_else(|| eyre!("transposed conv has no BF16 weights"))?;
         let (c, n) = (self.w.shape()[0], self.w.shape()[1]);
         assert_eq!((x16.rows, x16.cols), (h * w, c));
@@ -955,7 +994,7 @@ pub fn group_norm_stats<'a>(
     w: &'a Tensor,
     b: &'a Tensor,
     eps: f32,
-    act: i32,
+    act: Act,
 ) -> Result<PendingNorm<'a>> {
     let (hw, c) = (x.rows(), x.cols());
     let chunk = 256usize;
@@ -976,7 +1015,7 @@ pub struct PendingNorm<'a> {
     b: &'a Tensor,
     groups: usize,
     eps: f32,
-    act: i32,
+    act: Act,
 }
 
 impl PendingNorm<'_> {
@@ -1013,4 +1052,29 @@ pub fn to_bf16(gpu: &Gpu, src: &Tensor, cols: usize, rows: usize, ld: usize) -> 
 
 pub fn upload_i32(gpu: &Gpu, v: Vec<i32>) -> Result<Buf> {
     gpu.upload_buf(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Act;
+
+    /// The kernels take the activation as a bare `i32`, so a renumbering on either side
+    /// would silently apply the wrong one
+    #[test]
+    fn act_numbers_match_the_kernels() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/crates/sam3rs-kernels/src/common.rs");
+        let source = std::fs::read_to_string(path).unwrap();
+        let mut kernel: Vec<(&str, i32)> = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub const ACT_")?.strip_suffix(';')?.split_once(": i32 = "))
+            .map(|(name, value)| (name, value.parse().unwrap()))
+            .collect();
+        kernel.sort_by_key(|&(_, value)| value);
+
+        // the kernels have no constant for `Act::None`: any other number is the identity
+        let host = [("RELU", Act::Relu), ("GELU", Act::Gelu), ("GELU_TANH", Act::GeluTanh), ("SIGMOID", Act::Sigmoid)];
+        let host: Vec<(&str, i32)> = host.iter().map(|&(name, act)| (name, act as i32)).collect();
+        assert_eq!(kernel, host);
+        assert!(kernel.iter().all(|&(_, value)| value != Act::None as i32));
+    }
 }

@@ -5,8 +5,7 @@ use eyre::Result;
 
 use crate::gpu::{Arg, Gpu, Mat, Precision, Tensor, launch};
 use crate::ops::{
-    ACT_GELU, ACT_GELU_TANH, ACT_NONE, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, add_assign_bf16,
-    attention, bias_act, ew,
+    Act, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, add_assign_bf16, attention, bias_act, ew,
 };
 use crate::weights::Weights;
 
@@ -156,7 +155,7 @@ impl Backbone {
             None => b.norm1.forward16(gpu, x)?,
         };
         drop(pending);
-        let qkv = b.qkv.forward16_act16(gpu, &h, ACT_NONE)?;
+        let qkv = b.qkv.forward16_act16(gpu, &h, Act::None)?;
         drop(h);
 
         let (cos, sin) = if b.global { &self.rope_global_wm } else { &self.rope_window };
@@ -190,11 +189,11 @@ impl Backbone {
         gpu.launch("vit_attn_bf16_d64", ((tokens / 64) as u32, HEADS as u32, 1), (128, 1, 1), 0, args)?;
         drop((qkv, k));
 
-        let attn = b.proj.forward16_act16(gpu, &merged, ACT_NONE)?;
+        let attn = b.proj.forward16_act16(gpu, &merged, Act::None)?;
         drop(merged);
-        let hidden = b.fc1.forward16_act16(gpu, &b.norm2.add_forward16(gpu, x, &attn)?, ACT_GELU_TANH)?;
+        let hidden = b.fc1.forward16_act16(gpu, &b.norm2.add_forward16(gpu, x, &attn)?, Act::GeluTanh)?;
         drop(attn);
-        b.fc2.forward16_act16(gpu, &hidden, ACT_NONE)
+        b.fc2.forward16_act16(gpu, &hidden, Act::None)
     }
 
     /// One FP32 block over raster-order `x` in place
@@ -223,7 +222,7 @@ impl Backbone {
 
         let h = b.norm2.forward(gpu, x)?;
         // upstream runs fc1 through `addmm_act`, whose CUDA GELU is the tanh approximation
-        let hidden = b.fc1.forward_act(gpu, &h, ACT_GELU_TANH)?;
+        let hidden = b.fc1.forward_act(gpu, &h, Act::GeluTanh)?;
         drop(h);
         b.fc2.forward_residual(gpu, &hidden, x)
     }
@@ -282,17 +281,17 @@ impl Neck {
         for level in &self.levels {
             let (h, side) = match (&level.scale, &trunk.bf16) {
                 (Scale::Up4(a, b), Some(t16)) => {
-                    let h16 = a.forward16(gpu, t16, GRID, GRID, ACT_GELU)?;
-                    let y16 = b.forward16(gpu, &h16, 2 * GRID, 2 * GRID, ACT_NONE)?;
+                    let h16 = a.forward16(gpu, t16, GRID, GRID, Act::Gelu)?;
+                    let y16 = b.forward16(gpu, &h16, 2 * GRID, 2 * GRID, Act::None)?;
                     (level.proj1.forward_from16(gpu, &y16)?, 4 * GRID)
                 }
                 (Scale::Up2(a), Some(t16)) => {
-                    (level.proj1.forward_from16(gpu, &a.forward16(gpu, t16, GRID, GRID, ACT_NONE)?)?, 2 * GRID)
+                    (level.proj1.forward_from16(gpu, &a.forward16(gpu, t16, GRID, GRID, Act::None)?)?, 2 * GRID)
                 }
                 (Scale::Same, Some(t16)) => (level.proj1.forward_from16(gpu, t16)?, GRID),
                 (Scale::Up4(a, b), None) => {
                     let h = a.forward(gpu, &trunk.f32, GRID, GRID)?;
-                    bias_act(gpu, &h, None, ACT_GELU)?;
+                    bias_act(gpu, &h, None, Act::Gelu)?;
                     (level.proj1.forward(gpu, &b.forward(gpu, &h, 2 * GRID, 2 * GRID)?)?, 4 * GRID)
                 }
                 (Scale::Up2(a), None) => {

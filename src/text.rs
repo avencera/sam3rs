@@ -3,7 +3,7 @@
 use eyre::Result;
 
 use crate::gpu::{Gpu, Tensor, launch};
-use crate::ops::{ACT_GELU, B256, LayerNorm, Linear, Mask, ew, mha};
+use crate::ops::{Act, B256, LayerNorm, Linear, Mask, ew, mha};
 use crate::tokenizer::CONTEXT;
 use crate::weights::Weights;
 
@@ -90,7 +90,7 @@ impl TextEncoder {
             )?;
             l.out.forward_residual(gpu, &o, &x)?;
             let h = l.ln2.forward(gpu, &x)?;
-            let hidden = l.fc1.forward_act(gpu, &h, ACT_GELU)?;
+            let hidden = l.fc1.forward_act(gpu, &h, Act::Gelu)?;
             l.fc2.forward_residual(gpu, &hidden, &x)?;
         }
         self.final_ln.forward_inplace(gpu, &x)?;
