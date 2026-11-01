@@ -746,8 +746,8 @@ pub struct VideoTracker<'a> {
 /// Features of one video frame
 pub(crate) struct FrameFeatures {
     pub(crate) point: PointImage,
-    /// tracker neck 72x72 level `[5184, 256]`, without the no-memory embedding
-    pub(crate) fpn2: Tensor,
+    /// Tracker neck's `fpn.coarse` `[5184, 256]`, without the no-memory embedding
+    pub(crate) coarse: Tensor,
 }
 
 impl Sam3 {
@@ -759,9 +759,9 @@ impl Sam3 {
             self.backbone.forward(gpu, pixels)?
         };
         let _r = range(c"neck");
-        let mut fpn = self.tracker_neck.forward(gpu, &Trunk::new(gpu, trunk)?)?;
+        let fpn = self.tracker_neck.forward(gpu, &Trunk::new(gpu, trunk)?)?;
         let point = self.point.prepare_image(gpu, &fpn)?;
-        Ok(FrameFeatures { point, fpn2: fpn.pop().expect("three levels") })
+        Ok(FrameFeatures { point, coarse: fpn.coarse })
     }
 
     /// Starts tracking objects through a video of `num_frames` frames: segments each
@@ -875,7 +875,7 @@ impl VideoTracker<'_> {
         for (b, &score) in scores.iter().enumerate() {
             let mask = gpu.empty(&[n])?;
             gpu.copy_dtod(input.at(b * n), mask.ptr(), n * 4)?;
-            mem.push(m.tracker.memory(gpu, &feats.fpn2, &mask, score > 0.0)?);
+            mem.push(m.tracker.memory(gpu, &feats.coarse, &mask, score > 0.0)?);
         }
         let keys = self.frame_keys(&mem)?;
         self.cond.push(MemFrame { frame: 0, mem, ptr: ptrs, keys });
@@ -1015,7 +1015,7 @@ impl VideoTracker<'_> {
         // layer 0 up to its cross-attention is the same for every object
         let start = if inputs.is_none() {
             let _r = range(c"memory_attention");
-            Some(m.tracker.mem_attn.frame_start(gpu, &feats.fpn2)?)
+            Some(m.tracker.mem_attn.frame_start(gpu, &feats.coarse)?)
         } else {
             None
         };
@@ -1029,7 +1029,7 @@ impl VideoTracker<'_> {
                 let _r = range(c"memory_attention");
                 match inputs.as_mut().and_then(Iterator::next) {
                     Some((memory, memory_pos)) => {
-                        m.tracker.mem_attn.forward(gpu, &feats.fpn2, &memory, &memory_pos, ptr_tokens)?
+                        m.tracker.mem_attn.forward(gpu, &feats.coarse, &memory, &memory_pos, ptr_tokens)?
                     }
                     None => self.memory_attention_cached(&sel, b, start.as_ref().expect("BF16 frame start"))?,
                 }
@@ -1046,7 +1046,7 @@ impl VideoTracker<'_> {
             let _r = range(c"memory_encoder");
             let high = upsample(gpu, Arg::slice(low_res.at(b * side), side), 1, IMAGE_SIZE, IMAGE_SIZE)?;
             let input = mask_for_mem(gpu, &high, false)?;
-            mems.push(m.tracker.memory(gpu, &feats.fpn2, &input, present)?);
+            mems.push(m.tracker.memory(gpu, &feats.coarse, &input, present)?);
             // `cal_mem_score`: present objects' rescaled score and their best IoU
             norm_sum += if present { 2.0 / (1.0 + (-score).exp()) - 1.0 } else { 0.0 };
             iou_sum += iou[best];

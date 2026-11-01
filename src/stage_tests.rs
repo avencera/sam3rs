@@ -17,7 +17,7 @@ use crate::ops::{B256, ew};
 use crate::point::{PointDecoder, PointPrompt, clamped_mask, full_res_masks};
 use crate::text::TextEncoder;
 use crate::tokenizer::Tokenizer;
-use crate::vision::{Backbone, Neck, Trunk};
+use crate::vision::{Backbone, Fpn, Neck, Trunk};
 use crate::weights::Weights;
 
 fn fixture(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
@@ -91,7 +91,7 @@ fn stages() -> Result<()> {
     let trunk = Trunk::new(&gpu, transpose(&gpu, &trunk)?)?;
     let neck = Neck::load(&gpu, &wts, "detector_model.vision_encoder.neck")?;
     let fpn = neck.forward(&gpu, &trunk)?;
-    for (i, f) in fpn.iter().enumerate() {
+    for (i, f) in [&fpn.fine, &fpn.mid, &fpn.coarse].into_iter().enumerate() {
         compare(&format!("fpn{i}"), &chw(&gpu, f)?, &fixture(&st, &format!("fpn{i}"))?);
     }
     drop((backbone, neck));
@@ -102,7 +102,7 @@ fn stages() -> Result<()> {
     let point_img = point_decoder.prepare_image(&gpu, &sam2_fpn)?;
     compare("sam2_fpn0", &chw(&gpu, &point_img.feat_s0)?, &fixture(&st, "sam2_fpn0")?);
     compare("sam2_fpn1", &chw(&gpu, &point_img.feat_s1)?, &fixture(&st, "sam2_fpn1")?);
-    compare("sam2_fpn2", &chw(&gpu, &sam2_fpn[2])?, &fixture(&st, "sam2_fpn2")?);
+    compare("sam2_fpn2", &chw(&gpu, &sam2_fpn.coarse)?, &fixture(&st, "sam2_fpn2")?);
     drop((tracker_neck, sam2_fpn));
     for prompt in meta["prompts"].as_array().unwrap() {
         let Some(points) = prompt.get("points") else { continue };
@@ -143,13 +143,11 @@ fn stages() -> Result<()> {
     }
 
     // detector stages from the reference fpn features
-    let sides = [288usize, 144, 72];
-    let fpn = (0..3)
-        .map(|i| {
-            let f = gpu.upload(fixture(&st, &format!("fpn{i}"))?, &[256, sides[i] * sides[i]])?;
-            transpose(&gpu, &f)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let level = |i: usize, side: usize| {
+        let f = gpu.upload(fixture(&st, &format!("fpn{i}"))?, &[256, side * side])?;
+        transpose(&gpu, &f)
+    };
+    let fpn = Fpn { fine: level(0, 288)?, mid: level(1, 144)?, coarse: level(2, 72)? };
     let tokenizer = Tokenizer::open("models/sam3".as_ref())?;
     let text_encoder = TextEncoder::load(&gpu, &wts)?;
     let detector = Detector::load(&gpu, &wts)?;

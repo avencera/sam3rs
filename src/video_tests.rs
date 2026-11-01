@@ -217,7 +217,7 @@ fn video_stages() -> Result<()> {
         println!("frame {t}");
         let feats = m.video_features(&pixels(gpu, &fx, t)?)?;
         let fpn = |l: usize| fx.get(&format!("{bb}.fpn{l}")).map(|(v, _)| v);
-        check(&mut failures, &format!("f{t} fpn2"), &download_hwc_as_chw(gpu, &feats.fpn2)?, &fpn(2)?, backbone_tol);
+        check(&mut failures, &format!("f{t} fpn2"), &download_hwc_as_chw(gpu, &feats.coarse)?, &fpn(2)?, backbone_tol);
         check(
             &mut failures,
             &format!("f{t} feat_s0"),
@@ -454,14 +454,14 @@ fn video_e2e() -> Result<()> {
                 let feats = m.video_features(&pixels(gpu, &fx, t)?)?;
                 let (sel, inputs) = (tracker.selection()?, tracker.memory_inputs()?);
                 let ptr_tokens = sel.ptr_tokens();
-                let start = m.tracker.mem_attn.frame_start(gpu, &feats.fpn2)?;
-                let src32 = to_ref(&feats.fpn2)?;
+                let start = m.tracker.mem_attn.frame_start(gpu, &feats.coarse)?;
+                let src32 = to_ref(&feats.coarse)?;
                 for (b, (mem, mem_pos)) in inputs.objects.iter().enumerate() {
                     let truth =
                         fp32.tracker.mem_attn.forward(rg, &src32, &to_ref(mem)?, &to_ref(mem_pos)?, ptr_tokens)?;
                     let truth = rg.download(&truth)?;
                     let cached = tracker.memory_attention_cached(&sel, b, &start)?;
-                    let assembled = m.tracker.mem_attn.forward(gpu, &feats.fpn2, mem, mem_pos, ptr_tokens)?;
+                    let assembled = m.tracker.mem_attn.forward(gpu, &feats.coarse, mem, mem_pos, ptr_tokens)?;
                     rel_l2(&format!("f{t} assembled o{b}"), &gpu.download(&assembled)?, &truth);
                     check(
                         &mut failures,

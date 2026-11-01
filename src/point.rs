@@ -7,7 +7,7 @@ use eyre::{Result, ensure};
 
 use crate::gpu::{Gpu, Tensor, launch};
 use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, bias_act, ew};
-use crate::vision::{GRID, IMAGE_SIZE};
+use crate::vision::{Fpn, GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
 const D: usize = 256;
@@ -48,11 +48,11 @@ impl PointPrompt {
 
 /// Image features the point decoder reads, computed once per image
 pub struct PointImage {
-    /// tracker fpn2 + no-memory embedding `[72^2, 256]`
+    /// tracker `fpn.coarse` + no-memory embedding `[72^2, 256]`
     pub embed: Tensor,
-    /// conv_s0(tracker fpn0) `[288^2, 32]`
+    /// conv_s0(tracker `fpn.fine`) `[288^2, 32]`
     pub feat_s0: Tensor,
-    /// conv_s1(tracker fpn1) `[144^2, 64]`
+    /// conv_s1(tracker `fpn.mid`) `[144^2, 64]`
     pub feat_s1: Tensor,
 }
 
@@ -192,13 +192,13 @@ impl PointDecoder {
     }
 
     /// Tracker neck outputs -> decoder image features
-    pub fn prepare_image(&self, gpu: &Gpu, fpn: &[Tensor]) -> Result<PointImage> {
-        let embed = gpu.clone_tensor(&fpn[2])?;
+    pub fn prepare_image(&self, gpu: &Gpu, fpn: &Fpn) -> Result<PointImage> {
+        let embed = gpu.clone_tensor(&fpn.coarse)?;
         launch!(gpu, "add_row", ew(embed.len()), B256, 0; &embed, &self.no_mem)?;
         Ok(PointImage {
             embed,
-            feat_s0: self.conv_s0.forward(gpu, &fpn[0])?,
-            feat_s1: self.conv_s1.forward(gpu, &fpn[1])?,
+            feat_s0: self.conv_s0.forward(gpu, &fpn.fine)?,
+            feat_s1: self.conv_s1.forward(gpu, &fpn.mid)?,
         })
     }
 
