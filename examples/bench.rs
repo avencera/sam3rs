@@ -22,7 +22,8 @@ struct Args {
     repeat: usize,
     #[arg(long, default_value_t = 0)]
     device: usize,
-    /// fp32 (strict reference path) or bf16 (tensor cores, fused attention)
+    /// fp32 (strict reference path), tf32 (FP32 with TF32 tensor-core GEMMs) or bf16
+    /// (BF16 backbone, fused attention)
     #[arg(long, default_value = "bf16")]
     precision: Precision,
 }

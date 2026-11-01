@@ -226,8 +226,12 @@ impl Mat {
 pub enum Precision {
     /// Strict FP32 GEMMs (no TF32) and materialized attention: the parity reference path
     Fp32,
-    /// BF16 tensor-core GEMMs (FP32 accumulation) and fused attention in the vision
-    /// backbone and necks; every other layer stays FP32
+    /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
+    /// Runtime's CUDA provider runs FP32 models by default
+    Tf32,
+    /// BF16 tensor-core GEMMs (FP32 accumulation) in the vision backbone and necks.
+    /// Every other GEMM stays FP32, but unmasked attention with head dim 32 or 64 runs
+    /// the fused kernel everywhere, which rounds q, k and v to BF16
     Bf16,
 }
 
@@ -237,8 +241,9 @@ impl std::str::FromStr for Precision {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "fp32" => Ok(Self::Fp32),
+            "tf32" => Ok(Self::Tf32),
             "bf16" => Ok(Self::Bf16),
-            _ => bail!("unknown precision {s:?}, expected fp32 or bf16"),
+            _ => bail!("unknown precision {s:?}, expected fp32, tf32 or bf16"),
         }
     }
 }
@@ -285,18 +290,21 @@ impl Gpu {
             check_blas(blas::cublasCreate_v2(&mut handle))?;
             check_blas(blas::cublasSetStream_v2(handle, device.stream.cu_stream() as _))?;
         }
-        // FP32 layers never use TF32 or BF16 inputs: pedantic math for the parity reference,
-        // and plain FP32 compute for the layers BF16 mode keeps in FP32
+        // pedantic math for the parity reference, TF32 tensor cores for Tf32, and plain FP32
+        // compute for the GEMMs BF16 mode keeps in FP32
         let (math, fp32_compute) = match precision {
             Precision::Fp32 => {
                 (blas::cublasMath_t::CUBLAS_PEDANTIC_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC)
+            }
+            Precision::Tf32 => {
+                (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32)
             }
             Precision::Bf16 => (blas::cublasMath_t::CUBLAS_DEFAULT_MATH, blas::cublasComputeType_t::CUBLAS_COMPUTE_32F),
         };
         unsafe { check_blas(blas::cublasSetMathMode(handle, math))? };
 
         let lt = match precision {
-            Precision::Fp32 => None,
+            Precision::Fp32 | Precision::Tf32 => None,
             Precision::Bf16 => Some(BlasLt::new()?),
         };
 

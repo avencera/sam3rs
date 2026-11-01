@@ -39,7 +39,7 @@ def _gpu_ready() -> str | None:
     return None
 
 
-@pytest.fixture(scope="session", params=["fp32", "bf16"])
+@pytest.fixture(scope="session", params=["fp32", "tf32", "bf16"])
 def model(request: pytest.FixtureRequest) -> sam3rs.Sam3:
     """The local checkpoint in each precision; skips without weights."""
     reason = _gpu_ready()

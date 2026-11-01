@@ -329,9 +329,10 @@ pub fn attention(
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
 }
 
-/// The fused kernel covers BF16 mode for head dims 32 and 64 (64 only for BF16 inputs)
-/// without additive bias or causal masking. It loads q/k/v in 16-byte chunks and stores
-/// float2. BF16 q/k/v must use it, since the materialized path reads FP32
+/// The fused kernel covers BF16 mode for FP32 q/k/v with head dims 32 and 64, which it
+/// rounds to BF16 for `mma.sync`, and BF16 q/k/v with head dim 64, without additive bias
+/// or causal masking. It loads q/k/v in 16-byte chunks and stores float2. BF16 q/k/v
+/// must use it, since the materialized path reads FP32
 fn flash_ok(gpu: &Gpu, [q, k, v, out]: &[Mat; 4], hd: usize, mask: &Mask) -> bool {
     let aligned = |m: &Mat, elems: usize, size: usize| {
         !m.trans
@@ -560,7 +561,7 @@ pub fn concat_rows(gpu: &Gpu, a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// BF16 copy of a weight tensor in BF16 mode, for the conv layers in the necks
 fn bf16_weights(gpu: &Gpu, w: &Tensor) -> Result<Option<Buf>> {
     Ok(match gpu.precision() {
-        Precision::Fp32 => None,
+        Precision::Fp32 | Precision::Tf32 => None,
         Precision::Bf16 => Some(to_bf16(gpu, w.ptr(), w.len(), 1, w.len())?),
     })
 }
