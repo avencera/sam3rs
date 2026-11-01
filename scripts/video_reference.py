@@ -510,8 +510,9 @@ class Sam31Tracker:
         for out in self.base.propagate_in_video(
             self.m, state, start_frame_idx=0, max_frame_num_to_track=n, reverse=False, tqdm_disable=True
         ):
-            frame_idx, obj_ids, video_res = out[0], out[1], out[3]
-            yield frame_idx, list(obj_ids), _binary_masks(frame_idx, video_res)
+            # the multiplex demo yields frame_idx, obj_ids, low_res_masks, video_res_masks
+            frame_idx, obj_ids, low_res, video_res = out
+            yield frame_idx, list(obj_ids), _binary_masks(frame_idx, video_res, low_res)
 
     def close(self, state):
         state.clear()
