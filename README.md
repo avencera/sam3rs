@@ -180,7 +180,7 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
 | **sam3rs `bf16`** | **31.1** | **2.0** | **5.4** | **5.4** | **6.9** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
-| **sam3rs `fp32`** | **120.2** | **2.2** | **26.8** | **27.2** | **29.1** |
+| **sam3rs `fp32`** | **120.6** | **2.2** | **26.8** | **27.2** | **29.1** |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
@@ -188,7 +188,7 @@ Each sam3rs row sits under the runtime that uses the same numerics:
   4.3x on box prompts and 3.9x on text prompts.
 - `bf16` against PyTorch BF16: 1.27x on encode, 18x on points, 4.0x on box prompts and
   3.0x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: 1.08x on encode, 12x on points, 1.24x on
+- `fp32` against PyTorch FP32 with TF32 off: 1.07x on encode, 12x on points, 1.24x on
   box prompts and 1.09x on text prompts.
 
 The sam3rs rows come from three runs of one queued session, reporting the median of
@@ -239,10 +239,10 @@ the frame count.
 | PyTorch 2.14.1 `torch.compile` | 42.3 | 55.9 | 5.8-6.5 GB |
 | PyTorch 2.14.1 CUDA graphs | 45.1 | 59.7 | 10-20 GB |
 | ComfyUI core (SAM 3.1 multiplex) | 44.7 | 46.3 | 3.8-4.0 GB |
-| **sam3rs `bf16`** | **35.0** | **44.5** | **3.4-3.7 GB** |
-| sam3rs `fp32` | 148.1 | 214.2 | 5.3-5.4 GB |
+| **sam3rs `bf16`** | **34.8** | **44.2** | **3.4-3.7 GB** |
+| sam3rs `fp32` | 148.5 | 214.0 | 5.3-5.4 GB |
 
-At 1080p and 256 frames sam3rs takes 35.8 and 46.1 ms. The image encoder and tracker
+At 1080p and 256 frames sam3rs takes 35.7 and 45.6 ms. The image encoder and tracker
 neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,
 about 1.8 of them in the memory cross-attention kernel and 0.44 in the memory
 self-attention. The GPU is about 99% busy, so CUDA graphs would
