@@ -522,6 +522,15 @@ fn video_e2e() -> Result<()> {
             ));
         }
         for (b, o) in out.objects.iter().enumerate() {
+            // thresholding turns NaN logits into background, and the logit error above is
+            // only printed, so non-finite values fail here before the masks are compared
+            let ref_low = &low[b * side..][..side];
+            if !o.low_res.iter().chain(&o.ious).all(|v| v.is_finite()) {
+                failures.push(format!("f{t} o{b}: non-finite low-res logits or candidate IoUs"));
+            }
+            if !ref_low.iter().all(|v| v.is_finite()) || !scores[b].is_finite() {
+                failures.push(format!("f{t} o{b}: non-finite reference logits or score"));
+            }
             let want = unpack(&packed, b, (w, h));
             let v = iou(&o.mask, &want);
             ious[b].push(v);

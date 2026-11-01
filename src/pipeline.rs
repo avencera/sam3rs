@@ -26,8 +26,8 @@ pub const SCORE_THRESHOLD: f32 = 0.5;
 /// Text used for box-only prompts, as in upstream and osam
 pub const VISUAL_PROMPT: &str = "visual";
 
-/// Mask outputs resized per group in `detect`: 1 GiB of FP32 staging
-const MASK_GROUP_ELEMENTS: usize = 1 << 28;
+/// Mask outputs resized per group in `detect` and the video tracker: 1 GiB of FP32 staging
+pub(crate) const MASK_GROUP_ELEMENTS: usize = 1 << 28;
 
 /// Tells models apart, so an embedding is only used with the model that made it
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(0);

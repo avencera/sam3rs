@@ -19,7 +19,7 @@ use crate::nvtx::range;
 use crate::ops::{
     ACT_GELU, ACT_RELU, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha,
 };
-use crate::pipeline::Sam3;
+use crate::pipeline::{MASK_GROUP_ELEMENTS, Sam3};
 use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, PointImage, PointPrompt, row};
 use crate::posenc::sine_2d;
 use crate::vision::{GRID, IMAGE_SIZE, Trunk};
@@ -1097,12 +1097,24 @@ impl VideoTracker<'_> {
         let gpu = &self.model.gpu;
         let _r = range(c"postprocess");
         let (w, h) = (self.width, self.height);
-        let up = upsample(gpu, (&low_res).into(), self.objects, h, w)?;
-        let mask = gpu.alloc_bytes(up.len())?;
-        launch!(gpu, "threshold_u8", ew(up.len()), B256, 0; mask.slice::<u8>(), &up, 0.0f32)?;
-        let mut all = vec![0u8; self.objects * w * h];
-        gpu.download_into(&mask, &mut all)?;
-        let masks: Vec<Vec<u8>> = all.chunks_exact(w * h).map(<[u8]>::to_vec).collect();
+        // objects in groups of at most MASK_GROUP_ELEMENTS pixels, so a launch stays under
+        // the 2^32 threads `ew` allows and the GPU never holds every object's FP32 plane
+        let (plane, side) = (w * h, LOW_RES * LOW_RES);
+        let group = (MASK_GROUP_ELEMENTS / plane).max(1).min(self.objects);
+        let up = gpu.empty(&[group, plane])?;
+        let mask = gpu.alloc_bytes(group * plane)?;
+        let mut masks = Vec::with_capacity(self.objects);
+        for start in (0..self.objects).step_by(group) {
+            let k = group.min(self.objects - start);
+            let n = k * plane;
+            let input = Arg::slice(low_res.at(start * side), k * side);
+            launch!(gpu, "resize_bilinear", ew(n), B256, 0; Arg::slice(up.ptr(), n), input, LOW_RES, LOW_RES, h, w)?;
+            // sigmoid(x) > 0.5 is x > 0
+            launch!(gpu, "threshold_u8", ew(n), B256, 0; Arg::slice(mask.ptr(), n), Arg::slice(up.ptr(), n), 0.0f32)?;
+            let mut bytes = vec![0u8; n];
+            gpu.download_into(&mask, &mut bytes)?;
+            masks.extend(bytes.chunks_exact(plane).map(<[u8]>::to_vec));
+        }
         let logits = gpu.download(&low_res)?;
         let objects = scores
             .iter()

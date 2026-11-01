@@ -380,10 +380,10 @@ class Sam3Tracker:
             )
 
     def frames(self, state, n):
-        for frame_idx, obj_ids, _low, video_res, _scores in self.p.propagate_in_video(
+        for frame_idx, obj_ids, low_res, video_res, scores in self.p.propagate_in_video(
             state, start_frame_idx=0, max_frame_num_to_track=n, reverse=False, tqdm_disable=True, propagate_preflight=True
         ):
-            yield frame_idx, list(obj_ids), (video_res[:, 0] > 0).cpu().numpy()
+            yield frame_idx, list(obj_ids), _binary_masks(frame_idx, video_res, low_res, scores)
 
     def close(self, state):
         state.clear()
@@ -511,7 +511,7 @@ class Sam31Tracker:
             self.m, state, start_frame_idx=0, max_frame_num_to_track=n, reverse=False, tqdm_disable=True
         ):
             frame_idx, obj_ids, video_res = out[0], out[1], out[3]
-            yield frame_idx, list(obj_ids), (video_res[:, 0] > 0).cpu().numpy()
+            yield frame_idx, list(obj_ids), _binary_masks(frame_idx, video_res)
 
     def close(self, state):
         state.clear()
@@ -749,6 +749,16 @@ def compare(args) -> None:
         raise SystemExit(f"{failed} comparisons are missing frames or objects or below mean IoU {args.min_mean_iou}")
 
 
+def _binary_masks(frame_idx: int, video_res, *raw) -> np.ndarray:
+    """Masks from `video_res` logits `[objects, 1, h, w]`, after checking they and the other
+    raw outputs (low-res logits, scores) are finite: thresholding would turn NaN into
+    background, which a comparison against an empty mask then counts as a match"""
+    for t in (video_res, *raw):
+        if t is not None and not bool(torch.isfinite(t).all()):
+            raise RuntimeError(f"frame {frame_idx}: non-finite tracker output")
+    return (video_res[:, 0] > 0).cpu().numpy()
+
+
 def _masks_by_id(npz, k: int) -> dict:
     """Frame k's masks keyed by object ID, failing when IDs and mask planes disagree"""
     ids = json.loads(npz["ids"][k])
@@ -904,7 +914,7 @@ def dump(args) -> None:
         tensors[f"f{t}.low_res"] = _cpu(low_res)
         tensors[f"f{t}.scores"] = _cpu(scores)
         tensors[f"f{t}.masks"] = torch.from_numpy(
-            np.packbits((video_res[:, 0] > 0).cpu().numpy(), axis=-1)
+            np.packbits(_binary_masks(t, video_res, low_res, scores), axis=-1)
         )
         meta["per_frame"].append(frame_meta)
     if len(meta["per_frame"]) != n_frames:
