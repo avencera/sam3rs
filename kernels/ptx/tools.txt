@@ -1,4 +1,4 @@
-llc: Ubuntu LLVM version 21.1.8
-opt: Ubuntu LLVM version 21.1.8
-llvm-link: Ubuntu LLVM version 21.1.8
+llc: LLVM version 23.1.1-rust-1.99.1-stable
+opt: LLVM version 23.1.1-rust-1.99.1-stable
+llvm-link: LLVM version 23.1.1-rust-1.99.1-stable
 libdevice: 0c6b4d4e4c033e2faffcc6f671c68fec5e813020845a5a08f1dbdd35c19629d6

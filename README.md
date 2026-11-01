@@ -147,7 +147,7 @@ Click objects on the first frame, then feed the frames one at a time:
 use sam3rs::{PointPrompt, Precision, RgbImage, Sam3};
 
 let model = Sam3::from_pretrained(0, Precision::Bf16)?;
-let frames: Vec<RgbImage> = /* decoded frames, all one size */;
+let frames: Vec<RgbImage> = vec![/* decoded frames, all one size */];
 // one Vec of clicks per object, in the first frame's pixels
 let clicks = vec![vec![PointPrompt::new(640.0, 360.0, true)?]];
 let (mut tracker, first) = model.track(&frames[0], &clicks, frames.len())?;
@@ -269,7 +269,7 @@ Worst case over 43 checks:
 |---|---|---|---|
 | `fp32` | 0.0008 | 0.02 px | 0.9987 |
 | `tf32` | 0.0052 | 0.19 px | 0.9987 |
-| `bf16` | 0.0070 | 1.26 px | 0.9964 |
+| `bf16` | 0.0046 | 0.71 px | 0.9914 |
 
 ```sh
 cargo test --release --test parity -- --nocapture
