@@ -132,7 +132,9 @@ def test_matches_pytorch(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], 
 def test_loads_one_cublas(model: sam3rs.Sam3) -> None:
     # a second copy, such as a CUDA toolkit's beside the pip wheel, can leave libcublas
     # on another release's libcublasLt
-    paths = [Path(line.split()[-1]) for line in Path("/proc/self/maps").read_text().splitlines()]
+    # the pathname is the sixth field and may contain spaces; anonymous mappings have none
+    fields = (line.split(maxsplit=5) for line in Path("/proc/self/maps").read_text().splitlines())
+    paths = [Path(f[5]) for f in fields if len(f) == 6]
     blas = {p for p in paths if p.name.startswith("libcublas.so")}
     lt = {p for p in paths if p.name.startswith("libcublasLt.so")}
     assert len(blas) == len(lt) == 1, (blas, lt)
