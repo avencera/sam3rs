@@ -57,8 +57,9 @@
 //! - An NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 //!   and driver r580 or newer. RTX 50 series GPUs load compute_120 PTX, others the
 //!   compute_80 floor.
-//! - cuBLAS 13 (`libcublas.so.13`, `libcublasLt.so.13`) on the library path, from a CUDA 13
-//!   toolkit or the `nvidia-cublas` pip wheel
+//! - Any cuBLAS 13 release (`libcublas.so.13`, `libcublasLt.so.13`) on the library path,
+//!   from a CUDA 13 toolkit or the `nvidia-cublas` pip wheel. All three precision modes
+//!   are tested with wheels from 13.0.0 to 13.8.2.
 //! - Stable Rust (edition 2024)
 //!
 //! libcuda and cuBLAS load at run time. A missing driver, GPU or cuBLAS makes
@@ -66,6 +67,9 @@
 //! a copy already in the process, such as the pip wheel the Python package loads, is
 //! reused; otherwise the loader's search order picks one (`LD_LIBRARY_PATH`, then the
 //! ldconfig cache).
+//!
+//! `scripts/check-cublas-versions.sh` runs the Python package's tests on a GPU against the
+//! oldest cuBLAS 13 wheel, the one PyTorch's cu130 wheels pin and the newest.
 //!
 //! Cargo features:
 //!

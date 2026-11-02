@@ -8,6 +8,12 @@
 //! `CUBLAS_STATUS_INVALID_VALUE`. Opening the soname reuses a copy already loaded and
 //! otherwise follows the dynamic loader's search order. The types still come from
 //! cudarc's bindings, which match the 13.0 headers
+//!
+//! The toolkit's libcublas also binds its libcublasLt by soname, so it ran on the
+//! wheel's copy, and a libcublas newer than its libcublasLt (the 13.4.1 toolkit's on the
+//! 13.1.1 wheel's) fails its first GEMM with `CUBLAS_STATUS_NOT_INITIALIZED`. A version
+//! check can't catch that pairing: libcublas answers `cublasGetProperty` and
+//! `cublasGetVersion_v2` with its libcublasLt's release
 
 use std::ffi::c_int;
 use std::sync::OnceLock;

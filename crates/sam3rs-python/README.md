@@ -14,8 +14,9 @@ Linux x86_64 only. You need:
 
 - an NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 - NVIDIA driver r580 or newer
-- cuBLAS 13, which the `cuda` extra installs from the `nvidia-cublas` wheel. Leave the
-  extra out if a CUDA 13 toolkit is already on the library path.
+- cuBLAS 13, which the `cuda` extra installs from the `nvidia-cublas` wheel. Any 13.x
+  release works; it is tested with releases from 13.0.0 to 13.8.2. Leave the extra out
+  if a CUDA 13 toolkit is already on the library path.
 
 The package imports on any machine. Loading a model without a usable GPU, driver or
 cuBLAS raises `sam3rs.Sam3rsError` that says what is missing.

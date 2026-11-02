@@ -7,6 +7,7 @@ boxes within 0.5% of the longer side and mask IoU of at least 0.99.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -125,6 +126,31 @@ def test_matches_pytorch(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], 
         _check_bool_view(got.masks, height, width)
         checked += 1
     assert checked == len(prompts) > 0
+
+
+@pytest.mark.gpu
+def test_loads_one_cublas(model: sam3rs.Sam3) -> None:
+    # a second copy, such as a CUDA toolkit's beside the pip wheel, can leave libcublas
+    # on another release's libcublasLt
+    # the pathname is the sixth field and may contain spaces; anonymous mappings have none
+    fields = (line.split(maxsplit=5) for line in Path("/proc/self/maps").read_text().splitlines())
+    paths = [Path(f[5]) for f in fields if len(f) == 6]
+    blas = {p for p in paths if p.name.startswith("libcublas.so")}
+    lt = {p for p in paths if p.name.startswith("libcublasLt.so")}
+    assert len(blas) == len(lt) == 1, (blas, lt)
+
+    # _cuda swallows a failed wheel load and lets the system search path fill in, so with
+    # the wheel installed a working system pair would otherwise pass for it
+    try:
+        dist = importlib.metadata.distribution("nvidia-cublas")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    wheel = {
+        Path(dist.locate_file(f)).resolve()
+        for f in dist.files or []
+        if Path(f).name.startswith(("libcublas.so", "libcublasLt.so"))
+    }
+    assert {p.resolve() for p in blas | lt} <= wheel, (blas, lt, wheel)
 
 
 @pytest.mark.gpu

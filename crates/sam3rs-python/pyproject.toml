@@ -33,7 +33,8 @@ classifiers = [
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
-# cuBLAS 13 for the GEMMs; the NVIDIA driver supplies everything else
+# cuBLAS 13 for the GEMMs; any 13.x release works (scripts/check-cublas-versions.sh tests the
+# oldest), and the NVIDIA driver supplies everything else
 cuda = ["nvidia-cublas>=13,<14; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [project.scripts]
