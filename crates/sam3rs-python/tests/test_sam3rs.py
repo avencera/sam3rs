@@ -7,6 +7,7 @@ boxes within 0.5% of the longer side and mask IoU of at least 0.99.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -135,6 +136,19 @@ def test_loads_one_cublas(model: sam3rs.Sam3) -> None:
     blas = {p for p in paths if p.name.startswith("libcublas.so")}
     lt = {p for p in paths if p.name.startswith("libcublasLt.so")}
     assert len(blas) == len(lt) == 1, (blas, lt)
+
+    # _cuda swallows a failed wheel load and lets the system search path fill in, so with
+    # the wheel installed a working system pair would otherwise pass for it
+    try:
+        dist = importlib.metadata.distribution("nvidia-cublas")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    wheel = {
+        Path(dist.locate_file(f)).resolve()
+        for f in dist.files or []
+        if Path(f).name.startswith(("libcublas.so", "libcublasLt.so"))
+    }
+    assert {p.resolve() for p in blas | lt} <= wheel, (blas, lt, wheel)
 
 
 @pytest.mark.gpu

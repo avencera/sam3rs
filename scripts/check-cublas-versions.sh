@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs the Python package's tests against several releases of the nvidia-cublas wheel the
 # `cuda` extra accepts: by default the oldest 13.x, the one PyTorch's cu130 wheels pin and
-# the newest. On a machine with a CUDA toolkit whose cuBLAS differs from the wheel's, it
-# also checks that the wheel's copy is the only one loaded. Needs an NVIDIA GPU, the
+# the newest. It also checks that the wheel's copy is the only cuBLAS loaded, so neither a
+# CUDA toolkit's nor any other system copy can stand in for it. Needs an NVIDIA GPU, the
 # weights in models/sam3 and the parity fixtures in models/parity
 # (scripts/fetch-models.sh, scripts/reference.py dump)
 #
@@ -51,7 +51,8 @@ for version in "${versions[@]}"; do
   venv="$root/$work/venv-$version"
   installed=$("$venv/bin/python" -c 'from importlib.metadata import version; print(version("nvidia-cublas"))')
   echo "== nvidia-cublas $installed"
-  if ! (cd crates/sam3rs-python && "$venv/bin/python" -m pytest -q -rs); then
+  # inherited options such as -m 'not gpu' could deselect every GPU test and still pass
+  if ! (cd crates/sam3rs-python && env -u PYTEST_ADDOPTS "$venv/bin/python" -m pytest -q -rs); then
     failed+=("$installed")
   else
     passed+=("$installed")
