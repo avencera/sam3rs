@@ -282,8 +282,10 @@ def _prompts(points: npt.ArrayLike) -> list[list[tuple[float, ...]]]:
         # prompts with different click counts don't stack into one array
         array = None
     if array is not None:
-        if array.size == 0:
+        if array.ndim >= 1 and array.shape[0] == 0:
             return []
+        if array.ndim == 3 and array.shape[1] == 0:
+            raise ValueError(f"points of shape {array.shape} give prompts with no clicks")
         if array.ndim == 2 and array.shape[1] == 2:
             return [[(float(x), float(y))] for x, y in array]
         if array.ndim != 3 or array.shape[2] != 2:

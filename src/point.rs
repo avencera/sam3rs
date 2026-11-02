@@ -289,13 +289,16 @@ impl PointDecoder {
         let k = prompts.len();
         ensure!(k > 0, "a decoder batch needs at least one prompt");
         let mut tokens = Vec::new();
+        let mut per_prompt = None;
         for points in prompts {
+            let start = tokens.len();
             tokens.extend_from_slice(&self.output_tokens);
             tokens.extend(self.sparse_tokens(points, width, height));
+            // compared per prompt, since unequal counts can still sum to a multiple of k
+            let len = tokens.len() - start;
+            ensure!(*per_prompt.get_or_insert(len) == len, "the prompts of one decoder batch need equal point counts");
         }
-        ensure!(tokens.len().is_multiple_of(k * D), "the prompts of one decoder batch need equal point counts");
         let n = tokens.len() / (k * D);
-        ensure!(tokens.len() == k * n * D, "the prompts of one decoder batch need equal point counts");
         let prompt_pe = gpu.upload(tokens, &[k * n, D])?;
         let queries = gpu.clone_tensor(&prompt_pe)?;
 

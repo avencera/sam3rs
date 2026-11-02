@@ -229,6 +229,8 @@ def test_rejects_bad_prompts(model: sam3rs.Sam3) -> None:
         model.segment_points_batch(emb, [(1, 2)], labels=[-1])
     with pytest.raises(ValueError):
         model.segment_points_batch(emb, np.zeros((2, 3)))
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, np.zeros((2, 0, 2)))
 
 
 def _check_bool_view(masks: np.ndarray, height: int, width: int) -> None:
