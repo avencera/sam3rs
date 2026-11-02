@@ -128,6 +128,16 @@ def test_matches_pytorch(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], 
 
 
 @pytest.mark.gpu
+def test_loads_one_cublas(model: sam3rs.Sam3) -> None:
+    # a second copy, such as a CUDA toolkit's beside the pip wheel, can leave libcublas
+    # on another release's libcublasLt
+    paths = [Path(line.split()[-1]) for line in Path("/proc/self/maps").read_text().splitlines()]
+    blas = {p for p in paths if p.name.startswith("libcublas.so")}
+    lt = {p for p in paths if p.name.startswith("libcublasLt.so")}
+    assert len(blas) == len(lt) == 1, (blas, lt)
+
+
+@pytest.mark.gpu
 def test_encode_path_matches_array(model: sam3rs.Sam3, tmp_path: Path) -> None:
     rng = np.random.default_rng(0)
     image = rng.integers(0, 256, size=(48, 64, 3), dtype=np.uint8)
