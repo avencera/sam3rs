@@ -20,6 +20,7 @@ pub mod common;
 pub mod conv;
 pub mod detector;
 pub mod elementwise;
+pub mod holes;
 pub mod mma;
 pub mod norm;
 pub mod preprocess;

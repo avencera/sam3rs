@@ -519,6 +519,22 @@ impl Gpu {
         self.synchronize()
     }
 
+    /// Copies `src` from byte `offset` on into `host` and waits for the stream
+    pub fn download_range_into<T: Pod>(&self, src: &Buf, offset: usize, host: &mut [T]) -> Result<()> {
+        let host: &mut [u8] = bytemuck::cast_slice_mut(host);
+        let end = offset.checked_add(host.len());
+        ensure!(
+            end.is_some_and(|end| end <= src.bytes),
+            "download of {} bytes at {offset} from a {} byte buffer",
+            host.len(),
+            src.bytes
+        );
+        if !host.is_empty() {
+            unsafe { cur::memcpy_dtoh_async(host, src.ptr + offset as u64, self.cu_stream())? };
+        }
+        self.synchronize()
+    }
+
     pub fn download(&self, t: &Tensor) -> Result<Vec<f32>> {
         let mut host = vec![0f32; t.len()];
         self.download_into(&t.buf, &mut host)?;

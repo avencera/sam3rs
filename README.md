@@ -143,6 +143,32 @@ All of a call's masks share one host buffer. Dropping the result hands that memo
 back to the model, so the next call writes its masks into pages that are already
 mapped. Faulting in fresh memory for 27 masks at 2560 px took about 27 ms.
 
+### Many objects from clicks
+
+`segment_points` segments one object from its clicks. To segment several objects in
+the same image, pass one prompt per object to `segment_points_batch`. It decodes
+them together on the GPU and returns the same scores and masks as one
+`segment_points` call per prompt, all in one host buffer:
+
+```rust
+use sam3rs::{PointPrompt, Precision, RgbImage, Sam3};
+
+// one prompt per object; each may hold several clicks, background ones included
+let dog = [PointPrompt::new(1439.0, 504.0, true)?];
+let other = [PointPrompt::new(700.0, 900.0, true)?, PointPrompt::new(760.0, 980.0, false)?];
+let objects = model.segment_points_batch(&embedding, &[&dog, &other])?;
+for (i, score) in objects.scores().iter().enumerate() {
+    // objects.mask(i) is height * width bytes, 1 = foreground
+    println!("object {i}: {score:.3}");
+}
+```
+
+Prompts with the same click count share every decoder launch, up to `POINT_BATCH`
+(16) at a time. A prompt with a different count starts a separate batch. Scores match
+the single calls exactly in `fp32`. In `tf32` and `bf16`, cuBLAS picks other GEMM
+kernels for the taller batch, so scores can move by about as much as `tf32` and
+`bf16` already differ from `fp32`.
+
 ### Video tracking
 
 Click objects on the first frame, then feed the frames one at a time:
@@ -180,20 +206,20 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **64.7** | **1.9** | **7.9** | **7.8** | **9.2** |
+| **sam3rs `tf32`** | **63.7** | **1.4** | **7.8** | **7.8** | **9.2** |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
-| **sam3rs `bf16`** | **31.1** | **2.0** | **5.4** | **5.4** | **6.9** |
+| **sam3rs `bf16`** | **30.9** | **1.5** | **5.4** | **5.4** | **6.9** |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
-| **sam3rs `fp32`** | **120.6** | **2.2** | **26.8** | **27.2** | **29.1** |
+| **sam3rs `fp32`** | **117.6** | **1.7** | **26.6** | **26.9** | **28.8** |
 
 Each sam3rs row sits under the runtime that uses the same numerics:
 
-- `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 10x on points,
+- `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 14x on points,
   4.3x on box prompts and 3.9x on text prompts.
-- `bf16` against PyTorch BF16: 1.27x on encode, 18x on points, 4.0x on box prompts and
+- `bf16` against PyTorch BF16: 1.28x on encode, 24x on points, 4.0x on box prompts and
   3.0x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: 1.07x on encode, 12x on points, 1.24x on
-  box prompts and 1.09x on text prompts.
+- `fp32` against PyTorch FP32 with TF32 off: 1.10x on encode, 15x on points, 1.25x on
+  box prompts and 1.10x on text prompts.
 
 The sam3rs rows come from three runs of one queued session, reporting the median of
 each column. The PyTorch rows come from an earlier queued session on the same machine,
@@ -204,8 +230,9 @@ Where the time goes:
 - Image features stay on the GPU. osam downloads 133 MB of features at encode and
   re-uploads 117 MB on every detector call, and part of its point decoder runs on the
   CPU.
-- The point path is small kernels plus hole filling on the host. PyTorch spends about
-  17 ms of each point prompt filling holes with GPU connected components.
+- The point path is small kernels, hole filling included: a union-find over the
+  low-res masks in four launches. PyTorch spends about 17 ms of each point prompt
+  filling holes with GPU connected components.
 - PyTorch's box and text prompts launch about 2.8k kernels each and keep the GPU 46%
   busy. sam3rs issues about 0.6k GPU operations for a box prompt and 0.95k for a text
   prompt, and keeps the GPU about 91% busy. A BF16 box prompt spends about 1.8 ms in the

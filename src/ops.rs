@@ -331,6 +331,14 @@ impl Mlp {
     }
 }
 
+/// Threads for a block-per-row kernel over rows of `cols`: whole warps up to 256. The
+/// point decoder's 64-wide upscaling norm left three of four warps idle at 256. Block
+/// reductions see the missing warps' partials as the zeros idle warps would give, so the
+/// result is the same to the bit
+fn row_block(cols: usize) -> (u32, u32, u32) {
+    (cols.next_multiple_of(32).clamp(32, 256) as u32, 1, 1)
+}
+
 pub struct LayerNorm {
     pub w: Tensor,
     pub b: Tensor,
@@ -350,7 +358,8 @@ impl LayerNorm {
 
     pub fn forward_inplace(&self, gpu: &Gpu, x: &Tensor) -> Result<()> {
         assert_eq!(x.cols(), self.w.len());
-        launch!(gpu, "layernorm_inplace", (x.rows() as u32, 1, 1), B256, 0; x, &self.w, &self.b, x.cols(), self.eps)
+        launch!(gpu, "layernorm_inplace", (x.rows() as u32, 1, 1), row_block(x.cols()), 0;
+            x, &self.w, &self.b, x.cols(), self.eps)
     }
 
     /// Normalized rows in BF16, as the input of a BF16 linear
@@ -374,7 +383,8 @@ impl LayerNorm {
 
     fn forward_into(&self, gpu: &Gpu, x: &Tensor, out: &Tensor) -> Result<()> {
         assert_eq!(x.cols(), self.w.len());
-        launch!(gpu, "layernorm", (x.rows() as u32, 1, 1), B256, 0; out, x, &self.w, &self.b, x.cols(), self.eps)
+        launch!(gpu, "layernorm", (x.rows() as u32, 1, 1), row_block(x.cols()), 0;
+            out, x, &self.w, &self.b, x.cols(), self.eps)
     }
 }
 
@@ -557,7 +567,11 @@ pub fn attention(
     let scale = 1.0 / (hd as f32).sqrt();
     let s = Mat::new(scores.ptr(), lk).stride(lq * lk);
     gpu.gemm(lq, lk, hd, q, k.t(), s, batch, scale, 0.0)?;
-    launch!(gpu, "softmax", ((batch * lq) as u32, 1, 1), B256, 0;
+    // one warp a row when a warp covers the keys: the point decoder's image-to-token
+    // attention has 41k rows of 8 keys a prompt, which left 7 of 8 warps idle. The other
+    // warps' partials are zeros and -inf, so the result is the same to the bit
+    let block = if lk <= 32 { (32, 1, 1) } else { B256 };
+    launch!(gpu, "softmax", ((batch * lq) as u32, 1, 1), block, 0;
         &scores, lq, bias_arg, bias_div, key_pad, mask.causal as i32)?;
     gpu.gemm(lq, hd, lk, s, v, out, batch, 1.0, 0.0)
 }
@@ -955,12 +969,6 @@ impl Attention {
         Ok(Self { q: l("q_proj")?, k: l("k_proj")?, v: l("v_proj")?, o: l("o_proj")?, heads })
     }
 
-    /// `o_proj(attn(q_in Wq, k_in Wk, v_in Wv))`
-    pub fn forward(&self, gpu: &Gpu, q_in: &Tensor, k_in: &Tensor, v_in: &Tensor, mask: Mask) -> Result<Tensor> {
-        let attn = self.attend(gpu, q_in, k_in, v_in, mask)?;
-        self.o.forward(gpu, &attn)
-    }
-
     /// `residual += o_proj(attn(...))`
     pub fn forward_residual(
         &self,
@@ -981,6 +989,60 @@ impl Attention {
         let v = self.v.forward(gpu, v_in)?;
         let dim = q.cols();
         mha(gpu, (q.ptr(), dim), (k.ptr(), dim), (v.ptr(), dim), q.rows(), k.rows(), self.heads, dim / self.heads, mask)
+    }
+
+    /// `o_proj(attn(q_in Wq, k_in Wk, v_in Wv))` without a mask over `batch` independent
+    /// sequences, stacked along the rows of the inputs: sequence `b` is rows `b * lq..` of
+    /// `q_in` and `b * lk..` of `k_in` and `v_in`, and only attends within itself
+    pub fn forward_batch(
+        &self,
+        gpu: &Gpu,
+        q_in: &Tensor,
+        k_in: &Tensor,
+        v_in: &Tensor,
+        batch: usize,
+    ) -> Result<Tensor> {
+        let attn = self.attend_batch(gpu, q_in, k_in, v_in, batch)?;
+        self.o.forward(gpu, &attn)
+    }
+
+    /// [`Self::forward_residual`] without a mask over `batch` stacked sequences, as in
+    /// [`Self::forward_batch`]
+    pub fn forward_residual_batch(
+        &self,
+        gpu: &Gpu,
+        q_in: &Tensor,
+        k_in: &Tensor,
+        v_in: &Tensor,
+        batch: usize,
+        residual: &Tensor,
+    ) -> Result<()> {
+        let attn = self.attend_batch(gpu, q_in, k_in, v_in, batch)?;
+        self.o.forward_residual(gpu, &attn, residual)
+    }
+
+    /// One attention launch for every sequence and head. A single sequence takes the
+    /// unbatched path as is; more go through `[batch * heads, rows, head dim]` copies of
+    /// the projections, since the strided attention batch needs one stride between its
+    /// entries and the stacked `[batch * rows, heads * head dim]` rows have two
+    fn attend_batch(&self, gpu: &Gpu, q_in: &Tensor, k_in: &Tensor, v_in: &Tensor, batch: usize) -> Result<Tensor> {
+        if batch == 1 {
+            return self.attend(gpu, q_in, k_in, v_in, Mask::default());
+        }
+        assert!(q_in.rows().is_multiple_of(batch) && k_in.rows().is_multiple_of(batch), "rows of {batch} sequences");
+        let q = self.q.forward(gpu, q_in)?;
+        let k = self.k.forward(gpu, k_in)?;
+        let v = self.v.forward(gpu, v_in)?;
+        let (dim, heads) = (q.cols(), self.heads);
+        let hd = dim / heads;
+        let (lq, lk) = (q.rows() / batch, k.rows() / batch);
+        let [q, k, v] = [(&q, lq), (&k, lk), (&v, lk)].map(|(x, rows)| swap_middle(gpu, x, rows, heads, hd));
+        let (q, k, v) = (q?, k?, v?);
+        let by_head = gpu.empty(&[batch * heads * lq, hd])?;
+        let view = |t: &Tensor, rows: usize| Mat::new(t.ptr(), hd).stride(rows * hd);
+        let mask = Mask { bias_div: 1, ..Mask::default() };
+        attention(gpu, view(&q, lq), view(&k, lk), view(&v, lk), view(&by_head, lq), batch * heads, lq, lk, hd, mask)?;
+        Ok(swap_middle(gpu, &by_head, heads, lq, hd)?.reshape(&[batch * lq, dim]))
     }
 }
 
@@ -1024,6 +1086,14 @@ impl PendingNorm<'_> {
         launch!(gpu, "group_norm_apply", ew(x.len()), B256, 0;
             x, &self.stats, self.w, self.b, x.cols(), self.groups, self.eps, self.act)
     }
+}
+
+/// `x [n, a, b, d] -> [n, b, a, d]`, as `[n * b * a, d]`
+fn swap_middle(gpu: &Gpu, x: &Tensor, a: usize, b: usize, d: usize) -> Result<Tensor> {
+    assert!(x.len().is_multiple_of(a * b * d), "{:?} is not [n, {a}, {b}, {d}]", x.shape());
+    let out = gpu.empty(&[x.len() / d, d])?;
+    launch!(gpu, "swap_middle", ew(out.len()), B256, 0; &out, x, a, b, d)?;
+    Ok(out)
 }
 
 /// `[n, d]` rows of `a` followed by rows of `b`

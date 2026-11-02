@@ -5,6 +5,7 @@ from typing import final
 
 __version__: str
 SCORE_THRESHOLD: float
+POINT_BATCH: int
 VISUAL_PROMPT: str
 MODEL_REPO: str
 
@@ -38,6 +39,9 @@ class Model:
         self, emb: Embedding, text: str, boxes: list[tuple[float, float, float, float, bool]]
     ) -> tuple[list[float], list[float], HostBuffer, list[int]]: ...
     def segment_points(self, emb: Embedding, points: list[tuple[float, float, bool]]) -> tuple[float, HostBuffer]: ...
+    def segment_points_batch(
+        self, emb: Embedding, prompts: list[list[tuple[float, float, bool]]]
+    ) -> tuple[list[float], HostBuffer]: ...
 
 def overlay(width: int, height: int, rgb: bytes, masks: bytes) -> bytes: ...
 def save_image(width: int, height: int, rgb: bytes, path: str | PathLike[str]) -> None: ...

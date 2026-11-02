@@ -113,6 +113,23 @@ pub fn transpose(mut out: DisjointSlice<f32>, x: &[f32], cols: u32) {
     }
 }
 
+/// `x [n, a, b, d] -> out [n, b, a, d]`, each thread gathering its output element: the
+/// point decoder's `[prompts, tokens, heads, head dim]` projections to and from the
+/// `[prompts * heads, tokens, head dim]` layout one strided attention batch covers
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn swap_middle(mut out: DisjointSlice<f32>, x: &[f32], a: u32, b: u32, d: u32) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let (e, r) = (i % d, i / d);
+    // `r` walks out's [n, b, a] index, `ia` fastest
+    let (ia, r) = (r % a, r / a);
+    let (ib, n) = (r % b, r / b);
+    if let Some(mut out) = out.element_thread32(t) {
+        out.write(x[(((n * a + ia) * b + ib) * d + e) as usize]);
+    }
+}
+
 /// Rows of `cols` floats at row stride `ld` in `src`, into contiguous BF16 `[rows, cols]`
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32)]

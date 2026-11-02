@@ -129,6 +129,47 @@ def test_matches_pytorch(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], 
 
 
 @pytest.mark.gpu
+def test_batched_points_match_single_calls(model: sam3rs.Sam3, dogs: tuple[dict[str, np.ndarray], list[dict]]) -> None:
+    tensors, prompts = dogs
+    image = tensors["image_rgb"]
+    height, width = image.shape[:2]
+    emb = model.encode(image)
+    point = next(p for p in prompts if "points" in p)
+    fixture = [p[:2] for p in point["points"]]
+    # the fixture's click, two clicks on the other dogs and a click with a background one
+    prompts_xy = [fixture, [(700, 900)], [(2000, 1000)], [(1439, 504), (1500, 600)]]
+    labels = [[p[2] for p in point["points"]], [1], [1], [1, 0]]
+
+    got = model.segment_points_batch(emb, prompts_xy, labels)
+    assert len(got) == len(prompts_xy)
+    assert got.scores.dtype == np.float32 and got.scores.shape == (len(prompts_xy),)
+    _check_bool_view(got.masks, height, width)
+    for i, (xy, flags) in enumerate(zip(prompts_xy, labels)):
+        single = model.segment_points(emb, xy, flags)
+        assert abs(got.scores[i] - single.score) <= SCORE_TOL, i
+        assert _iou(got.masks[i], single.mask) >= MIN_IOU, i
+
+    # the fixture's prompt inside the batch still matches PyTorch
+    key = point["name"].replace(" ", "_")
+    want_iou = tensors[f"{key}.iou"]
+    best = int(np.argmax(want_iou))
+    assert abs(got.scores[0] - want_iou[best]) <= SCORE_TOL
+    assert _iou(got.masks[0], tensors[f"{key}.masks"][best] != 0) >= MIN_IOU
+
+    # a (k, 2) array is k single clicks, and a (k, n, 2) array k prompts of n clicks
+    clicks = np.array([[700, 900], [2000, 1000]], dtype=np.float32)
+    singles = model.segment_points_batch(emb, clicks)
+    stacked = model.segment_points_batch(emb, clicks[:, None, :], labels=np.ones((2, 1)))
+    np.testing.assert_array_equal(singles.scores, stacked.scores)
+    np.testing.assert_array_equal(singles.masks, stacked.masks)
+    # a batch of another size runs other GEMM shapes, so it matches only within rounding
+    np.testing.assert_allclose(singles.scores, got.scores[1:3], rtol=0, atol=SCORE_TOL)
+
+    empty = model.segment_points_batch(emb, [])
+    assert len(empty) == 0 and empty.masks.shape == (0, height, width)
+
+
+@pytest.mark.gpu
 def test_loads_one_cublas(model: sam3rs.Sam3) -> None:
     # a second copy, such as a CUDA toolkit's beside the pip wheel, can leave libcublas
     # on another release's libcublasLt
@@ -178,6 +219,18 @@ def test_rejects_bad_prompts(model: sam3rs.Sam3) -> None:
         model.segment_points(emb, [(1, 2)], labels=[1, 0])
     with pytest.raises(ValueError):
         model.segment_points(emb, [(1, 2)], labels=[-1])
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, [[(1, 2)], []])
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, [[(1, 2)], [(3, 4)]], labels=[[1]])
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, [[(1, 2)], [(3, 4), (5, 6)]], labels=[[1], [1]])
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, [(1, 2)], labels=[-1])
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, np.zeros((2, 3)))
+    with pytest.raises(ValueError):
+        model.segment_points_batch(emb, np.zeros((2, 0, 2)))
 
 
 def _check_bool_view(masks: np.ndarray, height: int, width: int) -> None:

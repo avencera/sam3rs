@@ -54,11 +54,22 @@ similar = model.detect(
 click = model.segment_points(embedding, [(1439, 504), (1500, 600)], labels=[1, 0])
 print(click.score, click.mask.sum())
 
+# many objects in one call, one prompt per object: here three single clicks
+objects = model.segment_points_batch(embedding, [(1439, 504), (700, 900), (2000, 1000)])
+print(objects.scores)  # (3,) float32
+print(objects.masks.shape)  # (3, height, width) bool
+
 tinted = sam3rs.overlay(sam3rs.load_image("dogs.jpg"), dogs.masks)
 ```
 
 An embedding works only with the model that made it, and costs nothing to reuse, so
 encode once and run as many prompts as you need against it.
+
+`segment_points_batch` takes `(k, 2)` single clicks, `(k, n, 2)` prompts of `n` clicks,
+or a list of prompts whose click counts differ, with `labels` shaped to match. Each
+object gets the score and mask `segment_points` would give its clicks alone (exactly
+in FP32, and within the usual BF16 and TF32 rounding otherwise), with the decoder
+batched on the GPU.
 
 `precision="bf16"` (the default) runs the vision backbone, the text encoder's MLP and
 the fusion encoder's feed-forward layers in BF16, every other matrix multiply on tensor
@@ -66,8 +77,8 @@ cores with BF16 or TF32 inputs, and most attention fused on FP16 tensor cores. `
 weights and activations but runs the matrix multiplies on TF32 tensor cores, as ONNX
 Runtime does for FP32 models, with most attention fused on TF32 tensor cores.
 `precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image
-takes about 31 ms in BF16, 65 ms in TF32 and 120 ms in FP32; a point prompt 1.9 to
-2.2 ms; a box prompt 5.4, 7.9 and 27 ms; and a text prompt 6.9, 9.2 and 29 ms.
+takes about 31 ms in BF16, 64 ms in TF32 and 118 ms in FP32; a point prompt 1.4 to
+1.7 ms; a box prompt 5.4, 7.8 and 27 ms; and a text prompt 6.9, 9.2 and 29 ms.
 
 Calls release the GIL while the GPU works. Calls on one model from several threads
 take turns. Masks are writable numpy views of memory the runtime filled, not copies;

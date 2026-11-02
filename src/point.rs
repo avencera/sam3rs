@@ -6,8 +6,8 @@ use std::ops::Range;
 
 use eyre::{Result, ensure};
 
-use crate::gpu::{Arg, Buf, Gpu, Tensor, launch};
-use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, ew};
+use crate::gpu::{Arg, Buf, Gpu, Mat, Tensor, launch};
+use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mlp, add, add_assign, bias_act, ew};
 use crate::vision::{Fpn, GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
@@ -59,26 +59,21 @@ pub struct PointImage {
     pub feat_s1: Tensor,
 }
 
-/// One decoder pass with every output still on the device, for the video tracker
+/// One decoder pass over `K` prompts with every output still on the device
 pub struct Decoded {
-    /// `[4 - first, 288 * 288]` logits of mask tokens `first..4`
+    /// `[K * (4 - first), 288 * 288]` logits of mask tokens `first..4`, prompt by prompt.
+    /// Upstream clamps them to +-32 before reuse as a mask input, but upsamples the
+    /// unclamped logits for the final masks
     pub low_res: Tensor,
-    /// `[1, 4]` predicted IoU of all four mask tokens, after the sigmoid
+    /// `[K, 4]` predicted IoU of all four mask tokens, after the sigmoid
     pub iou: Tensor,
-    /// `[6 + prompts, 256]` output tokens: object score, IoU, then mask tokens 0 to 3
+    /// `[K * (6 + prompts), 256]` output tokens of each prompt: object score, IoU, then
+    /// mask tokens 0 to 3
     pub tokens: Tensor,
 }
 
 /// Row of mask token `m` in [`Decoded::tokens`]
 pub const MASK_TOKEN_ROW: usize = 2;
-
-/// Three candidate masks from one decoder pass
-pub struct PointOutput {
-    /// `[3, 288 * 288]` logits. Upstream clamps them to +-32 before reuse as a mask
-    /// input, but upsamples the unclamped logits for the final masks
-    pub low_res: Tensor,
-    pub iou: [f32; 3],
-}
 
 struct TwoWayLayer {
     self_attn: Attention,
@@ -230,19 +225,22 @@ impl PointDecoder {
         out
     }
 
-    /// Dense prompt embedding `[72^2, 256]` from a low-res mask `[288^2]` or the
-    /// no-mask embedding
-    fn dense(&self, gpu: &Gpu, mask: Option<&Tensor>) -> Result<Tensor> {
+    /// Dense prompt embeddings `[k * 72^2, 256]` of `k` prompts, from their low-res masks
+    /// `[k, 288^2]` or the no-mask embedding
+    fn dense(&self, gpu: &Gpu, mask: Option<&Tensor>, k: usize) -> Result<Tensor> {
         let Some(mask) = mask else {
-            let out = gpu.zeros(&[GRID * GRID, D])?;
+            let out = gpu.zeros(&[k * GRID * GRID, D])?;
             launch!(gpu, "add_row", ew(out.len()), B256, 0; &out, &self.no_mask)?;
             return Ok(out);
         };
         let mut side = LOW_RES;
-        let mut x = gpu.clone_tensor(mask)?.reshape(&[side * side, 1]);
+        assert_eq!(mask.len(), k * side * side, "one low-res mask per prompt");
+        // the k masks stacked as one image k times as tall: the 2x2 patches and the
+        // rowwise convs and norms never cross from one mask into the next
+        let mut x = gpu.clone_tensor(mask)?.reshape(&[k * side * side, 1]);
         for (conv, ln) in [(&self.mask_conv1, &self.mask_ln1), (&self.mask_conv2, &self.mask_ln2)] {
             let c = x.cols();
-            let patches = gpu.empty(&[(side / 2) * (side / 2), c * 4])?;
+            let patches = gpu.empty(&[k * (side / 2) * (side / 2), c * 4])?;
             launch!(gpu, "patchify2x2", ew(patches.len()), B256, 0; &patches, &x, side, c)?;
             side /= 2;
             x = conv.forward(gpu, &patches)?;
@@ -250,20 +248,6 @@ impl PointDecoder {
             bias_act(gpu, &x, None, Act::Gelu)?;
         }
         self.mask_conv3.forward(gpu, &x)
-    }
-
-    pub fn forward(
-        &self,
-        gpu: &Gpu,
-        img: &PointImage,
-        points: &[PointPrompt],
-        width: usize,
-        height: usize,
-        mask_input: Option<&Tensor>,
-    ) -> Result<PointOutput> {
-        let out = self.decode(gpu, &img.embed, img, points, (width, height), mask_input, 1)?;
-        let iou = gpu.download(&out.iou)?;
-        Ok(PointOutput { low_res: out.low_res, iou: [iou[1], iou[2], iou[3]] })
     }
 
     /// The decoder over image embedding `embed` (the memory-conditioned features on a
@@ -276,35 +260,70 @@ impl PointDecoder {
         embed: &Tensor,
         img: &PointImage,
         points: &[PointPrompt],
+        size: (usize, usize),
+        mask_input: Option<&Tensor>,
+        first: usize,
+    ) -> Result<Decoded> {
+        self.decode_batch(gpu, embed, img, &[points], size, mask_input, first)
+    }
+
+    /// [`Self::decode`] for `K` independent prompts with the same number of points, which
+    /// share `embed` and `img`, and their mask inputs `[K, 288^2]`
+    ///
+    /// The prompts are stacked along the rows of every activation, so each GEMM, norm and
+    /// conv runs once for all of them. Equal point counts give every prompt the same token
+    /// count, so each prompt's attention is the one a single decode would run: no padding
+    /// tokens and no masks. One prompt issues exactly the work [`Self::decode`] always did
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batch(
+        &self,
+        gpu: &Gpu,
+        embed: &Tensor,
+        img: &PointImage,
+        prompts: &[&[PointPrompt]],
         (width, height): (usize, usize),
         mask_input: Option<&Tensor>,
         first: usize,
     ) -> Result<Decoded> {
         assert!(first < 4, "mask tokens 0 to 3");
-        let mut tokens = self.output_tokens.clone();
-        tokens.extend(self.sparse_tokens(points, width, height));
-        let n = tokens.len() / D;
-        let prompt_pe = gpu.upload(tokens, &[n, D])?;
+        let k = prompts.len();
+        ensure!(k > 0, "a decoder batch needs at least one prompt");
+        let mut tokens = Vec::new();
+        let mut per_prompt = None;
+        for points in prompts {
+            let start = tokens.len();
+            tokens.extend_from_slice(&self.output_tokens);
+            tokens.extend(self.sparse_tokens(points, width, height));
+            // compared per prompt, since unequal counts can still sum to a multiple of k
+            let len = tokens.len() - start;
+            ensure!(*per_prompt.get_or_insert(len) == len, "the prompts of one decoder batch need equal point counts");
+        }
+        let n = tokens.len() / (k * D);
+        let prompt_pe = gpu.upload(tokens, &[k * n, D])?;
         let queries = gpu.clone_tensor(&prompt_pe)?;
 
-        let keys = self.dense(gpu, mask_input)?;
-        add_assign(gpu, &keys, embed)?;
-        let none = Mask::default();
+        let keys = self.dense(gpu, mask_input, k)?;
+        add_tiled(gpu, &keys, embed)?;
+        let dense_pe = |keys: &Tensor| -> Result<Tensor> {
+            let out = gpu.clone_tensor(keys)?;
+            add_tiled(gpu, &out, &self.dense_pe)?;
+            Ok(out)
+        };
 
         let mut queries = queries;
         for (i, l) in self.layers.iter().enumerate() {
             if i == 0 {
                 // the first layer replaces the queries with self-attention (no residual, no pe)
-                queries = l.self_attn.forward(gpu, &queries, &queries, &queries, none)?;
+                queries = l.self_attn.forward_batch(gpu, &queries, &queries, &queries, k)?;
             } else {
                 let q = add(gpu, &queries, &prompt_pe)?;
-                l.self_attn.forward_residual(gpu, &q, &q, &queries, none, &queries)?;
+                l.self_attn.forward_residual_batch(gpu, &q, &q, &queries, k, &queries)?;
             }
             l.norm1.forward_inplace(gpu, &queries)?;
 
             let q = add(gpu, &queries, &prompt_pe)?;
-            let k = add(gpu, &keys, &self.dense_pe)?;
-            l.token_to_image.forward_residual(gpu, &q, &k, &keys, none, &queries)?;
+            let kp = dense_pe(&keys)?;
+            l.token_to_image.forward_residual_batch(gpu, &q, &kp, &keys, k, &queries)?;
             l.norm2.forward_inplace(gpu, &queries)?;
 
             let m = l.mlp.forward(gpu, &queries)?;
@@ -312,32 +331,40 @@ impl PointDecoder {
             l.norm3.forward_inplace(gpu, &queries)?;
 
             let q = add(gpu, &queries, &prompt_pe)?;
-            l.image_to_token.forward_residual(gpu, &k, &q, &queries, none, &keys)?;
+            l.image_to_token.forward_residual_batch(gpu, &kp, &q, &queries, k, &keys)?;
             l.norm4.forward_inplace(gpu, &keys)?;
         }
         let q = add(gpu, &queries, &prompt_pe)?;
-        let k = add(gpu, &keys, &self.dense_pe)?;
-        self.final_attn.forward_residual(gpu, &q, &k, &keys, none, &queries)?;
+        let kp = dense_pe(&keys)?;
+        self.final_attn.forward_residual_batch(gpu, &q, &kp, &keys, k, &queries)?;
         self.final_norm.forward_inplace(gpu, &queries)?;
 
-        let up = self.upscale1.forward(gpu, &keys, GRID, GRID)?;
-        add_assign(gpu, &up, &img.feat_s1)?;
+        // the k image grids stacked as one grid k times as tall, which the transposed
+        // convs' pixel shuffle keeps prompt by prompt
+        let up = self.upscale1.forward(gpu, &keys, k * GRID, GRID)?;
+        add_tiled(gpu, &up, &img.feat_s1)?;
         self.upscale_ln.forward_inplace(gpu, &up)?;
         bias_act(gpu, &up, None, Act::Gelu)?;
-        let up = self.upscale2.forward(gpu, &up, 2 * GRID, 2 * GRID)?;
-        add_assign(gpu, &up, &img.feat_s0)?;
+        let up = self.upscale2.forward(gpu, &up, 2 * k * GRID, 2 * GRID)?;
+        add_tiled(gpu, &up, &img.feat_s0)?;
         bias_act(gpu, &up, None, Act::Gelu)?;
 
         // mask token 0 is the single-mask output, 1 to 3 the multimask ones
         let side = LOW_RES * LOW_RES;
-        let low_res = gpu.empty(&[4 - first, side])?;
-        let proj = Linear::new(up, None);
+        let masks = 4 - first;
+        let low_res = gpu.empty(&[k * masks, side])?;
+        let c = up.cols();
         for (j, m) in (first..4).enumerate() {
-            let hyper = self.hyper[m].forward(gpu, &row(gpu, &queries, MASK_TOKEN_ROW + m)?)?;
-            proj.forward_raw(gpu, hyper.ptr(), hyper.cols(), 1, low_res.at(j * side), 0.0)?;
+            let tokens = rows(gpu, &queries, (0..k).map(|b| b * n + MASK_TOKEN_ROW + m))?;
+            let hyper = self.hyper[m].forward(gpu, &tokens)?;
+            // prompt b's mask j is its hypernetwork row times its own upscaled map
+            let x = Mat::new(hyper.ptr(), hyper.cols()).stride(hyper.cols());
+            let maps = Mat::new(up.ptr(), c).t().stride(side * c);
+            let out = Mat::new(low_res.at(j * side), side).stride(masks * side);
+            gpu.gemm(1, side, c, x, maps, out, k, 1.0, 0.0)?;
         }
 
-        let iou = self.iou_head.forward(gpu, &row(gpu, &queries, 1)?)?;
+        let iou = self.iou_head.forward(gpu, &rows(gpu, &queries, (0..k).map(|b| b * n + 1))?)?;
         bias_act(gpu, &iou, None, Act::Sigmoid)?;
         Ok(Decoded { low_res, iou, tokens: queries })
     }
@@ -357,6 +384,29 @@ pub fn row(gpu: &Gpu, x: &Tensor, r: usize) -> Result<Tensor> {
     Ok(out)
 }
 
+/// Rows `idx` of `x`, in that order, as one `[idx.len(), cols]` tensor
+pub fn rows(gpu: &Gpu, x: &Tensor, idx: impl IntoIterator<Item = usize>) -> Result<Tensor> {
+    let idx: Vec<i32> = idx.into_iter().map(|r| r as i32).collect();
+    let d = x.cols();
+    assert!(idx.iter().all(|&r| (r as usize) < x.rows()), "rows {idx:?} of {} rows", x.rows());
+    if let [r] = idx[..] {
+        return row(gpu, x, r as usize);
+    }
+    let out = gpu.empty(&[idx.len(), d])?;
+    let idx = gpu.upload_buf(idx)?;
+    launch!(gpu, "gather_rows", ew(out.len()), B256, 0; &out, x, idx.slice::<i32>(), d)?;
+    Ok(out)
+}
+
+/// `x += b`, with `b` repeated over `x` when `x` stacks several prompts' copies of it
+fn add_tiled(gpu: &Gpu, x: &Tensor, b: &Tensor) -> Result<()> {
+    assert!(x.len().is_multiple_of(b.len()), "{:?} is not a stack of {:?}", x.shape(), b.shape());
+    if x.len() == b.len() {
+        return add_assign(gpu, x, b);
+    }
+    launch!(gpu, "add_row", ew(x.len()), B256, 0; x, b)
+}
+
 /// First index of the maximum, like `torch.argmax`
 pub fn argmax(v: &[f32]) -> usize {
     let mut best = 0;
@@ -368,74 +418,36 @@ pub fn argmax(v: &[f32]) -> usize {
     best
 }
 
-/// One low-res mask `[288^2]` clamped to +-32, as the next pass's mask input
-pub fn clamped_mask(gpu: &Gpu, low_res: &Tensor, index: usize) -> Result<Tensor> {
-    let n = LOW_RES * LOW_RES;
-    let out = gpu.empty(&[n])?;
-    gpu.copy_dtod(low_res.at(index * n), out.ptr(), n * 4)?;
-    launch!(gpu, "clamp", ew(n), B256, 0; &out, -32.0f32, 32.0f32)?;
+/// The best candidate of each prompt from a pass's `low_res [K * candidates, 288^2]`:
+/// row `best[b]` of prompt `b`'s candidates, as `[K, 288^2]`
+pub fn pick_masks(gpu: &Gpu, low_res: &Tensor, best: &[usize]) -> Result<Tensor> {
+    let candidates = low_res.rows() / best.len();
+    assert_eq!(low_res.rows(), best.len() * candidates, "{} candidates of {} prompts", low_res.rows(), best.len());
+    rows(gpu, low_res, best.iter().enumerate().map(|(b, &i)| b * candidates + i))
+}
+
+/// [`pick_masks`] clamped to +-32, as the next pass's mask inputs
+pub fn clamped_masks(gpu: &Gpu, low_res: &Tensor, best: &[usize]) -> Result<Tensor> {
+    let out = pick_masks(gpu, low_res, best)?;
+    launch!(gpu, "clamp", ew(out.len()), B256, 0; &out, -32.0f32, 32.0f32)?;
     Ok(out)
 }
 
-/// Upstream's `postprocess_masks` hole filling: background regions (logit <= 0), 8-connected,
-/// of at most `max_area` pixels become foreground (+10)
-pub fn fill_holes(logits: &mut [f32], side: usize, max_area: usize) {
-    let mut seen = vec![false; logits.len()];
-    let mut stack = Vec::new();
-    let mut component = Vec::new();
-    for start in 0..logits.len() {
-        if seen[start] || logits[start] > 0.0 {
-            continue;
-        }
-        seen[start] = true;
-        stack.push(start);
-        component.clear();
-        while let Some(p) = stack.pop() {
-            component.push(p);
-            let (y, x) = ((p / side) as isize, (p % side) as isize);
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let (ny, nx) = (y + dy, x + dx);
-                    if ny < 0 || nx < 0 || ny >= side as isize || nx >= side as isize {
-                        continue;
-                    }
-                    let q = ny as usize * side + nx as usize;
-                    if !seen[q] && logits[q] <= 0.0 {
-                        seen[q] = true;
-                        stack.push(q);
-                    }
-                }
-            }
-        }
-        if component.len() <= max_area {
-            for &p in &component {
-                logits[p] = 10.0;
-            }
-        }
-    }
-}
-
-/// Hole-fills `n` low-res masks `[n, 288^2]` on the host, upsamples them bilinearly to
-/// the original size and thresholds at 0, returning `[n, height * width]` 0/1 bytes
-/// into `out`, which must hold `n * width * height` bytes
-pub fn full_res_masks(
-    gpu: &Gpu,
-    low_res: &Tensor,
-    n: usize,
-    width: usize,
-    height: usize,
-    out: &mut [u8],
-) -> Result<()> {
-    let side = LOW_RES;
-    assert_eq!(low_res.len(), n * side * side);
-    let mut logits = gpu.download(low_res)?;
-    for m in logits.chunks_mut(side * side) {
-        fill_holes(m, side, 256);
-    }
-    let filled = gpu.upload(logits, &[n, side * side])?;
-    let mask = MaskResize::new(gpu, n, width, height)?.all(gpu, &filled)?;
-    ensure!(out.len() == mask.bytes(), "mask buffer of {} bytes for {} pixels", out.len(), mask.bytes());
-    gpu.download_into(&mask, out)
+/// Upstream's `postprocess_masks` hole filling, in place on the GPU: in each low-res
+/// mask of `logits [n, 288^2]`, background regions (logit <= 0), 8-connected, of at most
+/// `max_area` pixels become foreground (+10). Every mask goes through the same four
+/// launches, so a batch costs what one mask does until the GPU fills up
+pub fn fill_holes(gpu: &Gpu, logits: &Tensor, max_area: usize) -> Result<()> {
+    let n = logits.len();
+    assert!(n.is_multiple_of(LOW_RES * LOW_RES), "{:?} is not a stack of low-res masks", logits.shape());
+    let labels = gpu.alloc_bytes(n * 4)?;
+    let area = gpu.alloc_bytes(n * 4)?;
+    gpu.memset_zero(area.ptr(), n * 4)?;
+    let (labels, area) = (labels.slice::<u32>(), area.slice::<u32>());
+    launch!(gpu, "holes_init", ew(n), B256, 0; labels, logits, LOW_RES)?;
+    launch!(gpu, "holes_merge", ew(n), B256, 0; labels, logits, LOW_RES)?;
+    launch!(gpu, "holes_count", ew(n), B256, 0; labels, area)?;
+    launch!(gpu, "holes_fill", ew(n), B256, 0; logits, labels, area, max_area)
 }
 
 /// Low-res mask logits `[n, 288^2]` to full-size 0/1 masks: bilinear upsampling to
@@ -494,5 +506,113 @@ impl MaskResize {
         launch!(gpu, "resize_bilinear", ew(n), B256, 0; up, input, LOW_RES, LOW_RES, self.height, self.width)?;
         // sigmoid(x) > 0.5 is x > 0
         launch!(gpu, "threshold_u8", ew(n), B256, 0; dst, up, 0.0f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eyre::Result;
+
+    use super::{LOW_RES, fill_holes};
+    use crate::gpu::{Gpu, Precision};
+
+    /// The host flood fill the GPU fill replaced: background regions (logit <= 0),
+    /// 8-connected, of at most `max_area` pixels become foreground (+10). NaN is
+    /// foreground, as upstream's `mask <= mask_threshold`; the old fill let a NaN pixel
+    /// start a region, so its regions depended on scan order
+    fn fill_holes_host(logits: &mut [f32], side: usize, max_area: usize) {
+        let mut seen = vec![false; logits.len()];
+        let mut stack = Vec::new();
+        let mut component = Vec::new();
+        for start in 0..logits.len() {
+            if seen[start] || logits[start] > 0.0 || logits[start].is_nan() {
+                continue;
+            }
+            seen[start] = true;
+            stack.push(start);
+            component.clear();
+            while let Some(p) = stack.pop() {
+                component.push(p);
+                let (y, x) = ((p / side) as isize, (p % side) as isize);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (ny, nx) = (y + dy, x + dx);
+                        if ny < 0 || nx < 0 || ny >= side as isize || nx >= side as isize {
+                            continue;
+                        }
+                        let q = ny as usize * side + nx as usize;
+                        if !seen[q] && logits[q] <= 0.0 {
+                            seen[q] = true;
+                            stack.push(q);
+                        }
+                    }
+                }
+            }
+            if component.len() <= max_area {
+                for &p in &component {
+                    logits[p] = 10.0;
+                }
+            }
+        }
+    }
+
+    /// Logits with regions of many sizes and shapes: box-blurred noise of growing radius,
+    /// with NaN pixels, then an all-background and an all-foreground mask
+    fn logits(masks: usize) -> Vec<f32> {
+        let side = LOW_RES;
+        let mut state = 0x9e37_79b9_u32;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as f32 / u32::MAX as f32 - 0.5
+        };
+        let mut out = Vec::new();
+        for m in 0..masks {
+            let raw: Vec<f32> = (0..side * side).map(|_| noise()).collect();
+            let r = 1 + m as isize;
+            let last = side as isize - 1;
+            let mut mask = vec![0f32; side * side];
+            for y in 0..side as isize {
+                for x in 0..side as isize {
+                    let mut sum = 0.0;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            let (yy, xx) = ((y + dy).clamp(0, last), (x + dx).clamp(0, last));
+                            sum += raw[yy as usize * side + xx as usize];
+                        }
+                    }
+                    mask[y as usize * side + x as usize] = sum + 0.05 * m as f32;
+                }
+            }
+            for p in (m * 7919..side * side).step_by(9973) {
+                mask[p] = f32::NAN;
+            }
+            out.extend(mask);
+        }
+        out.extend(vec![-1.0; side * side]);
+        out.extend(vec![1.0; side * side]);
+        out
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA GPU"]
+    fn gpu_fill_matches_the_host_flood_fill() -> Result<()> {
+        let gpu = Gpu::new(0, Precision::Bf16)?;
+        let side = LOW_RES;
+        let host = logits(6);
+        let n = host.len() / (side * side);
+        let mut want = host.clone();
+        want.chunks_mut(side * side).for_each(|m| fill_holes_host(m, side, 256));
+        let changed = want.iter().zip(&host).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert!(changed > 1000, "the fixture fills only {changed} pixels");
+
+        let t = gpu.upload(host, &[n, side * side])?;
+        fill_holes(&gpu, &t, 256)?;
+        let got = gpu.download(&t)?;
+        assert_eq!(got.len(), want.len());
+        let wrong = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(wrong, 0, "{wrong} of {} pixels differ from the host fill", got.len());
+        Ok(())
     }
 }
