@@ -186,6 +186,25 @@ impl Model {
         let m = py.detach(|| self.lock().segment_points(&emb.0, &points)).map_err(error)?;
         Ok((m.score, m.mask.into()))
     }
+
+    /// `prompts` holds each object's `(x, y, positive)` clicks in pixels; returns each
+    /// prompt's predicted IoU and their masks as `n * height * width` bytes
+    fn segment_points_batch(
+        &self,
+        py: Python<'_>,
+        emb: &Embedding,
+        prompts: Vec<Vec<(f32, f32, bool)>>,
+    ) -> PyResult<(Vec<f32>, HostBuffer)> {
+        let prompts: Vec<Vec<PointPrompt>> = prompts
+            .into_iter()
+            .map(|points| points.into_iter().map(|(x, y, positive)| PointPrompt::new(x, y, positive)).collect())
+            .collect::<eyre::Result<_>>()
+            .map_err(error)?;
+        let refs: Vec<&[PointPrompt]> = prompts.iter().map(Vec::as_slice).collect();
+        let masks = py.detach(|| self.lock().segment_points_batch(&emb.0, &refs)).map_err(error)?;
+        let (scores, masks) = masks.into_parts();
+        Ok((scores, masks.into()))
+    }
 }
 
 /// Tints each `height * width` mask over the RGB image, as the CLI's `--out` does
@@ -227,6 +246,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_image, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SCORE_THRESHOLD", sam3rs::SCORE_THRESHOLD)?;
+    m.add("POINT_BATCH", sam3rs::POINT_BATCH)?;
     m.add("VISUAL_PROMPT", sam3rs::VISUAL_PROMPT)?;
     m.add("MODEL_REPO", sam3rs::MODEL_REPO)?;
     Ok(())

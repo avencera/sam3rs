@@ -6,16 +6,31 @@
 //! RGB because the `image` crate's JPEG decoder differs from PIL's libjpeg-turbo on a few
 //! percent of bytes. Needs a CUDA GPU and the weights from scripts/fetch-models.sh. Both
 //! precision modes must pass the same gate
+//!
+//! The batched point API is checked against single calls on every image: the fixture's
+//! point prompt mixed into more clicks than one decoder batch holds, with several click
+//! counts interleaved, must give each object the score and mask its own call gives. FP32
+//! runs the same math either way, so it must match to 1e-4. TF32 and BF16 must match at
+//! the gate above, except on clicks whose single call already misses the FP32 result by
+//! more than that: stacking prompts changes which GEMM kernels cuBLAS picks, and on a
+//! background click with a near-zero first pass the second pass is ill-conditioned (one
+//! such click scored 0.09 in FP32, 0.17 in TF32 and 0.60 in BF16)
 
 use std::path::Path;
 
 use eyre::{Result, ensure, eyre};
 use safetensors::{Dtype, SafeTensors};
-use sam3rs::{BoxPrompt, PointPrompt, Precision, RgbImage, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT};
+use sam3rs::{
+    BoxPrompt, Embedding, POINT_BATCH, PointMask, PointPrompt, Precision, RgbImage, SCORE_THRESHOLD, Sam3,
+    VISUAL_PROMPT,
+};
 use serde_json::Value;
 
 const SCORE_TOL: f32 = 0.01;
 const MIN_IOU: f64 = 0.99;
+/// FP32 batched points against single calls
+const FP32_SCORE_TOL: f32 = 1e-4;
+const FP32_MIN_IOU: f64 = 0.999;
 /// Box corner tolerance as a fraction of the image's longer side
 const BOX_TOL: f32 = 0.005;
 
@@ -26,6 +41,10 @@ fn fixture(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
         Dtype::U8 => t.data().iter().map(|&b| b as f32).collect(),
         d => return Err(eyre!("{name}: unsupported {d:?}")),
     })
+}
+
+fn as_f32(mask: &[u8]) -> Vec<f32> {
+    mask.iter().map(|&b| b as f32).collect()
 }
 
 /// IoU of two masks of the same size; two empty masks match
@@ -62,13 +81,20 @@ fn matches_pytorch() -> Result<()> {
         return Err(eyre!("missing weights, run scripts/fetch-models.sh"));
     }
     let mut failures = Vec::new();
+    // FP32 single-call results of the batched-points check, per image, which the reduced
+    // precisions are judged against; FP32 has to run first
+    let mut truth = Vec::new();
     for precision in [Precision::Fp32, Precision::Tf32, Precision::Bf16] {
         println!("== {precision:?}");
         let model = Sam3::load(model_dir, 0, precision)?;
-        let worst = check(&model, &mut failures, precision)?;
+        let worst = check(&model, &mut failures, precision, &mut truth)?;
         println!(
             "worst over {} checks: score delta {:.4}, box delta {:.2} px, mask iou {:.5}",
             worst.checks, worst.score, worst.box_px, worst.iou
+        );
+        println!(
+            "batched points against single calls, worst over {} objects ({} excused): score delta {:.5}, mask iou {:.5}",
+            worst.batch_checks, worst.batch_excused, worst.batch_score, worst.batch_iou
         );
     }
     assert!(failures.is_empty(), "parity failures:\n{}", failures.join("\n"));
@@ -81,17 +107,35 @@ struct Worst {
     score: f32,
     box_px: f32,
     iou: f64,
+    batch_checks: usize,
+    batch_excused: usize,
+    batch_score: f32,
+    batch_iou: f64,
 }
 
 /// Runs every fixture prompt, pushing the checks that miss the gate onto `failures`
-fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Result<Worst> {
+fn check(
+    model: &Sam3,
+    failures: &mut Vec<String>,
+    precision: Precision,
+    truth: &mut Vec<Vec<PointMask>>,
+) -> Result<Worst> {
     let mut fixtures: Vec<_> =
         std::fs::read_dir("models/parity")?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
     fixtures.sort();
     assert!(!fixtures.is_empty(), "no fixtures, run scripts/reference.py dump");
 
-    let mut worst = Worst { checks: 0, score: 0.0, box_px: 0.0, iou: 1.0 };
-    for path in fixtures {
+    let mut worst = Worst {
+        checks: 0,
+        score: 0.0,
+        box_px: 0.0,
+        iou: 1.0,
+        batch_checks: 0,
+        batch_excused: 0,
+        batch_score: 0.0,
+        batch_iou: 1.0,
+    };
+    for (index, path) in fixtures.into_iter().enumerate() {
         let bytes = std::fs::read(&path)?;
         let st = SafeTensors::deserialize(&bytes)?;
         let (_, header) = SafeTensors::read_metadata(&bytes)?;
@@ -104,6 +148,7 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
         let emb = model.encode(&img)?;
         let hw = width * height;
         let box_tol = BOX_TOL * width.max(height) as f32;
+        let mut fixture_points = Vec::new();
 
         for prompt in meta["prompts"].as_array().unwrap() {
             let key = prompt["name"].as_str().unwrap().replace(' ', "_");
@@ -126,6 +171,7 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
                     })
                     .collect::<Result<_>>()?;
                 let got = model.segment_points(&emb, &points)?;
+                fixture_points.push(points.clone());
                 let want_iou = fixture(&st, &format!("{key}.iou"))?;
                 let best = (0..3).fold(0, |b, i| if want_iou[i] > want_iou[b] { i } else { b });
                 let want_mask = fixture(&st, &format!("{key}.masks"))?;
@@ -184,8 +230,102 @@ fn check(model: &Sam3, failures: &mut Vec<String>, precision: Precision) -> Resu
                 );
             }
         }
+        if precision == Precision::Fp32 {
+            truth.push(Vec::new());
+        }
+        let truth = truth.get_mut(index).ok_or_else(|| eyre!("FP32 has to run first"))?;
+        let batch = Batch { extra: &fixture_points, precision, truth };
+        check_batch(model, &emb, batch, &mut worst, &mut |ok, what| {
+            let line = format!("{image}/batched points: {what}");
+            println!("{}{line}", if ok { "" } else { "FAIL " });
+            if !ok {
+                failures.push(format!("{precision:?} {line}"));
+            }
+        })?;
     }
     Ok(worst)
+}
+
+/// What [`check_batch`] runs on and against
+struct Batch<'a> {
+    /// The fixture's point prompts, mixed into the batch
+    extra: &'a [Vec<PointPrompt>],
+    precision: Precision,
+    /// FP32 single-call results, written by the FP32 run and read by the others
+    truth: &'a mut Vec<PointMask>,
+}
+
+/// [`Sam3::segment_points_batch`] against one [`Sam3::segment_points`] call per prompt.
+/// The batch holds `extra` and more than [`POINT_BATCH`] grid clicks, plus prompts of two
+/// and three clicks with background ones, interleaved, so it splits into several decoder
+/// batches and its click-count groups are not runs of the input
+fn check_batch(
+    model: &Sam3,
+    emb: &Embedding,
+    Batch { extra, precision, truth }: Batch,
+    worst: &mut Worst,
+    check: &mut dyn FnMut(bool, String),
+) -> Result<()> {
+    let (w, h) = (emb.width() as f32, emb.height() as f32);
+    let at = |fx: f32, fy: f32, positive: bool| PointPrompt::new(fx * w, fy * h, positive);
+    let grid = POINT_BATCH + 4;
+    let mut prompts: Vec<Vec<PointPrompt>> = Vec::new();
+    for i in 0..grid {
+        let (fx, fy) = ((i % 5) as f32 * 0.2 + 0.1, (i / 5) as f32 / (grid / 5 + 1) as f32 + 0.1);
+        prompts.push(vec![at(fx, fy, true)?]);
+        match i % 7 {
+            2 => prompts.push(vec![at(fx, fy, true)?, at(fx + 0.05, fy + 0.05, false)?]),
+            5 => prompts.push(vec![at(fx, fy, true)?, at(fx + 0.04, fy, true)?, at(fx, fy + 0.06, false)?]),
+            _ => {}
+        }
+    }
+    prompts.splice(3..3, extra.iter().cloned());
+
+    // a batch of one is the single call itself
+    let one = model.segment_points_batch(emb, &[&prompts[0]])?;
+    let single = model.segment_points(emb, &prompts[0])?;
+    check(
+        one.len() == 1 && one.scores()[0].to_bits() == single.score.to_bits() && one.mask(0) == &single.mask[..],
+        format!("batch of 1, score {:.5} vs {:.5}", one.scores()[0], single.score),
+    );
+    let empty = model.segment_points_batch(emb, &[])?;
+    check(empty.is_empty() && empty.masks().is_empty(), format!("batch of 0 gave {} masks", empty.len()));
+
+    let refs: Vec<&[PointPrompt]> = prompts.iter().map(Vec::as_slice).collect();
+    let batch = model.segment_points_batch(emb, &refs)?;
+    ensure!(batch.len() == prompts.len(), "{} masks for {} prompts", batch.len(), prompts.len());
+    ensure!(batch.masks().len() == prompts.len() * emb.width() * emb.height(), "mask buffer size");
+    let fp32 = precision == Precision::Fp32;
+    let (score_tol, min_iou) = if fp32 { (FP32_SCORE_TOL, FP32_MIN_IOU) } else { (SCORE_TOL, MIN_IOU) };
+    let mut excused = 0;
+    for (i, points) in prompts.iter().enumerate() {
+        let single = model.segment_points(emb, points)?;
+        let mask_iou = iou(batch.mask(i), &as_f32(&single.mask))?;
+        let dscore = (batch.scores()[i] - single.score).abs();
+        let label = format!("prompt {i} ({} clicks)", points.len());
+        let scores = format!("score {:.5} vs {:.5}, mask iou {mask_iou:.5}", batch.scores()[i], single.score);
+        let ok = mask_iou >= min_iou && dscore <= score_tol;
+        if fp32 {
+            truth.push(single);
+        } else if !ok {
+            // ill-conditioned at this precision: the single call itself is off FP32
+            let want = truth.get(i).ok_or_else(|| eyre!("no FP32 result for prompt {i}"))?;
+            let (off_score, off_iou) = ((single.score - want.score).abs(), iou(&single.mask, &as_f32(&want.mask))?);
+            if off_score.is_finite() && (off_score > SCORE_TOL || off_iou < MIN_IOU) {
+                excused += 1;
+                worst.batch_excused += 1;
+                println!("{label}: excused, {scores}; the single call is off FP32 by {off_score:.4}, iou {off_iou:.5}");
+                continue;
+            }
+        }
+        worst.batch_checks += 1;
+        worst.batch_score = worse(worst.batch_score, dscore);
+        worst.batch_iou = worst.batch_iou.min(mask_iou);
+        check(ok, format!("{label} {scores}"));
+    }
+    // a gate that excuses most prompts would pass anything
+    check(excused * 4 <= prompts.len(), format!("{excused} of {} prompts excused", prompts.len()));
+    Ok(())
 }
 
 #[test]

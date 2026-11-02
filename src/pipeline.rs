@@ -8,12 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eyre::{Result, ensure};
 
 use crate::detector::{BoxPrompt, Detector, DetectorImage, QUERIES};
-use crate::gpu::{Gpu, Precision, launch};
+use crate::gpu::{Arg, Gpu, Precision, Tensor, launch};
 use crate::image::{RgbImage, preprocess};
 use crate::masks::{MaskBuffer, MaskPool};
 use crate::nvtx::range;
 use crate::ops::{B256, ew, upload_i32};
-use crate::point::{LOW_RES, MaskResize, PointDecoder, PointImage, PointPrompt, argmax, clamped_mask, full_res_masks};
+use crate::point::{
+    LOW_RES, MaskResize, PointDecoder, PointImage, PointPrompt, argmax, clamped_masks, fill_holes, pick_masks,
+};
 use crate::text::{TextEncoder, TextFeatures};
 use crate::tokenizer::Tokenizer;
 use crate::video::Tracker;
@@ -133,6 +135,59 @@ pub struct PointMask {
     pub score: f32,
     /// `height * width` bytes, 1 = foreground
     pub mask: MaskBuffer,
+}
+
+/// Largest background region of a point mask that hole filling turns into foreground,
+/// in low-res pixels, as upstream's `postprocess_masks`
+const HOLE_AREA: usize = 256;
+
+/// Most prompts of equal click counts [`Sam3::segment_points_batch`] decodes together.
+/// Batches of 32 measured no faster per prompt than 16 on an RTX 5090, and every
+/// decoder activation grows with the batch
+pub const POINT_BATCH: usize = 16;
+
+/// One mask per prompt of [`Sam3::segment_points_batch`], in prompt order, with all the
+/// masks in one buffer as in [`Detections`]
+#[derive(Clone, Debug, Default)]
+pub struct PointMasks {
+    scores: Vec<f32>,
+    masks: MaskBuffer,
+}
+
+impl PointMasks {
+    /// Number of prompts
+    pub fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    /// Whether there were no prompts
+    pub fn is_empty(&self) -> bool {
+        self.scores.is_empty()
+    }
+
+    /// Predicted IoU of each prompt's chosen mask
+    pub fn scores(&self) -> &[f32] {
+        &self.scores
+    }
+
+    /// Mask of prompt `i`: `height * width` bytes, 1 = foreground
+    ///
+    /// Panics if `i` is out of range
+    pub fn mask(&self, i: usize) -> &[u8] {
+        assert!(i < self.len(), "mask {i} of {} prompts", self.len());
+        let pixels = self.masks.len() / self.len();
+        &self.masks[i * pixels..][..pixels]
+    }
+
+    /// Every mask in prompt order: `len * height * width` bytes, 1 = foreground
+    pub fn masks(&self) -> &[u8] {
+        &self.masks
+    }
+
+    /// Splits into the scores and the mask buffer of [`PointMasks::masks`]
+    pub fn into_parts(self) -> (Vec<f32>, MaskBuffer) {
+        (self.scores, self.masks)
+    }
 }
 
 /// The loaded model on one GPU
@@ -311,22 +366,85 @@ impl Sam3 {
     /// and osam do), returning the second pass's best mask after hole filling
     pub fn segment_points(&self, emb: &Embedding, points: &[PointPrompt]) -> Result<PointMask> {
         ensure!(!points.is_empty(), "segment_points needs at least one point");
+        let (mut scores, mask) = self.segment_points_batch(emb, &[points])?.into_parts();
+        Ok(PointMask { score: scores.remove(0), mask })
+    }
+
+    /// [`Self::segment_points`] for several independent objects at once: prompt `i`'s
+    /// clicks give object `i`, with the score and mask `segment_points` would give it
+    /// alone, as upstream `predict_inst` does with a batch of prompts
+    ///
+    /// Prompts with the same number of clicks run through each decoder pass together, up
+    /// to [`POINT_BATCH`] at a time, so the decoder's per-call costs are paid once per
+    /// batch rather than once per object. Each prompt needs at least one click; no prompts
+    /// give an empty result. Every mask is `height * width` bytes of host memory, so a
+    /// large image times many prompts takes a lot of it: 50 MB a mask at 8160x6144
+    pub fn segment_points_batch(&self, emb: &Embedding, prompts: &[&[PointPrompt]]) -> Result<PointMasks> {
+        ensure!(prompts.iter().all(|p| !p.is_empty()), "every point prompt needs at least one point");
         self.check(emb)?;
+        if prompts.is_empty() {
+            return Ok(PointMasks::default());
+        }
         let gpu = &self.gpu;
         let _r = range(c"segment_points");
         let (w, h) = (emb.width, emb.height);
-        let reserved = self.masks.reserve(w * h);
-        let first = self.point.forward(gpu, &emb.point, points, w, h, None)?;
-        let mask_input = clamped_mask(gpu, &first.low_res, argmax(&first.iou))?;
-        let second = self.point.forward(gpu, &emb.point, points, w, h, Some(&mask_input))?;
-        let best = argmax(&second.iou);
+        let plane = w * h;
+        let reserved = self.masks.reserve(prompts.len() * plane);
 
-        let _r = range(c"postprocess");
-        let side = LOW_RES * LOW_RES;
-        let low_res = gpu.empty(&[1, side])?;
-        gpu.copy_dtod(second.low_res.at(best * side), low_res.ptr(), side * 4)?;
-        let mut mask = self.masks.take(reserved, w * h)?;
-        full_res_masks(gpu, &low_res, 1, w, h, &mut mask)?;
-        Ok(PointMask { score: second.iou[best], mask })
+        // runs of equal click counts, in input order within each run, so the common case
+        // of one count is one run of consecutive masks
+        let mut order: Vec<usize> = (0..prompts.len()).collect();
+        order.sort_by_key(|&i| prompts[i].len());
+        let mut scores = vec![f32::NAN; prompts.len()];
+        let mut reserved = Some(reserved);
+        let mut masks = MaskBuffer::default();
+        for batch in
+            order.chunk_by(|&a, &b| prompts[a].len() == prompts[b].len()).flat_map(|run| run.chunks(POINT_BATCH))
+        {
+            let points: Vec<&[PointPrompt]> = batch.iter().map(|&i| prompts[i]).collect();
+            let (best, ious) = self.decode_points(emb, &points)?;
+            for (&i, iou) in batch.iter().zip(ious) {
+                scores[i] = iou;
+            }
+
+            let _r = range(c"postprocess");
+            fill_holes(gpu, &best, HOLE_AREA)?;
+            let resize = MaskResize::new(gpu, batch.len(), w, h)?;
+            let group = gpu.alloc_bytes(resize.group() * plane)?;
+            for part in resize.groups() {
+                resize.run(gpu, &best, part.clone(), Arg::slice(group.ptr(), part.len() * plane))?;
+                if let Some(reserved) = reserved.take() {
+                    // taken after the first launches, so a buffer still faulting in
+                    // overlaps the GPU work
+                    masks = self.masks.take(reserved, prompts.len() * plane)?;
+                }
+                // consecutive prompts download together
+                let ids = &batch[part];
+                let mut j = 0;
+                for run in ids.chunk_by(|&a, &b| b == a + 1) {
+                    let dst = &mut masks[run[0] * plane..][..run.len() * plane];
+                    gpu.download_range_into(&group, j * plane, dst)?;
+                    j += run.len();
+                }
+            }
+        }
+        Ok(PointMasks { scores, masks })
+    }
+
+    /// Both decoder passes over prompts with equal click counts: the best second-pass
+    /// mask of each `[K, 288^2]`, before hole filling, and its predicted IoU
+    fn decode_points(&self, emb: &Embedding, prompts: &[&[PointPrompt]]) -> Result<(Tensor, Vec<f32>)> {
+        let gpu = &self.gpu;
+        let size = (emb.width, emb.height);
+        let img = &emb.point;
+        // mask tokens 1 to 3, the multimask candidates
+        let best = |iou: &[f32]| -> Vec<usize> { iou.chunks(4).map(|c| argmax(&c[1..])).collect() };
+        let first = self.point.decode_batch(gpu, &img.embed, img, prompts, size, None, 1)?;
+        let mask_input = clamped_masks(gpu, &first.low_res, &best(&gpu.download(&first.iou)?))?;
+        let second = self.point.decode_batch(gpu, &img.embed, img, prompts, size, Some(&mask_input), 1)?;
+        let iou = gpu.download(&second.iou)?;
+        let picks = best(&iou);
+        let scores = picks.iter().enumerate().map(|(b, &i)| iou[b * 4 + 1 + i]).collect();
+        Ok((pick_masks(gpu, &second.low_res, &picks)?, scores))
     }
 }

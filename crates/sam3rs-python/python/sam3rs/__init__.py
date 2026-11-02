@@ -11,6 +11,10 @@ Encode an image once, then answer any number of text, box and point prompts::
 
     click = model.segment_points(embedding, [(1439, 504)])
     print(click.score, click.mask.sum())
+
+    # one object per click, in one call
+    objects = model.segment_points_batch(embedding, [(1439, 504), (600, 900)])
+    print(objects.scores, objects.masks.shape)
 """
 
 from __future__ import annotations
@@ -30,10 +34,12 @@ from ._errors import Sam3rsError
 
 __all__ = [
     "MODEL_REPO",
+    "POINT_BATCH",
     "SCORE_THRESHOLD",
     "Detections",
     "Embedding",
     "PointMask",
+    "PointMasks",
     "Precision",
     "Sam3",
     "Sam3rsError",
@@ -49,6 +55,8 @@ __version__: str = _native.__version__
 MODEL_REPO: str = _native.MODEL_REPO
 #: Detections scoring at or below this are dropped, as in upstream ``Sam3Processor``
 SCORE_THRESHOLD: float = _native.SCORE_THRESHOLD
+#: Most prompts with the same click count :meth:`Sam3.segment_points_batch` decodes at once
+POINT_BATCH: int = _native.POINT_BATCH
 
 Precision = Literal["bf16", "tf32", "fp32"]
 #: An ``(height, width, 3)`` uint8 RGB array, or a path to a PNG or JPEG
@@ -81,6 +89,19 @@ class PointMask:
     score: float
     #: ``(height, width)`` bool
     mask: npt.NDArray[np.bool_]
+
+
+@dataclass(frozen=True)
+class PointMasks:
+    """One mask per prompt from :meth:`Sam3.segment_points_batch`, in prompt order."""
+
+    #: ``(k,)`` float32 predicted IoU of each prompt's chosen mask
+    scores: npt.NDArray[np.float32]
+    #: ``(k, height, width)`` bool
+    masks: npt.NDArray[np.bool_]
+
+    def __len__(self) -> int:
+        return len(self.scores)
 
 
 class Sam3:
@@ -170,19 +191,41 @@ class Sam3:
         xy = _rows(points, 2, "points")
         if not xy:
             raise ValueError("give at least one point")
-        if labels is None:
-            flags = [True] * len(xy)
-        else:
-            values = np.asarray(labels).reshape(-1)
-            # SAM's -1 padding label would otherwise read as foreground
-            if not np.isin(values, (0, 1)).all():
-                raise ValueError(f"labels must be 0 (background) or 1 (foreground), got {values.tolist()}")
-            flags = [bool(v) for v in values]
-        if len(flags) != len(xy):
-            raise ValueError(f"{len(xy)} points but {len(flags)} labels")
+        flags = _labels(labels, len(xy), "labels")
         score, mask = self._native.segment_points(embedding, [(x, y, f) for (x, y), f in zip(xy, flags)])
         h, w = embedding.height, embedding.width
         return PointMask(score=score, mask=_bool_view(mask, 1, h, w)[0])
+
+    def segment_points_batch(
+        self,
+        embedding: Embedding,
+        points: npt.ArrayLike,
+        labels: npt.ArrayLike | None = None,
+    ) -> PointMasks:
+        """Segment several independent objects in one call, one per prompt.
+
+        ``points`` holds one prompt per object: a ``(k, n, 2)`` array of ``(x, y)``
+        pixels, a ``(k, 2)`` array of single clicks, or a sequence of ``k`` prompts of
+        ``(n_i, 2)`` clicks each when their counts differ. ``labels`` matches it with
+        ``(k, n)``, ``(k,)`` or one sequence per prompt, 1 for foreground and 0 for
+        background, and defaults to all foreground. Each object gets the score and mask
+        :meth:`segment_points` would give its clicks alone, as upstream's ``predict_inst``
+        with ``point_coords`` of shape ``(k, n, 2)``, but in a fraction of the time of
+        ``k`` calls. Every mask is a full-size array, so many prompts on a large image
+        take a lot of memory: 50 MB a mask at 8160x6144.
+        """
+        prompts = _prompts(points)
+        if labels is None:
+            flags = [[True] * len(xy) for xy in prompts]
+        else:
+            per_prompt = list(labels)  # type: ignore[arg-type]
+            if len(per_prompt) != len(prompts):
+                raise ValueError(f"{len(prompts)} prompts but {len(per_prompt)} label rows")
+            flags = [_labels(row, len(xy), f"labels[{i}]") for i, (row, xy) in enumerate(zip(per_prompt, prompts))]
+        clicks = [[(x, y, f) for (x, y), f in zip(xy, fs)] for xy, fs in zip(prompts, flags)]
+        scores, masks = self._native.segment_points_batch(embedding, clicks)
+        n, h, w = len(scores), embedding.height, embedding.width
+        return PointMasks(scores=np.asarray(scores, dtype=np.float32), masks=_bool_view(masks, n, h, w))
 
 
 def load_image(path: str | os.PathLike[str]) -> npt.NDArray[np.uint8]:
@@ -218,6 +261,40 @@ def _bool_view(buffer: _native.HostBuffer, n: int, h: int, w: int) -> npt.NDArra
     # the runtime writes only 0 and 1, which are valid numpy bools, so the masks are
     # viewed in place: a converted copy is another fresh array of n full-size masks
     return np.frombuffer(buffer, dtype=np.bool_).reshape(n, h, w)
+
+
+def _labels(labels: npt.ArrayLike | None, n: int, name: str) -> list[bool]:
+    if labels is None:
+        return [True] * n
+    values = np.asarray(labels).reshape(-1)
+    # SAM's -1 padding label would otherwise read as foreground
+    if not np.isin(values, (0, 1)).all():
+        raise ValueError(f"{name} must be 0 (background) or 1 (foreground), got {values.tolist()}")
+    if len(values) != n:
+        raise ValueError(f"{n} points but {len(values)} {name}")
+    return [bool(v) for v in values]
+
+
+def _prompts(points: npt.ArrayLike) -> list[list[tuple[float, ...]]]:
+    try:
+        array = np.asarray(points, dtype=np.float32)
+    except ValueError:
+        # prompts with different click counts don't stack into one array
+        array = None
+    if array is not None:
+        if array.size == 0:
+            return []
+        if array.ndim == 2 and array.shape[1] == 2:
+            return [[(float(x), float(y))] for x, y in array]
+        if array.ndim != 3 or array.shape[2] != 2:
+            raise ValueError(
+                f"points must be (k, n, 2), (k, 2) or one (n, 2) prompt per object, got shape {array.shape}"
+            )
+    prompts = [_rows(p, 2, f"points[{i}]") for i, p in enumerate(points)]  # type: ignore[arg-type]
+    for i, xy in enumerate(prompts):
+        if not xy:
+            raise ValueError(f"points[{i}] has no clicks")
+    return prompts
 
 
 def _rgb(image: npt.ArrayLike) -> npt.NDArray[np.uint8]:

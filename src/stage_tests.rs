@@ -7,14 +7,14 @@
 
 use std::path::PathBuf;
 
-use eyre::{Result, eyre};
+use eyre::{Result, ensure, eyre};
 use safetensors::{Dtype, SafeTensors};
 
 use crate::detector::{BoxPrompt, Detector};
 use crate::gpu::{Gpu, Precision, Tensor, launch};
 use crate::image::{RgbImage, preprocess};
 use crate::ops::{B256, ew};
-use crate::point::{PointDecoder, PointPrompt, clamped_mask, full_res_masks};
+use crate::point::{LOW_RES, MaskResize, PointDecoder, PointPrompt, clamped_masks, fill_holes};
 use crate::text::TextEncoder;
 use crate::tokenizer::Tokenizer;
 use crate::vision::{Backbone, Fpn, Neck, Trunk};
@@ -117,18 +117,23 @@ fn stages() -> Result<()> {
             })
             .collect::<Result<_>>()?;
         println!("-- {key} ({} points)", points.len());
-        let first = point_decoder.forward(&gpu, &point_img, &points, img.width(), img.height(), None)?;
-        println!("  iou_first {:?} vs {:?}", first.iou, fixture(&st, &format!("{key}.iou_first"))?);
-        let clamped: Vec<f32> = gpu.download(&first.low_res)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
+        let size = (img.width(), img.height());
+        let decode = |mask_input: Option<&Tensor>| -> Result<(Tensor, Vec<f32>)> {
+            let out = point_decoder.decode(&gpu, &point_img.embed, &point_img, &points, size, mask_input, 1)?;
+            Ok((out.low_res, gpu.download(&out.iou)?[1..].to_vec()))
+        };
+        let (low_first, iou_first) = decode(None)?;
+        println!("  iou_first {iou_first:?} vs {:?}", fixture(&st, &format!("{key}.iou_first"))?);
+        let clamped: Vec<f32> = gpu.download(&low_first)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
         compare("low_first", &clamped, &fixture(&st, &format!("{key}.low_res_first"))?);
-        let best = (0..3).max_by(|a, b| first.iou[*a].total_cmp(&first.iou[*b])).unwrap();
-        let mask_input = clamped_mask(&gpu, &first.low_res, best)?;
-        let second = point_decoder.forward(&gpu, &point_img, &points, img.width(), img.height(), Some(&mask_input))?;
-        println!("  iou {:?} vs {:?}", second.iou, fixture(&st, &format!("{key}.iou"))?);
-        let clamped: Vec<f32> = gpu.download(&second.low_res)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
+        let best = (0..3).max_by(|a, b| iou_first[*a].total_cmp(&iou_first[*b])).unwrap();
+        let mask_input = clamped_masks(&gpu, &low_first, &[best])?;
+        let (low_res, iou) = decode(Some(&mask_input))?;
+        println!("  iou {iou:?} vs {:?}", fixture(&st, &format!("{key}.iou"))?);
+        let clamped: Vec<f32> = gpu.download(&low_res)?.iter().map(|v| v.clamp(-32.0, 32.0)).collect();
         compare("low_res", &clamped, &fixture(&st, &format!("{key}.low_res"))?);
         let mut masks = vec![0u8; 3 * img.width() * img.height()];
-        full_res_masks(&gpu, &second.low_res, 3, img.width(), img.height(), &mut masks)?;
+        full_res_masks(&gpu, &low_res, 3, img.width(), img.height(), &mut masks)?;
         let want = fixture(&st, &format!("{key}.masks"))?;
         let hw = img.width() * img.height();
         for m in 0..3 {
@@ -187,4 +192,17 @@ fn stages() -> Result<()> {
         println!("  kept {kept:?}");
     }
     Ok(())
+}
+
+/// Hole-fills `n` low-res masks `[n, 288^2]`, upsamples them bilinearly to
+/// the original size and thresholds at 0, returning `[n, height * width]` 0/1 bytes
+/// into `out`, which must hold `n * width * height` bytes
+fn full_res_masks(gpu: &Gpu, low_res: &Tensor, n: usize, width: usize, height: usize, out: &mut [u8]) -> Result<()> {
+    let side = LOW_RES;
+    assert_eq!(low_res.len(), n * side * side);
+    let filled = gpu.clone_tensor(low_res)?;
+    fill_holes(gpu, &filled, 256)?;
+    let mask = MaskResize::new(gpu, n, width, height)?.all(gpu, &filled)?;
+    ensure!(out.len() == mask.bytes(), "mask buffer of {} bytes for {} pixels", out.len(), mask.bytes());
+    gpu.download_into(&mask, out)
 }
