@@ -39,16 +39,6 @@ jobs:
           cache-bin: false
           prefix-key: v1-rust
 
-      # the license is a placeholder until it is chosen, and both READMEs become
-      # registry pages, so no release goes out while a TODO(license) remains
-      - name: Check the license is settled
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          if git grep -n 'TODO(license)' -- . ':(exclude).github'; then
-            echo "settle the license before tagging a release" >&2
-            exit 1
-          fi
-
       - name: Package crate
         run: |
           rm -rf target/package

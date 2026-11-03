@@ -382,4 +382,7 @@ SAM3RS_VIDEO=models/video-parity/horses-720p-64-o3-fp32.safetensors SAM3RS_PRECI
 
 ## License
 
-TODO(license): pick the license before release.
+sam3rs is licensed under the [Apache License 2.0](LICENSE). It is an independent
+implementation and contains no SAM 3 weights. Meta distributes the weights under the
+[SAM License](https://huggingface.co/facebook/sam3), and each user accepts it on Hugging
+Face before downloading them.

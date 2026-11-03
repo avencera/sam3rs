@@ -5,11 +5,8 @@ members = ["crates/sam3rs-python"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-# TODO(license): Apache-2.0 is a placeholder until the license is chosen. To switch to
-# Meta's SAM License, which has no SPDX id: put its text in LICENSE, replace this line
-# with `license-file = "LICENSE"`, set `license = "LicenseRef-SAM-License"` in
-# crates/sam3rs-python/pyproject.toml, and drop NOTICE from the repo, `include` and
-# `license-files`
+# sam3rs is an independent implementation, so its code takes its own license; the SAM 3
+# weights it loads stay under Meta's SAM License, which NOTICE points users to
 license = "Apache-2.0"
 repository = "https://github.com/avencera/sam3rs"
 authors = ["Praveen Perera"]

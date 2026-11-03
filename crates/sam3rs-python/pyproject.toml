@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "SAM 3 image segmentation on NVIDIA GPUs with text, box and point prompts, in native Rust/CUDA"
 readme = "README.md"
 requires-python = ">=3.11"
-# TODO(license): keep in step with the workspace license; see the root Cargo.toml
+# keep in step with the workspace license in the root Cargo.toml
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Praveen Perera" }]

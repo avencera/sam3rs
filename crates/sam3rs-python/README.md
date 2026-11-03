@@ -96,4 +96,8 @@ Prints one JSON object per result. `--out` writes the image with the masks drawn
 
 ## License
 
-TODO(license): pick the license before release.
+sam3rs is licensed under the [Apache License
+2.0](https://github.com/avencera/sam3rs/blob/master/LICENSE). It is an independent
+implementation and contains no SAM 3 weights. Meta distributes the weights under the
+[SAM License](https://huggingface.co/facebook/sam3), and each user accepts it on Hugging
+Face before downloading them.

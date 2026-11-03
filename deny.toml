@@ -4,8 +4,6 @@ yanked = "deny"
 
 [licenses]
 version = 2
-# TODO(license): switching sam3rs to Meta's SAM License needs a [[licenses.clarify]]
-# entry for sam3rs, since its license-file has no SPDX id
 confidence-threshold = 0.8
 allow = [
     "Apache-2.0",
