@@ -65,7 +65,7 @@ feature enables downloads; local model loading works without it.
 - Any cuBLAS 13 release (`libcublas.so.13`, `libcublasLt.so.13`) on the library path,
   from a CUDA 13 toolkit or the `nvidia-cublas` pip wheel. All three precision modes
   are tested with wheels from 13.0.0 to 13.8.2.
-- Stable Rust (edition 2024)
+- Stable Rust (edition 2024), to build from source
 
 libcuda and cuBLAS load at run time. A missing driver, GPU or cuBLAS makes
 `Sam3::load` return an error rather than panic. cuBLAS opens by those two sonames, so
@@ -84,6 +84,34 @@ Cargo features:
 - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems. The only feature that
   needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
   `/usr/local/cuda`).
+
+## Install
+
+The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer), from the latest GitHub
+release into `~/.local/bin`:
+
+```sh
+curl -LSfs https://github.com/avencera/sam3rs/releases/latest/download/install.sh | sh
+```
+
+`--to DIR` installs somewhere else and `--tag vX.Y.Z` picks a release. The binary
+finds cuBLAS on the library path, so it needs a CUDA 13 toolkit. Without one, run the
+Python package's `sam3rs` command, which takes the same arguments and brings cuBLAS
+from the `nvidia-cublas` wheel (about 470 MB, downloaded on the first run):
+
+```sh
+uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
+```
+
+`pip install "sam3rs[cuda]"` installs the same command and the Python API. Building
+the command from source needs no CUDA toolkit, though running it needs cuBLAS as the
+release binary does:
+
+```sh
+cargo install sam3rs --features cli
+```
+
+As a library, `cargo add sam3rs`.
 
 ## Weights
 
@@ -105,16 +133,14 @@ scripts/fetch-models.sh
 ## Usage
 
 ```sh
-cargo build --release --features cli
-
 # text prompt: every dog, with an overlay
-./target/release/sam3rs models/images/dogs.jpg --text dog --out dogs.png
+sam3rs dogs.jpg --text dog --out dogs.png
 
 # box exemplars (pixels x0,y0,x1,y1), optionally negative ones
-./target/release/sam3rs models/images/dogs.jpg --box 1233,376,1649,691 --neg-box 1400,500,1500,600
+sam3rs dogs.jpg --box 1233,376,1649,691 --neg-box 1400,500,1500,600
 
 # clicks for a single object
-./target/release/sam3rs models/images/dogs.jpg --point 1439,504 --out dog.png
+sam3rs dogs.jpg --point 1439,504 --out dog.png
 ```
 
 Each detection prints as a JSON line with its score and box. Without `--model DIR`,
@@ -206,20 +232,15 @@ sam3rs encodes once and reuses, while osam and PyTorch encode it again on every 
 | Runtime | Encode | Point | Box | Neg box | Text |
 |---|---|---|---|---|---|
 | osam 0.9.2, ONNX Runtime 1.31.1 CUDA (FP32, TF32 matmuls) | 134.4 | 19.6 | 34.0 | 34.1 | 35.7 |
-| **sam3rs `tf32`** | **63.7** | **1.4** | **7.8** | **7.8** | **9.2** |
+| **sam3rs `tf32`** | **63.7** (2.1x) | **1.4** (14x) | **7.8** (4.4x) | **7.8** (4.4x) | **9.2** (3.9x) |
 | PyTorch 2.14.1 BF16 (official `Sam3Processor`) | 39.4 | 36.2 | 21.8 | 22.1 | 20.7 |
-| **sam3rs `bf16`** | **30.9** | **1.5** | **5.4** | **5.4** | **6.9** |
+| **sam3rs `bf16`** | **30.9** (1.28x) | **1.5** (24x) | **5.4** (4.0x) | **5.4** (4.1x) | **6.9** (3.0x) |
 | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
-| **sam3rs `fp32`** | **117.6** | **1.7** | **26.6** | **26.9** | **28.8** |
+| **sam3rs `fp32`** | **117.6** (1.10x) | **1.7** (15x) | **26.6** (1.25x) | **26.9** (1.25x) | **28.8** (1.10x) |
 
-Each sam3rs row sits under the runtime that uses the same numerics:
-
-- `tf32` against osam, both FP32 with TF32 matmuls: 2.1x on encode, 14x on points,
-  4.3x on box prompts and 3.9x on text prompts.
-- `bf16` against PyTorch BF16: 1.28x on encode, 24x on points, 4.0x on box prompts and
-  3.0x on text prompts.
-- `fp32` against PyTorch FP32 with TF32 off: 1.10x on encode, 15x on points, 1.25x on
-  box prompts and 1.10x on text prompts.
+Each sam3rs row sits under the runtime that uses the same numerics, and its speedup
+over that row is in parentheses: `tf32` against osam, both FP32 with TF32 matmuls;
+`bf16` against PyTorch BF16; `fp32` against PyTorch FP32 with TF32 off.
 
 The sam3rs rows come from three runs of one queued session, reporting the median of
 each column. The PyTorch rows come from an earlier queued session on the same machine,
@@ -273,8 +294,11 @@ the frame count.
 | PyTorch 2.14.1 `torch.compile` | 42.3 | 55.9 | 5.8-6.5 GB |
 | PyTorch 2.14.1 CUDA graphs | 45.1 | 59.7 | 10-20 GB |
 | ComfyUI core (SAM 3.1 multiplex) | 44.7 | 46.3 | 3.8-4.0 GB |
-| **sam3rs `bf16`** | **34.8** | **44.2** | **3.4-3.7 GB** |
+| **sam3rs `bf16`** | **34.8** (1.31x) | **44.2** (1.36x) | **3.4-3.7 GB** |
 | sam3rs `fp32` | 148.5 | 214.0 | 5.3-5.4 GB |
+
+The speedups in parentheses are over PyTorch eager. Over the fastest other runtime in
+each column, `torch.compile` for 1 object and ComfyUI for 3, they are 1.22x and 1.05x.
 
 At 1080p and 256 frames sam3rs takes 35.7 and 45.6 ms. The image encoder and tracker
 neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,

@@ -94,6 +94,13 @@ sam3rs dogs.jpg --point 1439,504 --neg-point 1500,600 --model ./sam3
 
 Prints one JSON object per result. `--out` writes the image with the masks drawn on it.
 
+To run the command without installing anything, `uvx` fetches the package and cuBLAS
+(about 470 MB) into a cached environment on the first run:
+
+```sh
+uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
+```
+
 ## License
 
 sam3rs is licensed under the [Apache License
