@@ -231,8 +231,11 @@ Where the time goes:
   re-uploads 117 MB on every detector call, and part of its point decoder runs on the
   CPU.
 - The point path is small kernels, hole filling included: a union-find over the
-  low-res masks in four launches. PyTorch spends about 17 ms of each point prompt
-  filling holes with GPU connected components.
+  low-res masks in four launches. PyTorch's hole filling costs about 0.2 ms; most of
+  its point prompt is copying masks to the host. It upsamples all three candidates of
+  both passes to full size as float32 and copies them into freshly allocated host
+  memory: at 2560x1600, two 49 MB copies, 28 ms of a 36-38 ms prompt. sam3rs keeps
+  the first pass on the GPU and downloads one mask at one byte per pixel.
 - PyTorch's box and text prompts launch about 2.8k kernels each and keep the GPU 46%
   busy. sam3rs issues about 0.6k GPU operations for a box prompt and 0.95k for a text
   prompt, and keeps the GPU about 91% busy. A BF16 box prompt spends about 1.8 ms in the
