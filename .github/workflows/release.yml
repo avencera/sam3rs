@@ -1,7 +1,8 @@
 # Publish the sam3rs command as a GitHub release when a version tag is pushed
 #
-#   git tag v0.1.0
-#   git push origin v0.1.0
+#   add a CHANGELOG.md entry for the version, then
+#   git tag v0.1.1
+#   git push origin v0.1.1
 #
 # The Package workflow publishes the crate and the Python package from the same tag.
 #
@@ -67,6 +68,8 @@ jobs:
       - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         with:
           draft: true
+          # the tag's CHANGELOG.md entry becomes the release notes; a tag without one fails
+          changelog: CHANGELOG.md
 
   upload-assets:
     needs: create-release

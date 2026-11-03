@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "sam3rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "cc",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "sam3rs-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eyre",
  "pyo3",
