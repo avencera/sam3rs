@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "sam3rs"
 dynamic = ["version"]
-description = "SAM 3 image segmentation on NVIDIA GPUs with text, box and point prompts, in native Rust/CUDA"
+description = "Real-time SAM 3 image segmentation on NVIDIA GPUs with text, box and click prompts, up to 93x faster than PyTorch, in native Rust/CUDA"
 readme = "README.md"
 requires-python = ">=3.11"
 # keep in step with the workspace license in the root Cargo.toml

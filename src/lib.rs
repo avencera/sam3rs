@@ -1,7 +1,70 @@
-//! A native Rust/CUDA runtime for [Meta SAM 3](https://github.com/facebookresearch/sam3)
-//! image inference and click-to-track video. It loads the official Hugging Face
-//! `model.safetensors` checkpoint and runs the whole image path and the video tracker on
-//! one CUDA stream without ONNX Runtime or PyTorch:
+//! SAM 3 on NVIDIA GPUs, fast enough to run live. sam3rs is a native Rust/CUDA runtime for
+//! [Meta SAM 3](https://github.com/facebookresearch/sam3): it loads the official Hugging
+//! Face checkpoint and runs image segmentation and click-to-track video on one CUDA
+//! stream, with no PyTorch or ONNX Runtime.
+//!
+//! On an RTX 5090 in BF16, against the official PyTorch implementation:
+//!
+//! | Task | sam3rs | PyTorch | Speedup |
+//! |---|---|---|---|
+//! | Click to mask, 2560x1600 image | 1.5 ms | 36.2 ms | **24x** |
+//! | Click to mask, 50 MP photo | 5.4 ms | 461 ms | **85x** |
+//! | Segment everything (16x16 clicks), 50 MP photo | 1.46 s | 105 s | **72x** |
+//! | Box prompt, 2560x1600 | 5.4 ms | 21.8 ms | **4.0x** |
+//! | Text prompt, 2560x1600 | 6.9 ms | 20.7 ms | **3.0x** |
+//! | Encode a new image | 30.9 ms | 39.4 ms | **1.28x** |
+//!
+//! That makes these real time. In frames a second on the same card:
+//!
+//! | Live workload | sam3rs | PyTorch |
+//! |---|---|---|
+//! | Mask under a moving cursor, 50 MP photo | **120** | 2 |
+//! | Mask under a moving cursor, 12 MP photo | **120** | 10 |
+//! | 8 masks around the cursor on every move, 36 MP photo | **28** | 0.4 |
+//! | Text prompt on every new 2560x1600 frame | **26** | 17 |
+//! | Track one object, 720p video | **29** | 22 |
+//! | Track three objects, 720p video | **23** | 17 |
+//!
+//! The cursor moves at 120 Hz, so 120 means sam3rs answers every position; each side
+//! answers the newest one whenever it finishes the last. Even at 108 MP sam3rs draws 90
+//! masks a second, against PyTorch's 1. The 8-mask row is one batched call per move. A new
+//! frame with a text prompt is an encode plus the prompt, 31 + 7 ms against 39 + 21 ms.
+//! Tracking holds 28 frames a second at 1080p, and at 720p it is faster than PyTorch
+//! eager, `torch.compile`, CUDA graphs and ComfyUI, in less GPU memory than any of them.
+//!
+//! The [Python package](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python)
+//! gives the same speed with numpy in and out. Full benchmarks are under
+//! [Results](#results).
+//!
+//! # Install
+//!
+//! The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer), from the latest GitHub
+//! release into `~/.local/bin`:
+//!
+//! ```sh
+//! curl -LSfs https://github.com/avencera/sam3rs/releases/latest/download/install.sh | sh
+//! ```
+//!
+//! `--to DIR` installs somewhere else and `--tag vX.Y.Z` picks a release. The binary
+//! finds cuBLAS on the library path, so it needs a CUDA 13 toolkit. Without one, run the
+//! Python package's `sam3rs` command, which takes the same arguments and brings cuBLAS
+//! from the `nvidia-cublas` wheel (about 470 MB, downloaded on the first run):
+//!
+//! ```sh
+//! uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
+//! ```
+//!
+//! `pip install "sam3rs[cuda]"` installs the same command and the Python API. Building
+//! the command from source needs no CUDA toolkit, though running it needs cuBLAS as the
+//! release binary does:
+//!
+//! ```sh
+//! cargo install sam3rs --features cli
+//! ```
+//!
+//! As a library, `cargo add sam3rs`.
+//!
+//! # What it runs
 //!
 //! - Perception Encoder ViT backbone (32 blocks, windowed and global attention with RoPE)
 //!   and both SimpleFPN necks
@@ -18,9 +81,6 @@
 //! `kernels/ptx` that the driver compiles when the model loads, so building sam3rs needs no
 //! CUDA toolkit or cuda-oxide. `scripts/build-ptx.sh` regenerates the PTX after a kernel
 //! change.
-//!
-//! There is also a Python package with numpy in and out; see
-//! [crates/sam3rs-python](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python).
 //!
 //! Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
 //! blocking client with rustls and the shared Python Hugging Face cache. The `online`
@@ -56,7 +116,7 @@
 //!
 //! - An NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 //!   and driver r580 or newer. RTX 50 series GPUs load compute_120 PTX, others the
-//!   compute_80 floor.
+//!   compute_80 floor. Benchmarks and parity runs use an RTX 5090.
 //! - Any cuBLAS 13 release (`libcublas.so.13`, `libcublasLt.so.13`) on the library path,
 //!   from a CUDA 13 toolkit or the `nvidia-cublas` pip wheel. All three precision modes
 //!   are tested with wheels from 13.0.0 to 13.8.2.
@@ -79,34 +139,6 @@
 //! - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems. The only feature that
 //!   needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
 //!   `/usr/local/cuda`).
-//!
-//! # Install
-//!
-//! The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer), from the latest GitHub
-//! release into `~/.local/bin`:
-//!
-//! ```sh
-//! curl -LSfs https://github.com/avencera/sam3rs/releases/latest/download/install.sh | sh
-//! ```
-//!
-//! `--to DIR` installs somewhere else and `--tag vX.Y.Z` picks a release. The binary
-//! finds cuBLAS on the library path, so it needs a CUDA 13 toolkit. Without one, run the
-//! Python package's `sam3rs` command, which takes the same arguments and brings cuBLAS
-//! from the `nvidia-cublas` wheel (about 470 MB, downloaded on the first run):
-//!
-//! ```sh
-//! uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
-//! ```
-//!
-//! `pip install "sam3rs[cuda]"` installs the same command and the Python API. Building
-//! the command from source needs no CUDA toolkit, though running it needs cuBLAS as the
-//! release binary does:
-//!
-//! ```sh
-//! cargo install sam3rs --features cli
-//! ```
-//!
-//! As a library, `cargo add sam3rs`.
 //!
 //! # Weights
 //!
@@ -254,9 +286,7 @@
 //! over that row is in parentheses: `tf32` against osam, both FP32 with TF32 matmuls;
 //! `bf16` against PyTorch BF16; `fp32` against PyTorch FP32 with TF32 off.
 //!
-//! The sam3rs rows come from three runs of one queued session, reporting the median of
-//! each column. The PyTorch rows come from an earlier queued session on the same machine,
-//! three runs each, and the osam row from another.
+//! Each row is the median of three runs.
 //!
 //! Where the time goes:
 //!
@@ -291,6 +321,32 @@
 //! cargo run --release --example bench -- --precision fp32
 //! ```
 //!
+//! ## Large photos
+//!
+//! The click gap grows with the photo. Measured through the Python package with both
+//! runtimes on cuBLAS 13.8.2, each photo at its own size and the mask returned at that
+//! size. A click runs both decoder passes and hole filling; the cursor columns count masks
+//! a second while a cursor moves at 120 Hz and each side answers the newest position:
+//!
+//! | Photo | sam3rs click | PyTorch click | Speedup | sam3rs cursor | PyTorch cursor |
+//! |---|---|---|---|---|---|
+//! | 1600x1200 (2 MP) | 1.6 ms | 7.8 ms | 4.9x | 120/s | 120/s |
+//! | 4288x2848 (12 MP) | 2.4 ms | 103.2 ms | 43x | 120/s | 10/s |
+//! | 7360x4912 (36 MP) | 4.3 ms | 316.1 ms | 74x | 120/s | 3/s |
+//! | 8160x6144 (50 MP) | 5.4 ms | 460.9 ms | 85x | 120/s | 2/s |
+//! | 12000x9000 (108 MP) | 9.9 ms | 924.7 ms | 93x | 90/s | 1/s |
+//!
+//! Eight clicks per cursor move in one batched call, on the 36 MP photo, take 35 ms
+//! against 2.6 s: 28 updates a second against 0.4.
+//!
+//! PyTorch's `predict_inst` returns all three candidates of both passes at full size as
+//! float32, 24 bytes per pixel, in freshly allocated host memory. sam3rs returns one mask
+//! at one byte per pixel.
+//!
+//! Segmenting everything, as a 16x16 grid of clicks run in batches through
+//! `segment_points_batch` and PyTorch's batched `predict_inst`, takes 1.46 s against
+//! 105.3 s on the 50 MP photo (72x) and 2.77 s against 221.7 s at 108 MP (80x).
+//!
 //! ## Video
 //!
 //! Steady-state milliseconds a frame on the same RTX 5090, BF16, one click per object on
@@ -302,17 +358,17 @@
 //!
 //! | Runtime | 1 object | 3 objects | Peak VRAM |
 //! |---|---|---|---|
-//! | PyTorch 2.14.1 eager | 45.5 | 60.1 | 5.6-6.0 GB |
-//! | PyTorch 2.14.1 `torch.compile` | 42.3 | 55.9 | 5.8-6.5 GB |
-//! | PyTorch 2.14.1 CUDA graphs | 45.1 | 59.7 | 10-20 GB |
-//! | ComfyUI core (SAM 3.1 multiplex) | 44.7 | 46.3 | 3.8-4.0 GB |
-//! | **sam3rs `bf16`** | **34.8** (1.31x) | **44.2** (1.36x) | **3.4-3.7 GB** |
-//! | sam3rs `fp32` | 148.5 | 214.0 | 5.3-5.4 GB |
+//! | PyTorch 2.14.1 eager | 45.5 ms, 22 fps | 60.1 ms, 17 fps | 5.6-6.0 GB |
+//! | PyTorch 2.14.1 `torch.compile` | 42.3 ms, 24 fps | 55.9 ms, 18 fps | 5.8-6.5 GB |
+//! | PyTorch 2.14.1 CUDA graphs | 45.1 ms, 22 fps | 59.7 ms, 17 fps | 10-20 GB |
+//! | ComfyUI core (SAM 3.1 multiplex) | 44.7 ms, 22 fps | 46.3 ms, 22 fps | 3.8-4.0 GB |
+//! | **sam3rs `bf16`** | **34.8 ms, 29 fps** (1.31x) | **44.2 ms, 23 fps** (1.36x) | **3.4-3.7 GB** |
+//! | sam3rs `fp32` | 148.5 ms, 7 fps | 214.0 ms, 5 fps | 5.3-5.4 GB |
 //!
 //! The speedups in parentheses are over PyTorch eager. Over the fastest other runtime in
 //! each column, `torch.compile` for 1 object and ComfyUI for 3, they are 1.22x and 1.05x.
 //!
-//! At 1080p and 256 frames sam3rs takes 35.7 and 45.6 ms. The image encoder and tracker
+//! At 1080p and 256 frames sam3rs takes 35.7 and 45.6 ms, 28 and 22 fps. The image encoder and tracker
 //! neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,
 //! about 1.8 of them in the memory cross-attention kernel and 0.44 in the memory
 //! self-attention. The GPU is about 99% busy, so CUDA graphs would
@@ -403,16 +459,6 @@
 //!   rounding difference flips one low-resolution pixel, which cuts a 64-pixel background
 //!   region off from the rest. Hole filling turns background regions of up to 256 pixels
 //!   into foreground, so that region becomes part of the mask. The score is unaffected.
-//!
-//! # Not yet verified
-//!
-//! - Only measured on one RTX 5090 (sm_120) with CUDA 13.2. The compute_80 PTX that other
-//!   GPUs load passes parity on the 5090 but hasn't run on another architecture.
-//! - Video parity covers two clips (720p, 64 frames, 1 and 3 objects).
-//! - Timings use one image and one prompt of each kind. Scaling with many box exemplars
-//!   or long text prompts hasn't been measured.
-//! - Parity covers four images and 13 prompts, and the BF16 worst score delta is within
-//!   about 0.005 of the 0.01 gate.
 
 #![warn(missing_docs)]
 

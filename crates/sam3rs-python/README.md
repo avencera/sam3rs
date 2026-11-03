@@ -1,8 +1,34 @@
 # sam3rs
 
-SAM 3 image segmentation on NVIDIA GPUs, from Python. Encode an image once, then find
-objects by noun phrase, box exemplars or clicks. The model runs in a native Rust/CUDA
-runtime ([sam3rs](https://github.com/avencera/sam3rs)) with no PyTorch dependency.
+SAM 3 image segmentation on NVIDIA GPUs from Python, fast enough to run live. Encode an
+image once, then find objects by noun phrase, box exemplars or clicks. The model runs in
+a native Rust/CUDA runtime ([sam3rs](https://github.com/avencera/sam3rs)) with no
+PyTorch dependency.
+
+On an RTX 5090 in BF16, against the official PyTorch implementation:
+
+| Task | sam3rs | PyTorch | Speedup |
+|---|---|---|---|
+| Click to mask, 2560x1600 image | 1.5 ms | 36.2 ms | **24x** |
+| Click to mask, 50 MP photo | 5.4 ms | 461 ms | **85x** |
+| Segment everything (16x16 clicks), 50 MP photo | 1.46 s | 105 s | **72x** |
+| Box prompt, 2560x1600 | 5.4 ms | 21.8 ms | **4.0x** |
+| Text prompt, 2560x1600 | 6.9 ms | 20.7 ms | **3.0x** |
+| Encode a new image | 30.9 ms | 39.4 ms | **1.28x** |
+
+That is fast enough to run live. In frames a second:
+
+| Live workload | sam3rs | PyTorch |
+|---|---|---|
+| Mask under a moving cursor, 50 MP photo | **120** | 2 |
+| Mask under a moving cursor, 12 MP photo | **120** | 10 |
+| 8 masks around the cursor on every move, 36 MP photo | **28** | 0.4 |
+| Text prompt on every new 2560x1600 frame | **26** | 17 |
+
+The cursor moves at 120 Hz, so 120 means sam3rs answers every position. A new frame
+with a text prompt is an encode plus the prompt, 31 + 7 ms against 39 + 21 ms. Masks
+arrive as numpy bool arrays without a copy. Methods and the full tables are in the
+[sam3rs README](https://github.com/avencera/sam3rs#results).
 
 ## Install
 
