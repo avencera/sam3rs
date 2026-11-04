@@ -1,70 +1,25 @@
 //! SAM 3 detector: geometry (box) encoder, fusion encoder, DETR decoder with presence
 //! token, dot-product scoring and the segmentation head
 
-use eyre::{Result, WrapErr, ensure, eyre};
+use eyre::{Result, eyre};
 
-use crate::gpu::{Buf, Gpu, Precision, Tensor, blocks, launch};
-use crate::nvtx::range;
-use crate::ops::{
+use crate::cuda::gpu::{Buf, Gpu, Tensor, blocks, launch};
+use crate::cuda::nvtx::range;
+use crate::cuda::ops::{
     Act, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, concat_rows, ew,
     group_norm_stats, upload_i32,
 };
+use crate::cuda::text::TextFeatures;
+use crate::cuda::vision::{Fpn, GRID};
 use crate::posenc::{box_encoding, sine_2d};
-use crate::text::TextFeatures;
-use crate::vision::{Fpn, GRID};
+use crate::precision::Precision;
+use crate::prompt::BoxPrompt;
 use crate::weights::Weights;
 
 const D: usize = 256;
 const HEADS: usize = 8;
 pub const QUERIES: usize = 200;
 const ROI: usize = 7;
-
-/// A box prompt in normalized cxcywh with its label (true = positive)
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BoxPrompt {
-    cxcywh: [f32; 4],
-    positive: bool,
-}
-
-impl BoxPrompt {
-    /// A box from pixel corners `[x0, y0, x1, y1]` in a `width` x `height` image
-    ///
-    /// The box may extend past the image by up to one image size on each side
-    pub fn from_xyxy(xyxy: [f32; 4], width: usize, height: usize, positive: bool) -> Result<Self> {
-        ensure!(width > 0 && height > 0, "image size {width}x{height} is empty");
-        ensure!(xyxy.iter().all(|v| v.is_finite()), "box {xyxy:?} has a non-finite coordinate");
-        let (w, h) = (width as f32, height as f32);
-        let [x0, y0, x1, y1] = xyxy;
-        Self::from_cxcywh([(x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h, (x1 - x0) / w, (y1 - y0) / h], positive)
-            .wrap_err_with(|| format!("box {xyxy:?} in a {width}x{height} image"))
-    }
-
-    /// A box from its center and size as fractions of the image width and height
-    ///
-    /// Width and height must be positive, and the corners within `[-1, 2]`: no more than
-    /// one image size past each edge. That bounds the ROI pooling work per box
-    pub fn from_cxcywh(cxcywh: [f32; 4], positive: bool) -> Result<Self> {
-        let [cx, cy, w, h] = cxcywh;
-        ensure!(cxcywh.iter().all(|v| v.is_finite()), "box {cxcywh:?} has a non-finite value");
-        ensure!(w > 0.0 && h > 0.0, "box {cxcywh:?} has no area");
-        let corners = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
-        ensure!(
-            corners.iter().all(|c| (-1.0..=2.0).contains(c)),
-            "box {cxcywh:?} reaches more than one image size past the image"
-        );
-        Ok(Self { cxcywh, positive })
-    }
-
-    /// Center x, center y, width and height as fractions of the image size
-    pub fn cxcywh(&self) -> [f32; 4] {
-        self.cxcywh
-    }
-
-    /// Whether the box is a positive exemplar rather than a negative one
-    pub fn positive(&self) -> bool {
-        self.positive
-    }
-}
 
 /// Image features the detector reads, computed once per image
 pub struct DetectorImage {
@@ -273,7 +228,7 @@ impl Detector {
         let embeds = if n == 0 {
             gpu.clone_tensor(&g.cls)?
         } else {
-            let raw: Vec<f32> = boxes.iter().flat_map(|b| b.cxcywh).collect();
+            let raw: Vec<f32> = boxes.iter().flat_map(BoxPrompt::cxcywh).collect();
             let raw = gpu.upload(raw, &[n, 4])?;
             let x = g.direct.forward(gpu, &raw)?;
 
@@ -281,7 +236,7 @@ impl Detector {
             let xyxy: Vec<f32> = boxes
                 .iter()
                 .flat_map(|b| {
-                    let [cx, cy, w, h] = b.cxcywh;
+                    let [cx, cy, w, h] = b.cxcywh();
                     [(cx - 0.5 * w) * side, (cy - 0.5 * h) * side, (cx + 0.5 * w) * side, (cy + 0.5 * h) * side]
                 })
                 .collect();
@@ -291,11 +246,11 @@ impl Detector {
                 &pooled, &img.coarse_normed, &xyxy, GRID, GRID, D, ROI)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
-            let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh)).collect();
+            let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh())).collect();
             let enc = gpu.upload(enc, &[n, 258])?;
             g.pos.forward_residual(gpu, &enc, &x)?;
 
-            let labels: Vec<i32> = boxes.iter().map(|b| b.positive as i32).collect();
+            let labels: Vec<i32> = boxes.iter().map(|b| b.positive() as i32).collect();
             let labels = upload_i32(gpu, labels)?;
             let label = gpu.empty(&[n, D])?;
             launch!(gpu, "gather_rows", ew(label.len()), B256, 0; &label, &g.label, labels.slice::<i32>(), D)?;

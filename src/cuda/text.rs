@@ -2,8 +2,8 @@
 
 use eyre::Result;
 
-use crate::gpu::{Gpu, Tensor, launch};
-use crate::ops::{Act, B256, LayerNorm, Linear, Mask, ew, mha};
+use crate::cuda::gpu::{Gpu, Tensor, launch};
+use crate::cuda::ops::{Act, B256, LayerNorm, Linear, Mask, ew, mha};
 use crate::tokenizer::CONTEXT;
 use crate::weights::Weights;
 

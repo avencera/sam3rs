@@ -1,14 +1,15 @@
 //! SAM 2 style interactive decoder for point prompts: prompt encoder, two-way
 //! transformer, high-resolution upscaling and the multimask heads
 
+use crate::prompt::PointPrompt;
 use std::f64::consts::PI;
 use std::ops::Range;
 
 use eyre::{Result, ensure};
 
-use crate::gpu::{Arg, Buf, Gpu, Mat, Tensor, launch};
-use crate::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mlp, add, add_assign, bias_act, ew};
-use crate::vision::{Fpn, GRID, IMAGE_SIZE};
+use crate::cuda::gpu::{Arg, Buf, Gpu, Mat, Tensor, launch};
+use crate::cuda::ops::{Act, Attention, B256, ConvT2x2, LayerNorm, Linear, Mlp, add, add_assign, bias_act, ew};
+use crate::cuda::vision::{Fpn, GRID, IMAGE_SIZE};
 use crate::weights::Weights;
 
 const D: usize = 256;
@@ -17,37 +18,6 @@ const HEADS: usize = 8;
 pub const LOW_RES: usize = 4 * GRID;
 /// Most mask pixels [`MaskResize`] resizes per launch: 1 GiB of FP32 staging
 const MASK_GROUP_ELEMENTS: usize = 1 << 28;
-
-/// A click in original image pixels; positive = foreground
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PointPrompt {
-    x: f32,
-    y: f32,
-    positive: bool,
-}
-
-impl PointPrompt {
-    /// A click at `(x, y)` in original image pixels; fails on a non-finite coordinate
-    pub fn new(x: f32, y: f32, positive: bool) -> Result<Self> {
-        ensure!(x.is_finite() && y.is_finite(), "point ({x}, {y}) has a non-finite coordinate");
-        Ok(Self { x, y, positive })
-    }
-
-    /// Horizontal position in pixels
-    pub fn x(&self) -> f32 {
-        self.x
-    }
-
-    /// Vertical position in pixels
-    pub fn y(&self) -> f32 {
-        self.y
-    }
-
-    /// Whether the click marks foreground rather than background
-    pub fn positive(&self) -> bool {
-        self.positive
-    }
-}
 
 /// Image features the point decoder reads, computed once per image
 pub struct PointImage {
@@ -212,11 +182,11 @@ impl PointDecoder {
         let size = IMAGE_SIZE as f32;
         for (i, p) in points.iter().enumerate() {
             // pixels -> 1008 input frame, shifted to the pixel center, normalized back
-            let x = (p.x / width as f32 * size + 0.5) / size;
-            let y = (p.y / height as f32 * size + 0.5) / size;
+            let x = (p.x() / width as f32 * size + 0.5) / size;
+            let y = (p.y() / height as f32 * size + 0.5) / size;
             let row = &mut out[i * D..][..D];
             fourier(&self.gaussian, x, y, row);
-            let label = p.positive as usize;
+            let label = p.positive() as usize;
             for (v, e) in row.iter_mut().zip(&self.point_embed[label * D..][..D]) {
                 *v += e;
             }
@@ -514,7 +484,8 @@ mod tests {
     use eyre::Result;
 
     use super::{LOW_RES, fill_holes};
-    use crate::gpu::{Gpu, Precision};
+    use crate::cuda::gpu::Gpu;
+    use crate::precision::Precision;
 
     /// The host flood fill the GPU fill replaced: background regions (logit <= 0),
     /// 8-connected, of at most `max_area` pixels become foreground (+10). NaN is

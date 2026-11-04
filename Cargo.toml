@@ -62,7 +62,7 @@ nvtx = ["dep:cc"]
 [dependencies]
 # libcuda and cuBLAS are loaded at run time and the kernels ship as PTX, so the crate
 # builds without a CUDA toolkit. The 13.0 API floor is cuBLAS 13's (driver r580+).
-# cuBLAS takes only its types from cudarc; src/cublas.rs opens it by soname instead
+# cuBLAS takes only its types from cudarc; src/cuda/cublas.rs opens it by soname instead
 cudarc = { version = "0.19.10", default-features = false, features = [
     "std",
     "driver",

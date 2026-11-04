@@ -9,18 +9,24 @@
 //! `sam3_tracking_predictor.py` at f1647e8): all objects share one state, so the memory
 //! selection uses their mean score, and the bank is stored in BF16 in every mode
 
+use crate::output::{TrackedFrame, TrackedObject};
 use std::collections::VecDeque;
 
 use eyre::{Result, ensure, eyre};
 
-use crate::gpu::{Arg, Buf, Gpu, Precision, Tensor, launch};
-use crate::image::{AaResize, RgbImage, preprocess};
-use crate::nvtx::range;
-use crate::ops::{Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha};
-use crate::pipeline::Sam3;
-use crate::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, PointPrompt, argmax, row};
+use crate::cuda::gpu::{Arg, Buf, Gpu, Tensor, launch};
+use crate::cuda::image::{AaResize, preprocess};
+use crate::cuda::nvtx::range;
+use crate::cuda::ops::{
+    Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha,
+};
+use crate::cuda::pipeline::Sam3;
+use crate::cuda::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, argmax, row};
+use crate::cuda::vision::{GRID, IMAGE_SIZE, Trunk};
+use crate::image::RgbImage;
 use crate::posenc::sine_2d;
-use crate::vision::{GRID, IMAGE_SIZE, Trunk};
+use crate::precision::Precision;
+use crate::prompt::PointPrompt;
 use crate::weights::Weights;
 
 const D: usize = 256;
@@ -693,34 +699,6 @@ impl Selection<'_> {
 /// Memory-attention inputs of one frame, `(memory, memory_pos)` per object
 pub(crate) struct MemoryInputs {
     pub(crate) objects: Vec<(Tensor, Tensor)>,
-}
-
-/// One tracked object on one frame
-#[derive(Clone, Debug)]
-pub struct TrackedObject {
-    /// Object score logit; the object counts as present above 0
-    pub score: f32,
-    /// `height * width` bytes, 1 = foreground
-    pub mask: Vec<u8>,
-    /// `288 * 288` mask logits before upsampling, `-1024` everywhere for an absent object
-    pub low_res: Vec<f32>,
-    /// The decoder's predicted IoU of each candidate mask, the single-mask output first
-    pub ious: Vec<f32>,
-    /// Index into `ious` of the candidate kept
-    pub chosen: usize,
-}
-
-/// Every object's mask on one frame, in the order the objects were given
-pub struct TrackedFrame {
-    /// Frame index from 0, the frame the objects were clicked on
-    pub frame: usize,
-    /// One entry per object
-    pub objects: Vec<TrackedObject>,
-    /// Memory tokens the frame attended to, object pointer tokens included: 0 on the
-    /// clicked frame, then growing to a constant once the bank is full
-    pub memory_tokens: usize,
-    /// Of [`Self::memory_tokens`], those from object pointers (4 per pointer)
-    pub pointer_tokens: usize,
 }
 
 /// Follows clicked objects through a video one frame at a time, starting from the frame

@@ -11,7 +11,7 @@ use cudarc::driver::result as cur;
 use cudarc::driver::sys::{CUevent, CUstream};
 use eyre::{Result, WrapErr, bail};
 
-use crate::cublas::Lt;
+use crate::cuda::cublas::Lt;
 
 /// NVIDIA's recommended cuBLASLt workspace for Hopper and newer
 const WORKSPACE: usize = 32 << 20;

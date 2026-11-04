@@ -3,8 +3,9 @@
 
 use eyre::{Result, bail, eyre};
 
-use crate::blaslt::Epilogue;
-use crate::gpu::{Arg, Buf, Gpu, Mat, Precision, Tensor, blocks, launch};
+use crate::cuda::blaslt::Epilogue;
+use crate::cuda::gpu::{Arg, Buf, Gpu, Mat, Tensor, blocks, launch};
+use crate::precision::Precision;
 use crate::weights::Weights;
 
 /// An activation a kernel or a cuBLASLt epilogue applies; the discriminants are the
