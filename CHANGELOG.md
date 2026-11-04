@@ -15,7 +15,7 @@ All notable changes to sam3rs are documented here. The format follows
   an M4 Pro it encodes an image in 824 ms, answers a click in 6.2 ms, a box in 93 ms and
   a text prompt in 103 ms, 1.19-2.9x faster than the official SAM 3 package on PyTorch's
   MPS backend, and tracks three objects through 720p video at 1.2 s a frame. It needs
-  Apple silicon and macOS 26 or newer.
+  Apple silicon and macOS 26.1 or newer.
 - macOS release artifacts for Apple silicon: a Python wheel, so `pip install sam3rs`
   and `uvx sam3rs` work there, and a prebuilt `sam3rs` command that the install script
   now picks on an Apple silicon Mac.

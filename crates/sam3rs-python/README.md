@@ -44,7 +44,7 @@ On Linux x86_64 you need:
   release works; it is tested with releases from 13.0.0 to 13.8.2. Leave the extra out
   if a CUDA 13 toolkit is already on the library path.
 
-On macOS you need Apple silicon (M1 or newer) with macOS 26 or newer. The same command
+On macOS you need Apple silicon (M1 or newer) with macOS 26.1 or newer. The same command
 works there: the `cuda` extra installs nothing on a Mac, so `pip install sam3rs` is
 enough. `precision` takes `"bf16"` or `"fp32"`; `"tf32"` is a CUDA mode and raises
 `sam3rs.Sam3rsError`. On an M4 Pro in BF16, encoding an image takes 824 ms, a click
@@ -53,7 +53,7 @@ official SAM 3 package on PyTorch's MPS backend
 ([Apple silicon results](https://github.com/avencera/sam3rs#apple-silicon)).
 
 The package imports on any machine. Loading a model without a usable GPU, driver or
-cuBLAS, or on a macOS older than 26, raises `sam3rs.Sam3rsError` that says what is
+cuBLAS, or on a macOS older than 26.1, raises `sam3rs.Sam3rsError` that says what is
 missing.
 
 ## Weights

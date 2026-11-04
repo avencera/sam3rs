@@ -58,7 +58,7 @@ strip = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["gpu: needs a GPU (NVIDIA with cuBLAS 13, or Apple silicon on macOS 26+) and the weights in models/sam3"]
+markers = ["gpu: needs a GPU (NVIDIA with cuBLAS 13, or Apple silicon on macOS 26.1+) and the weights in models/sam3"]
 
 [tool.ruff]
 line-length = 120

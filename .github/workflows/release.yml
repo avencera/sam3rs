@@ -96,7 +96,7 @@ jobs:
             build-target: aarch64-apple-darwin
             build-tool: cargo
     env:
-      # the Metal backend checks for macOS 26 when a model loads and names the version it
+      # the Metal backend checks for macOS 26.1 when a model loads and names the version it
       # found, which an older floor lets the binary reach; Linux ignores this
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:

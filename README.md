@@ -40,7 +40,7 @@ Metal with the same API; see [Apple silicon](#apple-silicon).
 
 ## Install
 
-The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer) or Apple silicon (macOS 26
+The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer) or Apple silicon (macOS 26.1
 or newer), from the latest GitHub release into `~/.local/bin`:
 
 ```sh
@@ -139,7 +139,7 @@ the official package. Video tracking at 720p takes 931 ms a frame with one objec
 [Benchmarks](https://github.com/avencera/sam3rs/blob/master/docs/benchmarks.md#apple-silicon)
 compares osam and other ports and describes the Metal kernels.
 
-Requirements: Apple silicon with macOS 26 or newer (Metal 4). Only the M4 Pro has been
+Requirements: Apple silicon with macOS 26.1 or newer (Metal 4). Only the M4 Pro has been
 tested. Setting `SAM3RS_METAL_PROFILE` gives each kernel its own compute pass with GPU
 timestamps at its boundaries and prints GPU time by kernel when the model is dropped
 (`trace` also prints every dispatch). The extra passes change scheduling, so end-to-end

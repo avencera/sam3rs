@@ -132,7 +132,7 @@ jobs:
             target: aarch64-apple-darwin
             manylinux: ""
     env:
-      # the Metal backend needs macOS 26, but the wheel keeps the arm64 floor so pip
+      # the Metal backend needs macOS 26.1, but the wheel keeps the arm64 floor so pip
       # installs it on any Apple silicon Mac, where an older macOS gets the runtime's
       # error naming the version instead of a failed sdist build; Linux ignores this
       MACOSX_DEPLOYMENT_TARGET: "11.0"
