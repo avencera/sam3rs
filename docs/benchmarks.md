@@ -1,6 +1,7 @@
 # Benchmarks
 
-Every number here is from one RTX 5090 (driver 595.99, CUDA 13.2). The headline tables
+Every number here is from one RTX 5090 (driver 595.99, CUDA 13.2), except under
+[Apple silicon](#apple-silicon). The headline tables
 and the image results are in the [README](../README.md#results).
 
 ## Image prompts
@@ -126,3 +127,46 @@ video-click horses-720p-64:1 horses-720p-64:3` times the ComfyUI row through a s
 ComfyUI server, with per-node times from `scripts/comfy_launch.py`.
 `scripts/nsys_frames.py` turns an nsys capture of either into per-frame GPU busy
 time, launches and stage times.
+
+## Apple silicon
+
+On an M4 Pro (20-core GPU, macOS 27), with the image protocol above: `dogs.jpg`, the
+same prompts, full-resolution masks on the host. The official SAM 3 package runs on
+PyTorch's MPS backend, patched to run there, in BF16 autocast (FP32 with the FP32 MLP
+for its FP32 row). A click is the two-pass prediction the parity reference makes, and
+box prompts go through the detector in every runtime. Milliseconds, best of two rounds
+for the other runtimes:
+
+| Runtime | Encode | Click | Box | Neg box | Text | Peak memory |
+|---|---|---|---|---|---|---|
+| sam3rs `bf16` | 824 | 6.2 | 93 | 92 | 103 | 4.7 GB |
+| sam3rs `fp32` | 1071 | 6.2 | 95 | 95 | 105 | 5.7 GB |
+| Official SAM 3, MPS BF16 | 982 | 18.1 | 127 | 128 | 125 | 7.3 GB |
+| Official SAM 3, MPS FP32 | 1109 | 18.8 | 136 | 138 | 135 | 7.3 GB |
+| osam, ONNX Runtime on Core ML | 1213 | 34.8 | 281 | 236 | 240 | 11.1 GB |
+
+osam misses the parity gate on 32 of its 43 checks. The fastest other ports encode in
+1.02-1.11 s (MLX) and answer text prompts in 111 ms (Hugging Face transformers on MPS,
+with masks left at 288x288). Video tracking at 720p takes 931 ms a frame with one object
+and 1194 ms with three in `bf16` (1161 and 1421 in `fp32`), most of it the image encoder.
+
+### Where the time goes
+
+- The image encoder is matrix math at the GPU's limit: in `bf16` its linears run at
+  about 7.4 TFLOPS, close to the 7.55 that Metal 4's `matmul2d` reaches on this GPU,
+  and the whole encode is within about 1.05x of the summed floors of its parts.
+- Unmasked attention (the backbone, the fusion encoder's self-attention and the
+  tracker's memory attention) runs a flash-attention loop on tensor ops with an FP32
+  softmax. The tracker's 256-wide self-attention instead runs as a score GEMM, a row
+  softmax and a second GEMM, about twice as fast here as the fused loop. Its memory
+  cross-attention folds the value projection into the output projection, so it reads
+  the 64-channel memory rather than 256-channel values, computes each score tile once
+  for four SIMD groups and splits the keys across the GPU.
+- The Neural Engine runs the backbone's matrix math at about the GPU's rate but its
+  global attention five times slower, so the whole backbone takes over 1.3 s there.
+  sam3rs doesn't use it.
+
+```sh
+cargo run --release --example bench -- --precision bf16
+cargo run --release --example bench -- --precision fp32
+```

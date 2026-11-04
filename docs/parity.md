@@ -1,12 +1,12 @@
 # Parity
 
-sam3rs is checked against PyTorch FP32 outputs of the official implementation, in all
-three precision modes. The summary tables are in the [README](../README.md#parity).
+sam3rs is checked against PyTorch FP32 outputs of the official implementation, in every
+precision mode of each backend (three on CUDA, two on Metal). The summary tables are in the [README](../README.md#parity).
 
 ## Images
 
 `tests/parity.rs` runs four images and 13 prompts (text, box, negative box, points)
-through each mode. The fixtures come from `scripts/reference.py dump`. The gate: the
+through each mode of the backend. The fixtures come from `scripts/reference.py dump`. The gate: the
 same kept DETR queries, scores within 0.01, box corners within 0.5% of the image's
 longer side, and mask IoU of at least 0.99.
 
@@ -16,13 +16,15 @@ cargo test --release --test parity -- --nocapture
 
 The ignored `stage_tests::stages` unit test (`cargo test --release --lib -- --ignored`)
 compares every intermediate stage (pixels, trunk, FPN levels, text features, scores,
-boxes, mask logits) for one fixture.
+boxes, mask logits) for one fixture. On Macs, `detector_stages` and `point_stages` check
+the later stages from the fixture's reference features.
 
 ## Video
 
-The video tracker's gates are ignored tests in `src/cuda/video_tests.rs`, against fixtures
-from `scripts/video_reference.py dump`: upstream's tracker in true FP32 on a clip, with
-every stage's inputs and outputs on a few frames.
+The video tracker's gates are ignored tests in `src/cuda/video_tests.rs` and
+`src/metal/video_tests.rs`, against fixtures from `scripts/video_reference.py dump`:
+upstream's tracker in true FP32 on a clip, with every stage's inputs and outputs on a
+few frames.
 
 - `video_stages` runs each stage (memory attention, memory encoder, decoder, pointer
   MLP) on the reference's exact inputs: rel L2 within 1e-4 in `fp32` and 5e-3 in
@@ -38,6 +40,14 @@ every stage's inputs and outputs on a few frames.
 - `attention_d256` checks the two fused attention kernels (values of 256 for
   self-attention, of 64 for the memory cross-attention) against an f64 softmax: rel L2
   within 1e-3.
+
+On Metal, every stage after the necks runs in FP32, so `video_stages` holds those stages
+to the `fp32` limits in both modes. The cached-key check and `attention_d256` are CUDA
+only; on Macs the ignored `metal::kernel_tests` check every attention kernel (all masks,
+ragged lengths, split key ranges) and the linears against f64. Metal's `bf16` misses the
+one-object clip's gate: two candidate masks on the prompted frame score within 0.001 of
+each other and BF16 rounding picks the other one, so the object is then tracked at mean
+IoU 0.987 against FP32.
 
 ```sh
 SAM3RS_VIDEO=models/video-parity/horses-720p-64-o3-fp32.safetensors SAM3RS_PRECISION=bf16 \
