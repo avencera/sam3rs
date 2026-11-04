@@ -4,7 +4,8 @@
 //!     sam3rs image.jpg --box 1233,376,1649,691 --neg-box 1400,500,1500,600
 //!     sam3rs image.jpg --point 1439,504 --neg-point 1500,600
 //!
-//! Without `--model`, the weights come from the gated facebook/sam3 Hugging Face repo
+//! Without `--model`, the weights download from the avencera/sam3-safetensors Hugging Face
+//! repo, with no account or token
 
 use std::path::PathBuf;
 
@@ -36,7 +37,7 @@ struct Args {
     #[arg(long)]
     out: Option<PathBuf>,
     /// Directory with model.safetensors, vocab.json and merges.txt [default: download
-    /// facebook/sam3 from Hugging Face]
+    /// avencera/sam3-safetensors from Hugging Face]
     #[arg(long)]
     model: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]

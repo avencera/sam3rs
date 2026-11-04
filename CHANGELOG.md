@@ -6,6 +6,17 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The weights now download from
+  [avencera/sam3-safetensors](https://huggingface.co/avencera/sam3-safetensors), an
+  ungated mirror holding byte-identical copies of facebook/sam3's files under Meta's SAM
+  License, so `Sam3::from_pretrained`, `Sam3.from_pretrained()` and the CLI no longer
+  need a Hugging Face token or Meta's approval. Because the repo changed, the first run
+  after upgrading downloads the 3.4 GB checkpoint into the cache again.
+- `scripts/fetch-models.sh` fetches from the same mirror without a token by default.
+  `--official` fetches from facebook/sam3 with a token, and replaces `--mirror`.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

@@ -27,7 +27,7 @@ BOX_TOL = 0.005
 
 def test_imports_without_gpu() -> None:
     assert sam3rs.__version__
-    assert sam3rs.MODEL_REPO == "facebook/sam3"
+    assert sam3rs.MODEL_REPO == "avencera/sam3-safetensors"
     assert 0 < sam3rs.SCORE_THRESHOLD < 1
 
 
