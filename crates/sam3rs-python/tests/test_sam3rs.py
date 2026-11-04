@@ -49,7 +49,8 @@ def test_load_fails_cleanly_without_gpu(tmp_path: Path) -> None:
     out = subprocess.run([sys.executable, "-c", code], check=False, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     message = out.stdout.lower()
-    assert "driver" in message or "device" in message, message
+    # a driver without cuBLAS fails on the cuBLAS check, which runs before devices are counted
+    assert "driver" in message or "device" in message or "cublas" in message, message
     # the GPU is checked before the model files, so a GPU-less machine never reads them
     assert "vocab" not in message, message
 
