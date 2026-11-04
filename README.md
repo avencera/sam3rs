@@ -123,6 +123,8 @@ candidate masks on the prompted frame score within 0.001 of each other and BF16
 rounding picks the other one, so the object is then tracked at IoU 0.987 against FP32
 PyTorch, below the 0.997 of PyTorch's own BF16 run on that clip.
 
+![Bar charts of time per task on an M4 Pro for sam3rs bf16 on Metal, the official SAM 3 on PyTorch MPS and osam on ONNX Runtime with Core ML. sam3rs is fastest in every panel: 1.19x faster than the official package and 1.47x faster than osam to encode an image, 2.9x and 5.6x on a click, 1.37x and 3.0x on a box prompt, 1.22x and 2.3x on a text prompt, and it peaks at 4.7 GB of memory against 7.3 GB and 11.1 GB](https://raw.githubusercontent.com/avencera/sam3rs/master/docs/images/m4-pro.png)
+
 Milliseconds on an M4 Pro (20-core GPU, macOS 27) with the osam benchmark protocol
 (dogs.jpg, masks at full resolution on the host), against the official SAM 3 package
 on PyTorch's MPS backend in BF16 autocast:
@@ -277,6 +279,8 @@ length. Clicks go on frame 0 only; new clicks on later frames, adding objects mi
 and SAM 3.1's multiplex tracker aren't implemented.
 
 ## Results
+
+![Bar charts of time per task on an RTX 5090 for sam3rs bf16, the official SAM 3 on PyTorch and osam on ONNX Runtime. sam3rs is fastest in every panel: 1.28x faster than the official package and 4.35x faster than osam to encode an image, 24x and 13x on a click, 4.0x and 6.3x on a box prompt, 3.0x and 5.2x on a text prompt, and 1.36x faster than the official package at tracking three objects in video](https://raw.githubusercontent.com/avencera/sam3rs/master/docs/images/rtx5090.png)
 
 Milliseconds for `dogs.jpg` (2560x1600) on an RTX 5090, following the osam benchmark
 protocol, with full-resolution masks returned on the host:
