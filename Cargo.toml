@@ -2,7 +2,7 @@
 members = ["crates/sam3rs-python"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 # sam3rs is an independent implementation, so its code takes its own license; the SAM 3

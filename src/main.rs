@@ -14,7 +14,7 @@ use sam3rs::{BoxPrompt, PointPrompt, Precision, RgbImage, Sam3, VISUAL_PROMPT};
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(about = "SAM 3 image segmentation on CUDA")]
+#[command(about = "SAM 3 image segmentation on CUDA or Metal")]
 struct Args {
     image: PathBuf,
     /// Noun phrase to detect, alone or with boxes

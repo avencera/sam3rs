@@ -31,6 +31,8 @@ def test_imports_without_gpu() -> None:
     assert 0 < sam3rs.SCORE_THRESHOLD < 1
 
 
+# a Mac always has its GPU, so there is no device to hide there
+@pytest.mark.skipif(sys.platform != "linux", reason="CUDA backend only")
 def test_load_fails_cleanly_without_gpu(tmp_path: Path) -> None:
     # hiding every device stands in for a machine without one; on a CI runner without
     # a driver the same call fails on the missing libcuda instead
@@ -50,6 +52,13 @@ def test_load_fails_cleanly_without_gpu(tmp_path: Path) -> None:
     assert "driver" in message or "device" in message, message
     # the GPU is checked before the model files, so a GPU-less machine never reads them
     assert "vocab" not in message, message
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Metal backend only")
+def test_metal_rejects_tf32(tmp_path: Path) -> None:
+    # the precision is checked before the device and the model files, so this needs neither
+    with pytest.raises(sam3rs.Sam3rsError, match="CUDA mode"):
+        sam3rs.Sam3.load(tmp_path, precision="tf32")
 
 
 def test_cli_rejects_mixed_prompts(capsys: pytest.CaptureFixture[str]) -> None:
@@ -170,6 +179,7 @@ def test_batched_points_match_single_calls(model: sam3rs.Sam3, dogs: tuple[dict[
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(sys.platform != "linux", reason="CUDA backend only")
 def test_loads_one_cublas(model: sam3rs.Sam3) -> None:
     # a second copy, such as a CUDA toolkit's beside the pip wheel, can leave libcublas
     # on another release's libcublasLt
