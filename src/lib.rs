@@ -60,8 +60,12 @@
 //!
 //! As a library, `cargo add sam3rs`.
 //!
-//! On macOS, build the command from source with the same `cargo install` line; the release
-//! binary and the Python package are Linux only.
+//! On macOS, build the command from this repository; the release binary and the Python
+//! package are Linux only:
+//!
+//! ```sh
+//! cargo install --git https://github.com/avencera/sam3rs --features cli
+//! ```
 //!
 //! # What it runs
 //!
@@ -111,8 +115,8 @@
 //! Both modes pass the image parity gate below, and `fp32` passes the video gate on both
 //! clips. `bf16` passes it on the three-object clip. On the one-object clip, two
 //! candidate masks on the prompted frame score within 0.001 of each other and BF16
-//! rounding picks the other one, so the object is then tracked at IoU 0.988 against FP32
-//! PyTorch, level with PyTorch's own BF16 run on that clip.
+//! rounding picks the other one, so the object is then tracked at IoU 0.987 against FP32
+//! PyTorch, below the 0.997 of PyTorch's own BF16 run on that clip.
 //!
 //! Milliseconds on an M4 Pro (20-core GPU, macOS 27) with the osam benchmark protocol
 //! (dogs.jpg, masks at full resolution on the host), against the official SAM 3 package
