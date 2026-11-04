@@ -307,38 +307,26 @@
 
 #![warn(missing_docs)]
 
-mod blaslt;
-mod cublas;
-mod detector;
-mod gpu;
+mod cuda;
 #[cfg(feature = "online")]
 mod hub;
 mod image;
 mod masks;
-mod nvtx;
-mod ops;
-mod pipeline;
-mod point;
+mod output;
 mod posenc;
-mod text;
+mod precision;
+mod prompt;
 mod tokenizer;
-mod video;
-mod vision;
 mod weights;
 
-#[cfg(test)]
-mod stage_tests;
-#[cfg(test)]
-mod video_tests;
-
-pub use detector::BoxPrompt;
-pub use gpu::Precision;
+pub use cuda::{Embedding, Sam3, VideoTracker};
 #[cfg(feature = "online")]
 pub use hub::{MODEL_FILES, MODEL_REPO, download_model};
 pub use image::{MAX_IMAGE_SIDE, RgbImage};
 pub use masks::MaskBuffer;
-pub use pipeline::{
-    Detection, Detections, Embedding, POINT_BATCH, PointMask, PointMasks, SCORE_THRESHOLD, Sam3, VISUAL_PROMPT,
+pub use output::{
+    Detection, Detections, POINT_BATCH, PointMask, PointMasks, SCORE_THRESHOLD, TrackedFrame, TrackedObject,
+    VISUAL_PROMPT,
 };
-pub use point::PointPrompt;
-pub use video::{TrackedFrame, TrackedObject, VideoTracker};
+pub use precision::Precision;
+pub use prompt::{BoxPrompt, PointPrompt};

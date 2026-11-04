@@ -10,14 +10,18 @@ use std::path::PathBuf;
 use eyre::{Result, ensure, eyre};
 use safetensors::{Dtype, SafeTensors};
 
-use crate::detector::{BoxPrompt, Detector};
-use crate::gpu::{Gpu, Precision, Tensor, launch};
-use crate::image::{RgbImage, preprocess};
-use crate::ops::{B256, ew};
-use crate::point::{LOW_RES, MaskResize, PointDecoder, PointPrompt, clamped_masks, fill_holes};
-use crate::text::TextEncoder;
+use crate::cuda::detector::Detector;
+use crate::cuda::gpu::{Gpu, Tensor, launch};
+use crate::cuda::image::preprocess;
+use crate::cuda::ops::{B256, ew};
+use crate::cuda::point::{LOW_RES, MaskResize, PointDecoder, clamped_masks, fill_holes};
+use crate::cuda::text::TextEncoder;
+use crate::cuda::vision::{Backbone, Fpn, Neck, Trunk};
+use crate::image::RgbImage;
+use crate::precision::Precision;
+use crate::prompt::BoxPrompt;
+use crate::prompt::PointPrompt;
 use crate::tokenizer::Tokenizer;
-use crate::vision::{Backbone, Fpn, Neck, Trunk};
 use crate::weights::Weights;
 
 fn fixture(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {

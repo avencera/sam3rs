@@ -1,4 +1,5 @@
-//! Loads the Hugging Face format `model.safetensors` (all F32) straight onto the GPU
+//! Reads the Hugging Face format `model.safetensors` (all F32) from a memory map; each
+//! backend uploads the tensors it needs
 //!
 //! `weights_schema.txt` lists the name and shape of every tensor sam3rs reads. Opening a
 //! checkpoint checks all of them up front, so a wrong or truncated file fails with the
@@ -12,8 +13,6 @@ use std::sync::LazyLock;
 use eyre::{Result, WrapErr, bail, eyre};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
-
-use crate::gpu::{Gpu, Tensor};
 
 /// One `name dim,dim,...` line per tensor, from the facebook/sam3 checkpoint
 static SCHEMA: LazyLock<HashMap<&'static str, Vec<usize>>> = LazyLock::new(|| {
@@ -82,13 +81,9 @@ impl Weights {
         SCHEMA.contains_key(name)
     }
 
-    pub fn get(&self, gpu: &Gpu, name: &str) -> Result<Tensor> {
-        let (data, shape) = self.host(name)?;
-        gpu.upload(data, &shape)
-    }
-
-    /// Several tensors concatenated along dim 0, such as separate q/k/v projections
-    pub fn concat(&self, gpu: &Gpu, names: &[String]) -> Result<Tensor> {
+    /// Several tensors concatenated along dim 0, such as separate q/k/v projections, on
+    /// the host
+    pub fn host_concat(&self, names: &[String]) -> Result<(Vec<f32>, Vec<usize>)> {
         let mut data = Vec::new();
         let mut shape: Option<Vec<usize>> = None;
         for name in names {
@@ -105,6 +100,6 @@ impl Weights {
             }
         }
         let shape = shape.ok_or_else(|| eyre!("concat of nothing"))?;
-        gpu.upload(data, &shape)
+        Ok((data, shape))
     }
 }

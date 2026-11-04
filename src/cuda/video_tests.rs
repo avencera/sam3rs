@@ -16,11 +16,13 @@ use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 
-use crate::gpu::{Buf, Gpu, Precision, Tensor, launch};
-use crate::pipeline::Sam3;
-use crate::point::{LOW_RES, MASK_TOKEN_ROW, PointImage, PointPrompt};
-use crate::video::VideoTracker;
-use crate::vision::{GRID, IMAGE_SIZE};
+use crate::cuda::gpu::{Buf, Gpu, Tensor, launch};
+use crate::cuda::pipeline::Sam3;
+use crate::cuda::point::{LOW_RES, MASK_TOKEN_ROW, PointImage};
+use crate::cuda::video::VideoTracker;
+use crate::cuda::vision::{GRID, IMAGE_SIZE};
+use crate::precision::Precision;
+use crate::prompt::PointPrompt;
 
 /// Stage tolerances in FP32 (rel L2 on the reference's own inputs): every stage is a
 /// handful of FP32 GEMMs and reductions, which reorder sums but don't lose precision
@@ -612,7 +614,7 @@ fn attention_d256() -> Result<()> {
         let t = gpu.upload(x.to_vec(), &[x.len() / w, w])?;
         let out = gpu.alloc_bytes(x.len() * 2)?;
         // rope_rows = 0 only converts, so the angle tables are never read
-        launch!(gpu, "rope_rows_f16", crate::ops::ew(x.len() / 2), crate::ops::B256, 0;
+        launch!(gpu, "rope_rows_f16", crate::cuda::ops::ew(x.len() / 2), crate::cuda::ops::B256, 0;
             out.slice::<u32>(), &t, &t, &t, w, 0usize)?;
         Ok(out)
     };
@@ -623,9 +625,9 @@ fn attention_d256() -> Result<()> {
             let (q, k, v) = (values(lq * D, 512.0), values(lk * D, 256.0), values(lk * dv, 256.0));
             let (q16, k16, v16) = (to_f16(&gpu, &q, D)?, to_f16(&gpu, &k, D)?, to_f16(&gpu, &v, dv)?);
             let out = if dv == D {
-                crate::ops::attention_f16_d256(&gpu, &q16, &k16, &v16, lq, lk)?
+                crate::cuda::ops::attention_f16_d256(&gpu, &q16, &k16, &v16, lq, lk)?
             } else {
-                crate::ops::attention_f16_qk256_v64(&gpu, &q16, &k16, &v16, lq, lk)?
+                crate::cuda::ops::attention_f16_qk256_v64(&gpu, &q16, &k16, &v16, lq, lk)?
             };
             ensure!(out.shape() == [lq, dv], "output shape {:?}", out.shape());
             let got = gpu.download(&out)?;

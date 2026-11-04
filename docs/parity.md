@@ -20,7 +20,7 @@ boxes, mask logits) for one fixture.
 
 ## Video
 
-The video tracker's gates are ignored tests in `src/video_tests.rs`, against fixtures
+The video tracker's gates are ignored tests in `src/cuda/video_tests.rs`, against fixtures
 from `scripts/video_reference.py dump`: upstream's tracker in true FP32 on a clip, with
 every stage's inputs and outputs on a few frames.
 

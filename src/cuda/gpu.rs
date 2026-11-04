@@ -6,6 +6,7 @@
 //! [`Device`], so the stream, pool and context outlive each allocation whatever order
 //! their owners drop in
 
+use crate::precision::Precision;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -18,18 +19,18 @@ use cudarc::driver::sys::{self as cu, CUdeviceptr, CUfunction, CUmemoryPool, CUm
 use cudarc::driver::{CudaContext, CudaStream, result as cur};
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 
-use crate::blaslt::{BlasLt, Epilogue, Operands};
-use crate::cublas::Cublas;
+use crate::cuda::blaslt::{BlasLt, Epilogue, Operands};
+use crate::cuda::cublas::Cublas;
 
 /// Kernels from the cuda-oxide crate `crates/sam3rs-kernels` as PTX for compute
 /// capability 8.0, the first with the BF16 `mma.sync` the attention kernel uses. The
 /// driver JIT-compiles it for the GPU it runs on; `scripts/build-ptx.sh` regenerates both
 /// tiers
-static PTX_SM80: &str = concat!(include_str!("../kernels/ptx/sam3.sm80.ptx"), "\0");
+static PTX_SM80: &str = concat!(include_str!("../../kernels/ptx/sam3.sm80.ptx"), "\0");
 
 /// The same kernels as compute_120 PTX for RTX 50 series and newer. On an RTX 5090 it
 /// encodes about 3% faster than JIT-compiling the compute_80 tier
-static PTX_SM120: &str = concat!(include_str!("../kernels/ptx/sam3.sm120.ptx"), "\0");
+static PTX_SM120: &str = concat!(include_str!("../../kernels/ptx/sam3.sm120.ptx"), "\0");
 
 /// Oldest driver API cuBLAS 13 runs on, as `cuDriverGetVersion` reports it. The PTX (ISA 8.7
 /// at most) needs no newer one
@@ -219,7 +220,7 @@ impl From<&mut Tensor> for Arg {
 /// `usize` a `u32` size. Use [`Arg::slice`] or [`Buf::slice`] for other slices
 macro_rules! launch {
     ($gpu:expr, $name:expr, $grid:expr, $block:expr, $smem:expr; $($arg:expr),* $(,)?) => {
-        $gpu.launch($name, $grid, $block, $smem, vec![$($crate::gpu::Arg::from($arg)),*])
+        $gpu.launch($name, $grid, $block, $smem, vec![$($crate::cuda::gpu::Arg::from($arg)),*])
     };
 }
 pub(crate) use launch;
@@ -254,70 +255,6 @@ impl Mat {
     pub fn stride(mut self, stride: usize) -> Self {
         self.stride = stride;
         self
-    }
-}
-
-/// Numeric mode for the whole pipeline
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Precision {
-    /// Strict FP32 (no TF32 or BF16 anywhere): the parity reference path. cuBLAS GEMMs
-    /// run in pedantic math and cuBLASLt linears with FP32 compute, with bias and
-    /// activations fused into their epilogues. The vision backbone's attention runs a
-    /// fused flash-attention kernel on FP32 FMAs with an online softmax, so it never
-    /// writes the score matrix; the detector's attention stays materialized
-    Fp32,
-    /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
-    /// Runtime's CUDA provider runs FP32 models by default, with FP32 weights and
-    /// activations and bias and activations fused into cuBLASLt epilogues. Attention
-    /// without a causal mask or additive bias, the detector's box-biased cross-attention
-    /// included, runs a fused flash-attention kernel on TF32 tensor cores with an FP32
-    /// softmax; the rest stays materialized
-    ///
-    /// The first call of each GEMM shape times cuBLASLt's top candidate algorithms and
-    /// switches from its first choice only to one more than 5% faster. A candidate near
-    /// that margin can win in one run and lose in the next, so outputs can differ
-    /// slightly between runs (about 0.00001 in score)
-    Tf32,
-    /// Tensor-core GEMMs with FP32 accumulation. The vision backbone, necks, text encoder
-    /// MLP and fusion encoder FFN keep BF16 weights and activations; the rest of the text
-    /// encoder and fusion encoder, the detector and point decoder keep FP32 ones, and
-    /// cuBLAS may round their GEMM inputs to BF16 (`CUBLAS_COMPUTE_32F_FAST_16BF`), though
-    /// it picks TF32 kernels for most of them. Unmasked attention with head dim 32 or 64,
-    /// and the detector's box-biased cross-attention, run the fused kernel. It computes
-    /// scores from BF16 q and k as they are, or rounds FP32 q and k to FP16 and sums
-    /// their scores in FP16; either way it rounds v to FP16 and sums each 64-key P @ V
-    /// tile in FP16 before adding it to FP32 totals
-    Bf16,
-}
-
-impl Precision {
-    const ALL: [Self; 3] = [Self::Fp32, Self::Tf32, Self::Bf16];
-
-    /// The mode's name, which `parse` reads back: `"fp32"`, `"tf32"` or `"bf16"`
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Fp32 => "fp32",
-            Self::Tf32 => "tf32",
-            Self::Bf16 => "bf16",
-        }
-    }
-}
-
-/// Writes [`Precision::as_str`]
-impl std::fmt::Display for Precision {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(self.as_str())
-    }
-}
-
-impl std::str::FromStr for Precision {
-    type Err = eyre::Report;
-
-    fn from_str(s: &str) -> Result<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|p| p.as_str() == s)
-            .ok_or_else(|| eyre!("unknown precision {s:?}, expected fp32, tf32 or bf16"))
     }
 }
 

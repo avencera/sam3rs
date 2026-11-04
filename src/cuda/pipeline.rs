@@ -1,32 +1,33 @@
 //! End-to-end SAM 3 image inference: encode an image once, then answer text, box and
 //! point prompts against the cached features
 
+use crate::output::{
+    Detection, Detections, HOLE_AREA, POINT_BATCH, PointMask, PointMasks, SCORE_THRESHOLD, VISUAL_PROMPT,
+};
 use std::cell::{Cell, OnceCell};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eyre::{Result, ensure};
 
-use crate::detector::{BoxPrompt, Detector, DetectorImage, QUERIES};
-use crate::gpu::{Arg, Gpu, Precision, Tensor, launch};
-use crate::image::{RgbImage, preprocess};
-use crate::masks::{MaskBuffer, MaskPool};
-use crate::nvtx::range;
-use crate::ops::{B256, ew, upload_i32};
-use crate::point::{
-    LOW_RES, MaskResize, PointDecoder, PointImage, PointPrompt, argmax, clamped_masks, fill_holes, pick_masks,
+use crate::cuda::detector::{Detector, DetectorImage, QUERIES};
+use crate::cuda::gpu::{Arg, Gpu, Tensor, launch};
+use crate::cuda::image::preprocess;
+use crate::cuda::nvtx::range;
+use crate::cuda::ops::{B256, ew, upload_i32};
+use crate::cuda::point::{
+    LOW_RES, MaskResize, PointDecoder, PointImage, argmax, clamped_masks, fill_holes, pick_masks,
 };
-use crate::text::{TextEncoder, TextFeatures};
+use crate::cuda::text::{TextEncoder, TextFeatures};
+use crate::cuda::video::Tracker;
+use crate::cuda::vision::{Backbone, Neck, Trunk};
+use crate::image::RgbImage;
+use crate::masks::{MaskBuffer, MaskPool};
+use crate::precision::Precision;
+use crate::prompt::BoxPrompt;
+use crate::prompt::PointPrompt;
 use crate::tokenizer::Tokenizer;
-use crate::video::Tracker;
-use crate::vision::{Backbone, Neck, Trunk};
 use crate::weights::Weights;
-
-/// `Sam3Processor.confidence_threshold`
-pub const SCORE_THRESHOLD: f32 = 0.5;
-
-/// Text used for box-only prompts, as in upstream and osam
-pub const VISUAL_PROMPT: &str = "visual";
 
 /// Tells models apart, so an embedding is only used with the model that made it
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(0);
@@ -49,144 +50,6 @@ impl Embedding {
     /// Height of the encoded image in pixels
     pub fn height(&self) -> usize {
         self.height
-    }
-}
-
-/// One detected instance; its mask is [`Detections::mask`]
-#[derive(Clone, Debug)]
-pub struct Detection {
-    /// sigmoid(logit) * sigmoid(presence)
-    pub score: f32,
-    /// `[x0, y0, x1, y1]` in pixels, not clamped to the image
-    pub bbox: [f32; 4],
-    /// Index of the DETR query (0 to 199) that produced it
-    pub query: usize,
-}
-
-/// The instances [`Sam3::detect`] found, in DETR query order, with all their masks in
-/// one buffer
-///
-/// One buffer lets callers take every mask without copying it again: at 2560 px a mask
-/// is 5 MB, and copying a stack of them into fresh memory cost more than the detection
-#[derive(Clone, Debug, Default)]
-pub struct Detections {
-    instances: Vec<Detection>,
-    masks: MaskBuffer,
-}
-
-impl Detections {
-    /// Number of instances
-    pub fn len(&self) -> usize {
-        self.instances.len()
-    }
-
-    /// Whether nothing scored above [`SCORE_THRESHOLD`]
-    pub fn is_empty(&self) -> bool {
-        self.instances.is_empty()
-    }
-
-    /// The instances, without their masks
-    pub fn iter(&self) -> std::slice::Iter<'_, Detection> {
-        self.instances.iter()
-    }
-
-    /// Mask of instance `i`: `height * width` bytes, 1 = foreground
-    ///
-    /// Panics if `i` is out of range
-    pub fn mask(&self, i: usize) -> &[u8] {
-        assert!(i < self.len(), "mask {i} of {} detections", self.len());
-        let pixels = self.masks.len() / self.len();
-        &self.masks[i * pixels..][..pixels]
-    }
-
-    /// Every mask in instance order: `len * height * width` bytes, 1 = foreground
-    pub fn masks(&self) -> &[u8] {
-        &self.masks
-    }
-
-    /// Splits into the instances and the mask buffer of [`Detections::masks`]
-    pub fn into_parts(self) -> (Vec<Detection>, MaskBuffer) {
-        (self.instances, self.masks)
-    }
-}
-
-impl IntoIterator for Detections {
-    type Item = Detection;
-    type IntoIter = std::vec::IntoIter<Detection>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.instances.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a Detections {
-    type Item = &'a Detection;
-    type IntoIter = std::slice::Iter<'a, Detection>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-/// The best of the three candidate masks for a point prompt
-#[derive(Clone, Debug)]
-pub struct PointMask {
-    /// Predicted IoU of the chosen mask
-    pub score: f32,
-    /// `height * width` bytes, 1 = foreground
-    pub mask: MaskBuffer,
-}
-
-/// Largest background region of a point mask that hole filling turns into foreground,
-/// in low-res pixels, as upstream's `postprocess_masks`
-const HOLE_AREA: usize = 256;
-
-/// Most prompts of equal click counts [`Sam3::segment_points_batch`] decodes together.
-/// Batches of 32 measured no faster per prompt than 16 on an RTX 5090, and every
-/// decoder activation grows with the batch
-pub const POINT_BATCH: usize = 16;
-
-/// One mask per prompt of [`Sam3::segment_points_batch`], in prompt order, with all the
-/// masks in one buffer as in [`Detections`]
-#[derive(Clone, Debug, Default)]
-pub struct PointMasks {
-    scores: Vec<f32>,
-    masks: MaskBuffer,
-}
-
-impl PointMasks {
-    /// Number of prompts
-    pub fn len(&self) -> usize {
-        self.scores.len()
-    }
-
-    /// Whether there were no prompts
-    pub fn is_empty(&self) -> bool {
-        self.scores.is_empty()
-    }
-
-    /// Predicted IoU of each prompt's chosen mask
-    pub fn scores(&self) -> &[f32] {
-        &self.scores
-    }
-
-    /// Mask of prompt `i`: `height * width` bytes, 1 = foreground
-    ///
-    /// Panics if `i` is out of range
-    pub fn mask(&self, i: usize) -> &[u8] {
-        assert!(i < self.len(), "mask {i} of {} prompts", self.len());
-        let pixels = self.masks.len() / self.len();
-        &self.masks[i * pixels..][..pixels]
-    }
-
-    /// Every mask in prompt order: `len * height * width` bytes, 1 = foreground
-    pub fn masks(&self) -> &[u8] {
-        &self.masks
-    }
-
-    /// Splits into the scores and the mask buffer of [`PointMasks::masks`]
-    pub fn into_parts(self) -> (Vec<f32>, MaskBuffer) {
-        (self.scores, self.masks)
     }
 }
 

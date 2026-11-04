@@ -3,10 +3,11 @@
 
 use eyre::Result;
 
-use crate::gpu::{Arg, Gpu, Mat, Precision, Tensor, launch};
-use crate::ops::{
+use crate::cuda::gpu::{Arg, Gpu, Mat, Tensor, launch};
+use crate::cuda::ops::{
     Act, B256, Bf16, Conv3x3, ConvT2x2, LayerNorm, Linear, Mask, add_assign_bf16, attention, bias_act, ew,
 };
+use crate::precision::Precision;
 use crate::weights::Weights;
 
 pub const IMAGE_SIZE: usize = 1008;
