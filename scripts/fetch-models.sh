@@ -13,8 +13,13 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 repo=avencera/sam3-safetensors
+# the same commit the crate and the Python package load, read from src/hub.rs so the two
+# can't drift
+revision="$(sed -n 's/^pub const MODEL_REVISION: &str = "\([0-9a-f]*\)";$/\1/p' "$root/src/hub.rs")"
+[[ -n "$revision" ]] || { echo "MODEL_REVISION not found in src/hub.rs" >&2; exit 1; }
 if [[ "${1:-}" == "--official" ]]; then
   repo=facebook/sam3
+  revision=main
   shift
 fi
 hf="https://huggingface.co"
@@ -40,6 +45,8 @@ fi
 
 declare -A sha=(
   [model.safetensors]=6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a
+  [vocab.json]=5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363
+  [merges.txt]=9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a
   [sam3.pt]=9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e
 )
 
@@ -48,7 +55,7 @@ fetch() {
   [[ -s "$dest/$file" ]] && return 0
   mkdir -p "$dest"
   local status
-  status="$(curl -sSL --retry 5 -C - "${auth[@]}" -w '%{http_code}' -o "$dest/$file.part" "$hf/$repo/resolve/main/$file")"
+  status="$(curl -sSL --retry 5 -C - "${auth[@]}" -w '%{http_code}' -o "$dest/$file.part" "$hf/$repo/resolve/$revision/$file")"
   # a failed response leaves its error body in .part, which `-C -` would resume onto
   [[ "$status" == 200 || "$status" == 206 ]] || rm -f "$dest/$file.part"
   if [[ "$repo" == facebook/sam3 && ("$status" == 401 || "$status" == 403) ]]; then

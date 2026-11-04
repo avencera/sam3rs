@@ -47,9 +47,20 @@ impl PinnedModelRepository {
 const PINNED_MODEL_REPOSITORY: PinnedModelRepository = PinnedModelRepository::sam3();
 
 /// Downloads and caches the SAM 3 weights from [`MODEL_REPO`] at [`MODEL_REVISION`]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ModelManager {
     repo: HubRepo,
+}
+
+// hand-written so the repo's HTTP client, which holds any Hugging Face token in plain
+// text, never reaches logs
+impl std::fmt::Debug for ModelManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelManager")
+            .field("repo", &MODEL_REPO)
+            .field("revision", &MODEL_REVISION)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModelManager {
@@ -106,13 +117,18 @@ pub fn download_model() -> Result<PathBuf> {
 }
 
 fn download_error(error: HubError) -> eyre::Report {
-    // the repo is public, so 401 or 403 means the Hub rejected a token found in the
-    // environment rather than a missing one
+    // the repo is public, so 401 means the Hub rejected a token found in the environment
+    // rather than a missing one. 403 can also come from the storage server for an expired
+    // download link, so it gets no token advice of its own
     match error.status() {
-        Some(401 | 403) => eyre!(
+        Some(401) => eyre!(
             "{error}: Hugging Face rejected the token in HF_TOKEN or `hf auth login`'s token \
              file; no token is needed, so unset HF_TOKEN or run `hf auth logout`, or replace \
              it with a valid one"
+        ),
+        Some(403) => eyre!(
+            "{error}: access to {MODEL_REPO} was refused; retry the download, and if it keeps \
+             failing, unset HF_TOKEN or run `hf auth logout`, since no token is needed"
         ),
         _ => eyre!(
             "download {MODEL_REPO}: {error} (check the network connection, or pass a local \
