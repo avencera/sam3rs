@@ -9,13 +9,15 @@
 # Asset names match install.sh:
 #   sam3rs-<tag>-x86_64-unknown-linux-gnu.tar.gz
 #   sam3rs-<tag>-aarch64-apple-darwin.tar.gz
+#   sam3rs-<tag>-x86_64-pc-windows-msvc.zip (not used by install.sh)
 #
 # The Linux binary opens libcuda and cuBLAS with dlopen, which a static musl build can't
 # do, so Linux ships as glibc. cargo-zigbuild links against glibc 2.28, the same floor as
 # the manylinux_2_28 Python wheel, instead of the runner's newer glibc. The macOS binary
 # runs the Metal backend on Apple silicon; Intel Macs lack the Apple-family GPU features
-# its kernels use, so there is no x86_64 macOS build. There is no Windows build, since
-# there is no CPU backend.
+# its kernels use, so there is no x86_64 macOS build. The Windows binary runs the CUDA
+# backend like the Linux one, loading nvcuda.dll and cuBLAS at run time, and links the C
+# runtime statically so it runs without the Visual C++ redistributable.
 #
 # Pull requests that touch the release files build and check the archive without
 # uploading it.
@@ -91,13 +93,23 @@ jobs:
             # the .2.28 suffix asks cargo-zigbuild for that glibc floor
             build-target: x86_64-unknown-linux-gnu.2.28
             build-tool: cargo-zigbuild
+            rustflags: -D warnings
           - os: macos-26
             target: aarch64-apple-darwin
             build-target: aarch64-apple-darwin
             build-tool: cargo
+            rustflags: -D warnings
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            build-target: x86_64-pc-windows-msvc
+            build-tool: cargo
+            # RUSTFLAGS replaces the per-target flags rather than adding to them, so each
+            # target spells out its full set
+            rustflags: -D warnings -C target-feature=+crt-static
     env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
       # the Metal backend checks for macOS 26.1 when a model loads and names the version it
-      # found, which an older floor lets the binary reach; Linux ignores this
+      # found, which an older floor lets the binary reach; other OSes ignore this
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v6
@@ -134,6 +146,7 @@ jobs:
           build-tool: ${{ matrix.build-tool }}
           archive: $bin-$tag-$target
           tar: unix
+          zip: windows
           checksum: sha256
           locked: true
           dry-run: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -172,6 +185,30 @@ jobs:
           otool -L "$bin"
           if otool -L "$bin" | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
             echo "the binary links a library outside the system" >&2
+            exit 1
+          fi
+          "$bin" --help
+
+      # a static C runtime keeps vcruntime140.dll and the UCRT out of the imports, and
+      # CUDA must load at run time, so the binary may import only Windows system DLLs
+      - name: Check imports and the binary runs
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.upload.outputs.zip }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/archive"
+          # 7-Zip ships on the runner image, which the action itself uses to make the zip
+          7z x -y "$ARCHIVE" -o"$RUNNER_TEMP/archive"
+          bin="$RUNNER_TEMP/archive/sam3rs.exe"
+          rustup component add llvm-tools
+          readobj="$(cygpath -u "$(rustc --print sysroot)")/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-readobj.exe"
+          # a Windows tool's output ends lines with CRLF
+          imports="$("$readobj" --coff-imports "$bin" | tr -d '\r' | sed -n 's/^ *Name: //p' | sort -u)"
+          echo "$imports"
+          if grep -Eiv '^(kernel32|ntdll|advapi32|bcrypt|bcryptprimitives|ws2_32|userenv|secur32|crypt32|ole32|oleaut32|shell32|user32|synchronization|api-ms-win-core-[a-z0-9-]+)\.dll$' <<< "$imports"; then
+            echo "the binary imports a DLL outside Windows itself" >&2
             exit 1
           fi
           "$bin" --help

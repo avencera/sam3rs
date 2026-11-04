@@ -107,7 +107,7 @@ class PointMasks:
 class Sam3:
     """The SAM 3 model loaded on one GPU.
 
-    On Linux, needs an NVIDIA GPU with compute capability 8.0 or newer, driver r580 or
+    On Linux and Windows, needs an NVIDIA GPU with compute capability 8.0 or newer, driver r580 or
     newer, and cuBLAS 13 (``pip install "sam3rs[cuda]"`` or a CUDA 13 toolkit). On
     macOS, needs Apple silicon with macOS 26.1 or newer, and ``device`` must be 0. Calls
     from several threads take turns; each releases the GIL while the GPU works.

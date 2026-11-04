@@ -61,6 +61,13 @@
 //!
 //! As a library, `cargo add sam3rs`.
 //!
+//! On Windows x86_64, the release has `sam3rs-<tag>-x86_64-pc-windows-msvc.zip`
+//! holding `sam3rs.exe`, which needs nothing beyond the NVIDIA driver and cuBLAS 13: put
+//! the directory holding `cublas64_13.dll` and `cublasLt64_13.dll` on `PATH` (a CUDA 13
+//! toolkit keeps them in `%CUDA_PATH%\bin\x64`), or use the Python package, whose
+//! `cuda` extra brings its own. `cargo install sam3rs --features cli` builds the same command with
+//! the MSVC toolchain. The Windows build passes CI but hasn't been run on a GPU yet.
+//!
 //! On Apple silicon, `pip install sam3rs` installs the Python API and the same command,
 //! with no extra, and `cargo install sam3rs --features cli` builds the command there too.
 //!
@@ -147,15 +154,18 @@
 //! - An NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 //!   and driver r580 or newer. RTX 50 series GPUs load compute_120 PTX, others the
 //!   compute_80 floor. Benchmarks and parity runs use an RTX 5090.
-//! - Any cuBLAS 13 release (`libcublas.so.13`, `libcublasLt.so.13`), from a CUDA 13
-//!   toolkit or the `nvidia-cublas` pip wheel. All three precision modes are tested with
-//!   wheels from 13.0.0 to 13.8.2.
+//! - Any cuBLAS 13 release (`libcublas.so.13` and `libcublasLt.so.13` on Linux,
+//!   `cublas64_13.dll` and `cublasLt64_13.dll` on Windows), from a CUDA 13 toolkit or the
+//!   `nvidia-cublas` pip wheel. All three precision modes are tested on Linux with wheels
+//!   from 13.0.0 to 13.8.2.
 //! - Stable Rust (edition 2024), to build from source
 //!
-//! libcuda and cuBLAS load at run time, so a missing driver, GPU or cuBLAS makes
-//! `Sam3::load` return an error instead of panicking. A cuBLAS already loaded in the
-//! process, such as the pip wheel the Python package loads, is reused; otherwise the
-//! dynamic loader finds one (`LD_LIBRARY_PATH`, then the ldconfig cache).
+//! The driver (`libcuda.so.1`, or `nvcuda.dll` on Windows) and cuBLAS load at run time,
+//! so a missing driver, GPU or cuBLAS makes `Sam3::load` return an error instead of
+//! panicking. A cuBLAS already loaded in the process, such as the pip wheel the Python
+//! package loads, is reused; otherwise the dynamic loader finds one (on Linux
+//! `LD_LIBRARY_PATH`, then the ldconfig cache; on Windows the executable's directory,
+//! the system directories, the current directory, then `PATH`).
 //!
 //! Cargo features:
 //!
@@ -165,8 +175,8 @@
 //!   Face cache or a directory of your choice
 //! - `cli`: the `sam3rs` command
 //! - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems (CUDA backend only). The
-//!   only feature that needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
-//!   `/usr/local/cuda`).
+//!   only feature that needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, else
+//!   `CUDA_PATH`, which the Windows installer sets, else `/usr/local/cuda`).
 //!
 //! # Weights
 //!

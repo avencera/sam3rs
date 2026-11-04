@@ -1,4 +1,5 @@
-//! cuBLAS and cuBLASLt entry points, opened by their CUDA 13 sonames
+//! cuBLAS and cuBLASLt entry points, opened by their CUDA 13 sonames (DLL names on
+//! Windows)
 //!
 //! cudarc's loader tries the unversioned `libcublas.so` before `libcublas.so.13`. That
 //! name is a toolkit's dev symlink, so on a machine with a CUDA toolkit it opens the
@@ -14,6 +15,10 @@
 //! 13.1.1 wheel's) fails its first GEMM with `CUBLAS_STATUS_NOT_INITIALIZED`. A version
 //! check can't catch that pairing: libcublas answers `cublasGetProperty` and
 //! `cublasGetVersion_v2` with its libcublasLt's release
+//!
+//! Windows behaves the same way: loading a DLL by name reuses a loaded module with that
+//! name, wherever it came from, and `cublas64_13.dll` imports `cublasLt64_13.dll` by
+//! name, so opening Lt first pins both to one install there too
 
 use std::ffi::c_int;
 use std::sync::OnceLock;
@@ -23,10 +28,16 @@ use cudarc::cublaslt::sys as lt;
 use eyre::{Result, WrapErr};
 use libloading::Library;
 
-const BLAS_SONAME: &str = "libcublas.so.13";
+#[cfg(not(windows))]
+pub(crate) const BLAS_SONAME: &str = "libcublas.so.13";
 // libcublas links against libcublasLt by soname, so this one opens first and libcublas
 // then binds to the same copy
-const LT_SONAME: &str = "libcublasLt.so.13";
+#[cfg(not(windows))]
+pub(crate) const LT_SONAME: &str = "libcublasLt.so.13";
+#[cfg(windows)]
+pub(crate) const BLAS_SONAME: &str = "cublas64_13.dll";
+#[cfg(windows)]
+pub(crate) const LT_SONAME: &str = "cublasLt64_13.dll";
 
 /// Declares a table of C entry points and the code that resolves them from a library
 macro_rules! entry_points {

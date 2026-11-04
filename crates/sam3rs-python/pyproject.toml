@@ -19,6 +19,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -35,8 +36,11 @@ dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
 # cuBLAS 13 for the GEMMs; any 13.x release works (scripts/check-cublas-versions.sh tests the
-# oldest), and the NVIDIA driver supplies everything else
-cuda = ["nvidia-cublas>=13,<14; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# oldest), and the NVIDIA driver supplies everything else. Windows wheels exist for most
+# but not all 13.x releases, and pip takes the newest one there is
+cuda = [
+    "nvidia-cublas>=13,<14; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+]
 
 [project.scripts]
 sam3rs = "sam3rs.cli:main"

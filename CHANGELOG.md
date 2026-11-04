@@ -6,6 +6,15 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Windows x86_64 support on the CUDA backend. The runtime opens `nvcuda.dll`,
+  `cublas64_13.dll` and `cublasLt64_13.dll`, the release adds
+  `sam3rs-<tag>-x86_64-pc-windows-msvc.zip`, and PyPI gets a Windows wheel whose `cuda`
+  extra installs the Windows `nvidia-cublas` wheel. CI builds and tests it, but it
+  hasn't been run on a GPU yet.
+- The `nvtx` feature builds on Windows, finding the toolkit through `CUDA_PATH`.
+
 ## [0.3.0] - 2026-11-04
 
 ### Added
