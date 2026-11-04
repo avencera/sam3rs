@@ -25,8 +25,8 @@ use objc2_metal::{
     MTLBinding, MTLBindingType, MTLBuffer, MTLBufferBinding, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp, MTLCompileOptions, MTLComputeCommandEncoder,
     MTLComputePassDescriptor, MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLLanguageVersion,
-    MTLLibrary, MTLMathMode, MTLPipelineOption, MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLGPUFamily,
+    MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLPipelineOption, MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
 use crate::precision::Precision;
@@ -591,6 +591,13 @@ impl Gpu {
             v.patchVersion
         );
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| eyre!("no Metal device"))?;
+        // an Intel Mac can run macOS 26 but its GPU lacks the Apple-family features the
+        // kernels use, so fail here rather than at kernel compile, after the weight load
+        ensure!(
+            device.supportsFamily(MTLGPUFamily::Apple7),
+            "the Metal backend needs Apple silicon (M1 or newer), and this GPU is {}",
+            device.name()
+        );
         let queue = device.newCommandQueue().ok_or_else(|| eyre!("Metal could not create a command queue"))?;
         let build = {
             let device = device.clone();
