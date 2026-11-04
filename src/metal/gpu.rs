@@ -11,7 +11,7 @@
 //! kernel can still touch those bytes
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -92,12 +92,21 @@ struct Raw(Retained<ProtocolObject<dyn MTLBuffer>>);
 unsafe impl Send for Raw {}
 unsafe impl Sync for Raw {}
 
-/// Freed buffers by size class, each with the batch that last used it
+/// A freed buffer, the batch that last used it, and its stamp in [`PoolState::order`]
+struct Free {
+    raw: Raw,
+    batch: u64,
+    stamp: u64,
+}
+
+/// Freed buffers by size class
 #[derive(Default)]
 struct PoolState {
-    free: HashMap<usize, Vec<(Raw, u64)>>,
-    /// Size classes in the order buffers were freed, to drop the oldest first
-    order: VecDeque<usize>,
+    free: HashMap<usize, Vec<Free>>,
+    /// The size class of every cached buffer by stamp, oldest first, so eviction drops the
+    /// oldest; a reused buffer leaves it, which keeps it as long as the cache
+    order: BTreeMap<u64, usize>,
+    next_stamp: u64,
     bytes: usize,
 }
 
@@ -135,15 +144,16 @@ impl Pool {
         let found = st.free.get_mut(&class).and_then(|list| {
             let i = match completed {
                 // the oldest is the likeliest to be done
-                Some(done) => list.iter().position(|(_, batch)| *batch <= done)?,
+                Some(done) => list.iter().position(|f| f.batch <= done)?,
                 None => list.len().checked_sub(1)?,
             };
-            Some(list.swap_remove(i).0)
+            Some(list.swap_remove(i))
         });
         let raw = match found {
-            Some(raw) => {
+            Some(free) => {
+                st.order.remove(&free.stamp);
                 st.bytes -= class;
-                raw
+                free.raw
             }
             None => {
                 drop(st);
@@ -161,16 +171,18 @@ impl Pool {
         let class = raw.0.length();
         let batch = self.open.load(std::sync::atomic::Ordering::Relaxed);
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        st.free.entry(class).or_default().push((raw, batch));
-        st.order.push_back(class);
+        let stamp = st.next_stamp;
+        st.next_stamp += 1;
+        st.free.entry(class).or_default().push(Free { raw, batch, stamp });
+        st.order.insert(stamp, class);
         st.bytes += class;
         while st.bytes > POOL_LIMIT {
-            let Some(oldest) = st.order.pop_front() else { break };
+            let Some((stamp, oldest)) = st.order.pop_first() else { break };
             if let Some(list) = st.free.get_mut(&oldest)
-                && !list.is_empty()
+                && let Some(i) = list.iter().position(|f| f.stamp == stamp)
             {
                 // the GPU retains a buffer its queued commands use, so releasing ours is safe
-                list.remove(0);
+                list.swap_remove(i);
                 st.bytes -= oldest;
             }
         }
@@ -524,6 +536,11 @@ fn timestamps(device: &ProtocolObject<dyn MTLDevice>) -> (u64, u64) {
 /// Committed command buffers not yet seen complete, with their batch numbers
 type Inflight = VecDeque<(u64, Retained<ProtocolObject<dyn MTLCommandBuffer>>)>;
 
+/// A failed command buffer's error description
+fn failure_reason(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
+    cb.error().map_or_else(|| "unknown error".into(), |e| e.localizedDescription().to_string())
+}
+
 pub struct Gpu {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// The kernel build [`Gpu::new`] started, until the first use joins it
@@ -533,6 +550,8 @@ pub struct Gpu {
     inflight: RefCell<Inflight>,
     /// The highest batch known complete
     completed: Cell<u64>,
+    /// The error of a failed batch that `poll` retired, for the next `synchronize` to return
+    failure: RefCell<Option<String>>,
     pool: Arc<Pool>,
     precision: Precision,
     /// GPU time of each dispatch, when `SAM3RS_METAL_PROFILE` is set
@@ -569,6 +588,7 @@ impl Gpu {
             batch: RefCell::default(),
             inflight: RefCell::default(),
             completed: Cell::new(0),
+            failure: RefCell::default(),
             pool,
             precision,
             profile: profile.map(RefCell::new),
@@ -743,12 +763,11 @@ impl Gpu {
     pub fn synchronize(&self) -> Result<()> {
         self.flush()?;
         let mut inflight = self.inflight.borrow_mut();
-        let mut failure = None;
+        let mut failure = self.failure.take();
         while let Some((batch, cb)) = inflight.pop_front() {
             cb.waitUntilCompleted();
             if cb.status() == MTLCommandBufferStatus::Error && failure.is_none() {
-                let why = cb.error().map_or_else(|| "unknown error".into(), |e| e.localizedDescription().to_string());
-                failure = Some(eyre!("Metal command buffer failed: {why}"));
+                failure = Some(failure_reason(&cb));
             }
             self.completed.set(batch);
         }
@@ -756,7 +775,7 @@ impl Gpu {
         if let Some(p) = &self.profile {
             p.borrow_mut().resolve(&self.pool.device)?;
         }
-        failure.map_or(Ok(()), Err)
+        failure.map_or(Ok(()), |why| Err(eyre!("Metal command buffer failed: {why}")))
     }
 
     /// Marks finished command buffers complete without waiting, so their buffers become
@@ -764,8 +783,16 @@ impl Gpu {
     fn poll(&self) {
         let mut inflight = self.inflight.borrow_mut();
         while let Some((batch, cb)) = inflight.front() {
-            if !matches!(cb.status(), MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error) {
-                break;
+            match cb.status() {
+                MTLCommandBufferStatus::Completed => {}
+                // kept so the next `synchronize` fails instead of returning stale results
+                MTLCommandBufferStatus::Error => {
+                    let mut failure = self.failure.borrow_mut();
+                    if failure.is_none() {
+                        *failure = Some(failure_reason(cb));
+                    }
+                }
+                _ => break,
             }
             self.completed.set(*batch);
             inflight.pop_front();
