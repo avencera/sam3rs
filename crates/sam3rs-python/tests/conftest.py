@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -39,9 +40,13 @@ def _gpu_ready() -> str | None:
     return None
 
 
-@pytest.fixture(scope="session", params=["fp32", "tf32", "bf16"])
+# tf32 names a CUDA tensor-core mode, which the Metal backend rejects
+PRECISIONS = ["fp32", "bf16"] if sys.platform == "darwin" else ["fp32", "tf32", "bf16"]
+
+
+@pytest.fixture(scope="session", params=PRECISIONS)
 def model(request: pytest.FixtureRequest) -> sam3rs.Sam3:
-    """The local checkpoint in each precision; skips without weights."""
+    """The local checkpoint in each precision the backend runs; skips without weights."""
     reason = _gpu_ready()
     if reason:
         pytest.skip(reason)

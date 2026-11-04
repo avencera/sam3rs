@@ -1,9 +1,9 @@
 # sam3rs
 
-SAM 3 image segmentation on NVIDIA GPUs from Python, fast enough to run live. Encode an
-image once, then find objects by noun phrase, box exemplars or clicks. The model runs in
-a native Rust/CUDA runtime ([sam3rs](https://github.com/avencera/sam3rs)) with no
-PyTorch dependency.
+SAM 3 image segmentation on NVIDIA GPUs and Apple silicon from Python, fast enough to
+run live. Encode an image once, then find objects by noun phrase, box exemplars or
+clicks. The model runs in a native Rust runtime ([sam3rs](https://github.com/avencera/sam3rs)),
+on CUDA or Metal, with no PyTorch dependency.
 
 On an RTX 5090 in BF16, against the official PyTorch implementation:
 
@@ -36,7 +36,7 @@ arrive as numpy bool arrays without a copy. Methods and the full tables are in t
 pip install "sam3rs[cuda]"
 ```
 
-Linux x86_64 only. You need:
+On Linux x86_64 you need:
 
 - an NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 - NVIDIA driver r580 or newer
@@ -44,8 +44,17 @@ Linux x86_64 only. You need:
   release works; it is tested with releases from 13.0.0 to 13.8.2. Leave the extra out
   if a CUDA 13 toolkit is already on the library path.
 
+On macOS you need Apple silicon (M1 or newer) with macOS 26.1 or newer. The same command
+works there: the `cuda` extra installs nothing on a Mac, so `pip install sam3rs` is
+enough. `precision` takes `"bf16"` or `"fp32"`; `"tf32"` is a CUDA mode and raises
+`sam3rs.Sam3rsError`. On an M4 Pro in BF16, encoding an image takes 824 ms, a click
+6.2 ms, a box prompt 93 ms and a text prompt 103 ms, 1.19x to 2.9x faster than the
+official SAM 3 package on PyTorch's MPS backend
+([Apple silicon results](https://github.com/avencera/sam3rs#apple-silicon)).
+
 The package imports on any machine. Loading a model without a usable GPU, driver or
-cuBLAS raises `sam3rs.Sam3rsError` that says what is missing.
+cuBLAS, or on a macOS older than 26.1, raises `sam3rs.Sam3rsError` that says what is
+missing.
 
 ## Weights
 
@@ -102,7 +111,8 @@ the fusion encoder's feed-forward layers in BF16, every other matrix multiply on
 cores with BF16 or TF32 inputs, and most attention fused on FP16 tensor cores. `precision="tf32"` keeps FP32
 weights and activations but runs the matrix multiplies on TF32 tensor cores, as ONNX
 Runtime does for FP32 models, with most attention fused on TF32 tensor cores.
-`precision="fp32"` is the strict FP32 reference path. On an RTX 5090, encoding an image
+`precision="fp32"` is the strict FP32 reference path. On Metal, `bf16` runs the vision
+backbone and both necks in BF16 and every later stage in FP32. On an RTX 5090, encoding an image
 takes about 31 ms in BF16, 64 ms in TF32 and 118 ms in FP32; a point prompt 1.4 to
 1.7 ms; a box prompt 5.4, 7.8 and 27 ms; and a text prompt 6.9, 9.2 and 29 ms.
 

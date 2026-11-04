@@ -1,4 +1,4 @@
-"""SAM 3 image segmentation on NVIDIA GPUs, backed by the sam3rs Rust/CUDA runtime.
+"""SAM 3 image segmentation on NVIDIA GPUs and Apple silicon, backed by the sam3rs runtime.
 
 Encode an image once, then answer any number of text, box and point prompts::
 
@@ -105,11 +105,12 @@ class PointMasks:
 
 
 class Sam3:
-    """The SAM 3 model loaded on one CUDA GPU.
+    """The SAM 3 model loaded on one GPU.
 
-    Needs an NVIDIA GPU with compute capability 8.0 or newer, driver r580 or newer,
-    and cuBLAS 13 (``pip install "sam3rs[cuda]"`` or a CUDA 13 toolkit). Calls from
-    several threads take turns; each releases the GIL while the GPU works.
+    On Linux, needs an NVIDIA GPU with compute capability 8.0 or newer, driver r580 or
+    newer, and cuBLAS 13 (``pip install "sam3rs[cuda]"`` or a CUDA 13 toolkit). On
+    macOS, needs Apple silicon with macOS 26.1 or newer, and ``device`` must be 0. Calls
+    from several threads take turns; each releases the GIL while the GPU works.
     """
 
     def __init__(self, native: _native.Model) -> None:
@@ -133,7 +134,8 @@ class Sam3:
 
         ``bf16`` runs the vision backbone on BF16 tensor cores with fused attention;
         ``fp32`` is the strict FP32 reference path, about 3.5x slower to encode; ``tf32``
-        is the FP32 path with TF32 tensor-core GEMMs, as ONNX Runtime runs FP32 models.
+        is the FP32 path with TF32 tensor-core GEMMs, as ONNX Runtime runs FP32 models,
+        and raises :class:`Sam3rsError` on Metal.
         """
         prepare_libraries()
         with _cuda_hint():

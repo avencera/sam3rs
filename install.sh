@@ -1,11 +1,12 @@
 #!/bin/sh
 # Install the sam3rs command from GitHub Releases.
 #
-# One-liner (Linux x86_64):
+# One-liner (Linux x86_64, or Apple silicon on macOS):
 #   curl -LSfs https://github.com/avencera/sam3rs/releases/latest/download/install.sh | sh
 #
 # Asset names match .github/workflows/release.yml:
 #   sam3rs-<tag>-x86_64-unknown-linux-gnu.tar.gz
+#   sam3rs-<tag>-aarch64-apple-darwin.tar.gz
 #
 # Modified from avencera/homebased and avencera/rustywind, which started from
 # https://github.com/japaric/trust.
@@ -72,17 +73,38 @@ expand_dest() {
     printf '%s\n' "$dest"
 }
 
-# the binary opens libcuda and cuBLAS with dlopen, which a static musl build can't do,
-# so the one release target is glibc on x86_64
+# the Linux binary opens libcuda and cuBLAS with dlopen, which a static musl build can't
+# do, so Linux ships glibc on x86_64; macOS ships Apple silicon only, since the Metal
+# kernels need an Apple-family GPU
 target_triple() {
     case "$(uname -s)/$(uname -m)" in
         Linux/x86_64 | Linux/amd64)
             printf 'x86_64-unknown-linux-gnu\n'
             ;;
+        Darwin/arm64)
+            printf 'aarch64-apple-darwin\n'
+            ;;
+        Darwin/x86_64)
+            # a shell under Rosetta reports x86_64 on Apple silicon
+            if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+                printf 'aarch64-apple-darwin\n'
+            else
+                return 1
+            fi
+            ;;
         *)
             return 1
             ;;
     esac
+}
+
+# sha256sum is missing on older macOS, where shasum prints the same "<hash>  <file>" line
+sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1"
+    else
+        shasum -a 256 "$1"
+    fi
 }
 
 # true when the dynamic loader can find the library: LD_LIBRARY_PATH first, then the
@@ -146,15 +168,17 @@ need mktemp
 need install
 need rm
 need uname
-need sha256sum
 need awk
+if ! command -v sha256sum > /dev/null 2>&1 && ! command -v shasum > /dev/null 2>&1; then
+    err "need sha256sum or shasum (command not found)"
+fi
 
 if [ -z "${HOME:-}" ]; then
     err "HOME is not set"
 fi
 
 target=$(target_triple) \
-    || err "no release binary for $(uname -s)/$(uname -m); the release covers Linux x86_64. Elsewhere, build with: cargo install sam3rs --features cli"
+    || err "no release binary for $(uname -s)/$(uname -m); the release covers Linux x86_64 and Apple silicon. Elsewhere, build with: cargo install sam3rs --features cli"
 
 if [ -z "$dest" ]; then
     dest=$HOME/.local/bin
@@ -193,7 +217,7 @@ curl -fsSL "$url/releases/download/$tag/$base.sha256" -o "$td/$base.sha256" \
 
 # sha256sum output, one "<hash>  <file>" line per uploaded asset
 expected=$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1 }' "$td/$base.sha256")
-actual=$(sha256sum "$td/$archive" | cut -d ' ' -f 1)
+actual=$(sha256 "$td/$archive" | cut -d ' ' -f 1)
 if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
     err "checksum mismatch for $archive: expected ${expected:-nothing}, got $actual"
 fi
@@ -220,6 +244,11 @@ case ":$PATH:" in
         say "warning: $dest is not on PATH"
         ;;
 esac
+
+# the Metal backend needs nothing beyond macOS, so only Linux has libraries to check
+if [ "$target" != x86_64-unknown-linux-gnu ]; then
+    exit 0
+fi
 
 # the binary loads these at run time, so a missing one only fails when a model loads
 if ! has_library libcuda.so.1; then

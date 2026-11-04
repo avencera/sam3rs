@@ -35,7 +35,7 @@ def _coords(n: int):
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="sam3rs", description="SAM 3 image segmentation on CUDA")
+    p = argparse.ArgumentParser(prog="sam3rs", description="SAM 3 image segmentation on CUDA or Metal")
     p.add_argument("image", type=Path)
     p.add_argument("--text", help="noun phrase to detect, alone or with boxes")
     p.add_argument(

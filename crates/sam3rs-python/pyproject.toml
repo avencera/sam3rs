@@ -5,19 +5,20 @@ build-backend = "maturin"
 [project]
 name = "sam3rs"
 dynamic = ["version"]
-description = "Real-time SAM 3 image segmentation on NVIDIA GPUs with text, box and click prompts, up to 93x faster than PyTorch, in native Rust/CUDA"
+description = "Real-time SAM 3 image segmentation on NVIDIA GPUs and Apple silicon with text, box and click prompts, up to 93x faster than PyTorch, in native Rust"
 readme = "README.md"
 requires-python = ">=3.11"
 # keep in step with the workspace license in the root Cargo.toml
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Praveen Perera" }]
-keywords = ["sam3", "segment-anything", "segmentation", "cuda", "computer-vision"]
+keywords = ["sam3", "segment-anything", "segmentation", "cuda", "metal", "computer-vision"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: GPU :: NVIDIA CUDA",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -57,7 +58,7 @@ strip = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["gpu: needs an NVIDIA GPU, cuBLAS 13 and the weights in models/sam3"]
+markers = ["gpu: needs a GPU (NVIDIA with cuBLAS 13, or Apple silicon on macOS 26.1+) and the weights in models/sam3"]
 
 [tool.ruff]
 line-length = 120

@@ -83,7 +83,7 @@ impl Sam3 {
     /// Loads `model.safetensors`, `vocab.json` and `merges.txt` from `dir` onto the Metal
     /// GPU; `device` must be 0, the Mac's one GPU
     ///
-    /// Fails without a Metal 4 GPU (Apple silicon on macOS 26 or later), with
+    /// Fails without a Metal 4 GPU (Apple silicon on macOS 26.1 or later), with
     /// [`Precision::Tf32`], which has no Metal equivalent, and when the checkpoint
     /// doesn't match the SAM 3 weight schema
     pub fn load(dir: &Path, device: usize, precision: Precision) -> Result<Self> {

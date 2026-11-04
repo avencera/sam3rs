@@ -40,17 +40,18 @@ Metal with the same API; see [Apple silicon](#apple-silicon).
 
 ## Install
 
-The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer), from the latest GitHub
-release into `~/.local/bin`:
+The `sam3rs` command for Linux x86_64 (glibc 2.28 or newer) or Apple silicon (macOS 26.1
+or newer), from the latest GitHub release into `~/.local/bin`:
 
 ```sh
 curl -LSfs https://github.com/avencera/sam3rs/releases/latest/download/install.sh | sh
 ```
 
-`--to DIR` installs somewhere else and `--tag vX.Y.Z` picks a release. The binary
-needs cuBLAS 13 on the library path, which usually means a CUDA 13 toolkit. Without
-one, the Python package's `sam3rs` command takes the same arguments and brings its
-own cuBLAS (about 470 MB, downloaded on the first run):
+`--to DIR` installs somewhere else and `--tag vX.Y.Z` picks a release. On macOS the
+binary needs nothing else. On Linux it needs cuBLAS 13 on the library path, which
+usually means a CUDA 13 toolkit. Without one, the Python package's `sam3rs` command
+takes the same arguments and brings its own cuBLAS (about 470 MB, downloaded on the
+first run):
 
 ```sh
 uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
@@ -65,12 +66,8 @@ cargo install sam3rs --features cli
 
 As a library, `cargo add sam3rs`.
 
-On macOS, build the command from this repository; the release binary and the Python
-package are Linux only:
-
-```sh
-cargo install --git https://github.com/avencera/sam3rs --features cli
-```
+On Apple silicon, `pip install sam3rs` installs the Python API and the same command,
+with no extra, and `cargo install sam3rs --features cli` builds the command there too.
 
 ## What it runs
 
@@ -142,7 +139,7 @@ the official package. Video tracking at 720p takes 931 ms a frame with one objec
 [Benchmarks](https://github.com/avencera/sam3rs/blob/master/docs/benchmarks.md#apple-silicon)
 compares osam and other ports and describes the Metal kernels.
 
-Requirements: Apple silicon with macOS 26 or newer (Metal 4). Only the M4 Pro has been
+Requirements: Apple silicon with macOS 26.1 or newer (Metal 4). Only the M4 Pro has been
 tested. Setting `SAM3RS_METAL_PROFILE` gives each kernel its own compute pass with GPU
 timestamps at its boundaries and prints GPU time by kernel when the model is dropped
 (`trace` also prints every dispatch). The extra passes change scheduling, so end-to-end

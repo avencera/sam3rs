@@ -6,6 +6,8 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
 ### Added
 
 - Apple silicon support: on macOS, sam3rs builds a Metal backend with the same API, every
@@ -13,8 +15,10 @@ All notable changes to sam3rs are documented here. The format follows
   an M4 Pro it encodes an image in 824 ms, answers a click in 6.2 ms, a box in 93 ms and
   a text prompt in 103 ms, 1.19-2.9x faster than the official SAM 3 package on PyTorch's
   MPS backend, and tracks three objects through 720p video at 1.2 s a frame. It needs
-  macOS 26 or newer; the release binary and Python package remain Linux only, so on
-  macOS build from source.
+  Apple silicon and macOS 26.1 or newer.
+- macOS release artifacts for Apple silicon: a Python wheel, so `pip install sam3rs`
+  and `uvx sam3rs` work there, and a prebuilt `sam3rs` command that the install script
+  now picks on an Apple silicon Mac.
 
 ### Changed
 
@@ -22,6 +26,7 @@ All notable changes to sam3rs are documented here. The format follows
   video tables and the reproduction commands moved to `docs/benchmarks.md`, the parity
   gates and test commands to `docs/parity.md`, and the per-mode precision details to
   the `Precision` docs.
+- The crate and PyPI descriptions name Apple silicon next to NVIDIA GPUs.
 
 ## [0.1.1] - 2026-11-03
 
@@ -53,6 +58,7 @@ First release.
 - The `sam3rs` Python package on PyPI, with numpy in and out, the same command, and
   cuBLAS from the `cuda` extra.
 
-[Unreleased]: https://github.com/avencera/sam3rs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/avencera/sam3rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/avencera/sam3rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/avencera/sam3rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/avencera/sam3rs/releases/tag/v0.1.0

@@ -343,7 +343,7 @@ fn build_kernels(device: &ProtocolObject<dyn MTLDevice>) -> Result<Kernels> {
     let source = NSString::from_str(&SOURCES.concat());
     let library = device
         .newLibraryWithSource_options_error(&source, Some(&options))
-        .map_err(|e| eyre!("compile the Metal kernels (needs macOS 26 or newer): {}", e.localizedDescription()))?;
+        .map_err(|e| eyre!("compile the Metal kernels (needs macOS 26.1 or newer): {}", e.localizedDescription()))?;
     let names: Vec<String> = library.functionNames().iter().map(|n| n.to_string()).collect();
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).min(8);
     let library = &library;
@@ -576,16 +576,18 @@ impl Gpu {
             "tf32 is a CUDA mode (TF32 tensor cores); on Metal use fp32, whose GEMMs run near the BF16 rate"
         );
         // older systems lack Metal 4 and some selectors the kernel build calls, which would
-        // raise an Objective-C exception instead of returning an error
+        // raise an Objective-C exception instead of returning an error. 26.1 rather than
+        // 26.0 because the MSL spec (table 7.3) first allows bfloat matmul2d operands and
+        // get_left_input_cooperative_tensor there, and the one kernel library holds both
         let info = NSProcessInfo::processInfo();
         let v = info.operatingSystemVersion();
         ensure!(
             info.isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
                 majorVersion: 26,
-                minorVersion: 0,
+                minorVersion: 1,
                 patchVersion: 0
             }),
-            "the Metal backend needs macOS 26 or newer (Metal 4), and this is macOS {}.{}.{}",
+            "the Metal backend needs macOS 26.1 or newer (Metal 4), and this is macOS {}.{}.{}",
             v.majorVersion,
             v.minorVersion,
             v.patchVersion

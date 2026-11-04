@@ -113,11 +113,29 @@ jobs:
             exit 1
           fi
 
-  # one abi3 wheel; it builds without a GPU or CUDA toolkit because CUDA is loaded at
-  # run time, and there is no CPU or macOS backend to build for
+  # one abi3 wheel per backend. Linux builds without a GPU or CUDA toolkit because CUDA
+  # is loaded at run time; macOS needs no Xcode Metal toolchain because the OS compiles
+  # the kernels when a model loads. There is no CPU backend to build for
   python-wheel:
-    name: Python wheel (Linux x86_64)
-    runs-on: ubuntu-24.04
+    name: Python wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - name: macOS arm64
+            os: macos-26
+            target: aarch64-apple-darwin
+            manylinux: ""
+    env:
+      # the Metal backend needs macOS 26.1, but the wheel keeps the arm64 floor so pip
+      # installs it on any Apple silicon Mac, where an older macOS gets the runtime's
+      # error naming the version instead of a failed sdist build; Linux ignores this
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v6
 
@@ -125,8 +143,8 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: build
-          target: x86_64-unknown-linux-gnu
-          manylinux: "2_28"
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist -m crates/sam3rs-python/Cargo.toml
           # tag builds are published, so they never reuse objects from the shared cache
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -146,7 +164,7 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v7
         with:
-          name: python-wheel-x86_64-unknown-linux-gnu
+          name: python-wheel-${{ matrix.target }}
           path: dist/*.whl
 
   python-sdist:
@@ -197,16 +215,23 @@ jobs:
           name: python-sdist
           path: dist/*.tar.gz
 
-  # a GitHub runner has no NVIDIA driver, so this checks that the wheel imports, that
-  # model loads fail with Sam3rsError, and the argument checks; the GPU parity tests skip
+  # a GitHub runner has no NVIDIA driver and no weights, so this checks that the wheel
+  # imports, that model loads fail with Sam3rsError, and the argument checks; the GPU
+  # parity tests skip
   python-tests:
-    name: Python tests
+    name: Python tests (${{ matrix.os }}, ${{ matrix.python }})
     needs: python-wheel
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, macos-26]
         python: ["3.11", "3.14"]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-26
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
 
@@ -216,7 +241,7 @@ jobs:
       - name: Download wheel
         uses: actions/download-artifact@v8
         with:
-          name: python-wheel-x86_64-unknown-linux-gnu
+          name: python-wheel-${{ matrix.target }}
           path: dist
 
       - name: Install wheel into a fresh environment
@@ -268,7 +293,8 @@ jobs:
             exit 1
           fi
           ls -la dist
-          test "$(find dist -type f | wc -l)" -eq 2
+          # the Linux and macOS wheels and the sdist
+          test "$(find dist -type f | wc -l)" -eq 3
           for file in dist/*; do
             case "$(basename "$file")" in
               "sam3rs-${version}"-*.whl | "sam3rs-${version}.tar.gz") ;;
