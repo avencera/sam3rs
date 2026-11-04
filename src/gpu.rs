@@ -260,12 +260,23 @@ impl Mat {
 /// Numeric mode for the whole pipeline
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// Strict FP32 (no TF32 or BF16 anywhere): the parity reference path. The vision
-    /// backbone's attention runs a fused flash-attention kernel on FP32 FMAs; the
-    /// detector's attention stays materialized
+    /// Strict FP32 (no TF32 or BF16 anywhere): the parity reference path. cuBLAS GEMMs
+    /// run in pedantic math and cuBLASLt linears with FP32 compute, with bias and
+    /// activations fused into their epilogues. The vision backbone's attention runs a
+    /// fused flash-attention kernel on FP32 FMAs with an online softmax, so it never
+    /// writes the score matrix; the detector's attention stays materialized
     Fp32,
     /// The FP32 path with TF32 tensor-core GEMMs (FP32 accumulation), the way ONNX
-    /// Runtime's CUDA provider runs FP32 models by default
+    /// Runtime's CUDA provider runs FP32 models by default, with FP32 weights and
+    /// activations and bias and activations fused into cuBLASLt epilogues. Attention
+    /// without a causal mask or additive bias, the detector's box-biased cross-attention
+    /// included, runs a fused flash-attention kernel on TF32 tensor cores with an FP32
+    /// softmax; the rest stays materialized
+    ///
+    /// The first call of each GEMM shape times cuBLASLt's top candidate algorithms and
+    /// switches from its first choice only to one more than 5% faster. A candidate near
+    /// that margin can win in one run and lose in the next, so outputs can differ
+    /// slightly between runs (about 0.00001 in score)
     Tf32,
     /// Tensor-core GEMMs with FP32 accumulation. The vision backbone, necks, text encoder
     /// MLP and fusion encoder FFN keep BF16 weights and activations; the rest of the text

@@ -6,6 +6,13 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The README is shorter. Benchmark protocol, per-stage timings, the large-photo and
+  video tables and the reproduction commands moved to `docs/benchmarks.md`, the parity
+  gates and test commands to `docs/parity.md`, and the per-mode precision details to
+  the `Precision` docs.
+
 ## [0.1.1] - 2026-11-03
 
 ### Changed

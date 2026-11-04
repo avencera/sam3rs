@@ -14,7 +14,7 @@
 //! | Text prompt, 2560x1600 | 6.9 ms | 20.7 ms | **3.0x** |
 //! | Encode a new image | 30.9 ms | 39.4 ms | **1.28x** |
 //!
-//! That makes these real time. In frames a second on the same card:
+//! Fast enough that a mask can follow the cursor. In frames a second on the same card:
 //!
 //! | Live workload | sam3rs | PyTorch |
 //! |---|---|---|
@@ -25,16 +25,12 @@
 //! | Track one object, 720p video | **29** | 22 |
 //! | Track three objects, 720p video | **23** | 17 |
 //!
-//! The cursor moves at 120 Hz, so 120 means sam3rs answers every position; each side
-//! answers the newest one whenever it finishes the last. Even at 108 MP sam3rs draws 90
-//! masks a second, against PyTorch's 1. The 8-mask row is one batched call per move. A new
-//! frame with a text prompt is an encode plus the prompt, 31 + 7 ms against 39 + 21 ms.
-//! Tracking holds 28 frames a second at 1080p, and at 720p it is faster than PyTorch
-//! eager, `torch.compile`, CUDA graphs and ComfyUI, in less GPU memory than any of them.
+//! The cursor moves at 120 Hz, so 120 means sam3rs keeps up with every move. At 720p the
+//! tracker also beats `torch.compile`, CUDA graphs and ComfyUI, in less GPU memory than
+//! any of them.
 //!
 //! The [Python package](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python)
-//! gives the same speed with numpy in and out. Full benchmarks are under
-//! [Results](#results).
+//! gives the same speed with numpy in and out.
 //!
 //! # Install
 //!
@@ -46,17 +42,16 @@
 //! ```
 //!
 //! `--to DIR` installs somewhere else and `--tag vX.Y.Z` picks a release. The binary
-//! finds cuBLAS on the library path, so it needs a CUDA 13 toolkit. Without one, run the
-//! Python package's `sam3rs` command, which takes the same arguments and brings cuBLAS
-//! from the `nvidia-cublas` wheel (about 470 MB, downloaded on the first run):
+//! needs cuBLAS 13 on the library path, which usually means a CUDA 13 toolkit. Without
+//! one, the Python package's `sam3rs` command takes the same arguments and brings its
+//! own cuBLAS (about 470 MB, downloaded on the first run):
 //!
 //! ```sh
 //! uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
 //! ```
 //!
 //! `pip install "sam3rs[cuda]"` installs the same command and the Python API. Building
-//! the command from source needs no CUDA toolkit, though running it needs cuBLAS as the
-//! release binary does:
+//! from source needs no CUDA toolkit, though running the result still needs cuBLAS:
 //!
 //! ```sh
 //! cargo install sam3rs --features cli
@@ -75,66 +70,47 @@
 //! - the SAM 3 video tracker: memory attention over a bank of past frames, the memory
 //!   encoder, object pointers and upstream's memory selection
 //!
-//! Image features stay on the GPU between prompts. Kernels that cuBLAS doesn't cover are
-//! Rust, written with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) in
-//! [crates/sam3rs-kernels](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-kernels). They ship as prebuilt PTX in
-//! `kernels/ptx` that the driver compiles when the model loads, so building sam3rs needs no
-//! CUDA toolkit or cuda-oxide. `scripts/build-ptx.sh` regenerates the PTX after a kernel
+//! Image features stay on the GPU between prompts, which is where much of the speed comes
+//! from. Kernels that cuBLAS doesn't cover are Rust, written with
+//! [cuda-oxide](https://github.com/NVIDIA/cuda-rust) in
+//! [crates/sam3rs-kernels](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-kernels).
+//! They ship as prebuilt PTX in `kernels/ptx`, so building sam3rs needs neither a CUDA
+//! toolkit nor cuda-oxide. `scripts/build-ptx.sh` regenerates the PTX after a kernel
 //! change.
-//!
-//! Model downloads use [`hf-fetch`](https://github.com/avencera/hf-fetch), a small
-//! blocking client with rustls and the shared Python Hugging Face cache. The `online`
-//! feature enables downloads; local model loading works without it.
 //!
 //! # Precision modes
 //!
-//! - `bf16` (default): tensor-core GEMMs with FP32 accumulation, bias and activations
-//!   fused into cuBLASLt epilogues, and a fused flash-attention kernel. The backbone,
-//!   necks, text encoder MLP and fusion encoder FFN keep BF16 weights and activations.
-//!   The rest of the text encoder and fusion encoder, the detector and the point decoder
-//!   keep FP32 ones, and cuBLAS may round their GEMM inputs to BF16, though on an RTX 5090
-//!   it picks TF32 kernels for most of them. Their unmasked attention, and the detector's
-//!   box-biased cross-attention, also run the fused kernel, which rounds q, k and v to
-//!   FP16 and sums scores in FP16. In every fused attention, v is FP16 and each 64-key
-//!   P @ V tile is summed in FP16 before it is added to FP32 totals.
-//! - `tf32`: the `fp32` path with TF32 tensor-core GEMMs (FP32 accumulation), the way
-//!   ONNX Runtime's CUDA provider runs FP32 models by default, with bias and activations
-//!   fused into cuBLASLt epilogues. The first call of each GEMM shape times cuBLASLt's top
-//!   candidate algorithms and switches from its first choice only to one more than 5%
-//!   faster. A candidate near that margin can win in one run and lose in the next, so
-//!   outputs can differ slightly between runs (about 0.00001 in score). FP32 weights and
-//!   activations. Attention without a causal mask or additive bias, the detector's
-//!   box-biased cross-attention included, runs a fused flash-attention kernel on TF32
-//!   tensor cores with an FP32 softmax; the rest stays materialized.
-//! - `fp32`: strict FP32, with no TF32 or BF16 anywhere: cuBLAS GEMMs in pedantic math and
-//!   cuBLASLt linears with FP32 compute, with bias and activations fused into their
-//!   epilogues. The vision backbone's attention runs a fused flash-attention kernel on FP32
-//!   FMAs with an online softmax, so it never writes the score matrix; the detector's
-//!   attention stays materialized. This is the reference path for parity checks.
+//! - `bf16` (default): BF16 tensor-core GEMMs with FP32 accumulation and a fused
+//!   flash-attention kernel.
+//! - `tf32`: FP32 weights and activations with TF32 tensor-core GEMMs, the way ONNX
+//!   Runtime's CUDA provider runs FP32 models by default. GEMM autotuning can make
+//!   scores differ by about 0.00001 between runs.
+//! - `fp32`: strict FP32, with no TF32 or BF16 anywhere. The reference path for parity
+//!   checks.
+//!
+//! [`Precision`](https://docs.rs/sam3rs/latest/sam3rs/enum.Precision.html) lists which
+//! stages keep which types in each mode.
 //!
 //! # Requirements
 //!
 //! - An NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 //!   and driver r580 or newer. RTX 50 series GPUs load compute_120 PTX, others the
 //!   compute_80 floor. Benchmarks and parity runs use an RTX 5090.
-//! - Any cuBLAS 13 release (`libcublas.so.13`, `libcublasLt.so.13`) on the library path,
-//!   from a CUDA 13 toolkit or the `nvidia-cublas` pip wheel. All three precision modes
-//!   are tested with wheels from 13.0.0 to 13.8.2.
+//! - Any cuBLAS 13 release (`libcublas.so.13`, `libcublasLt.so.13`), from a CUDA 13
+//!   toolkit or the `nvidia-cublas` pip wheel. All three precision modes are tested with
+//!   wheels from 13.0.0 to 13.8.2.
 //! - Stable Rust (edition 2024), to build from source
 //!
-//! libcuda and cuBLAS load at run time. A missing driver, GPU or cuBLAS makes
-//! `Sam3::load` return an error rather than panic. cuBLAS opens by those two sonames, so
-//! a copy already in the process, such as the pip wheel the Python package loads, is
-//! reused; otherwise the loader's search order picks one (`LD_LIBRARY_PATH`, then the
-//! ldconfig cache).
-//!
-//! `scripts/check-cublas-versions.sh` runs the Python package's tests on a GPU against the
-//! oldest cuBLAS 13 wheel, the one PyTorch's cu130 wheels pin and the newest.
+//! libcuda and cuBLAS load at run time, so a missing driver, GPU or cuBLAS makes
+//! `Sam3::load` return an error instead of panicking. A cuBLAS already loaded in the
+//! process, such as the pip wheel the Python package loads, is reused; otherwise the
+//! dynamic loader finds one (`LD_LIBRARY_PATH`, then the ldconfig cache).
 //!
 //! Cargo features:
 //!
 //! - `online` (default): `Sam3::from_pretrained` and `download_model`, which fetch the
-//!   weights from Hugging Face
+//!   weights from Hugging Face through [`hf-fetch`](https://github.com/avencera/hf-fetch)
+//!   into the shared Python Hugging Face cache
 //! - `cli`: the `sam3rs` command
 //! - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems. The only feature that
 //!   needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
@@ -198,16 +174,14 @@
 //! # }
 //! ```
 //!
-//! All of a call's masks share one host buffer. Dropping the result hands that memory
-//! back to the model, so the next call writes its masks into pages that are already
-//! mapped. Faulting in fresh memory for 27 masks at 2560 px took about 27 ms.
+//! All of a call's masks share one host buffer. Drop the result before the next call and
+//! the model reuses that memory instead of faulting in fresh pages.
 //!
 //! ## Many objects from clicks
 //!
-//! `segment_points` segments one object from its clicks. To segment several objects in
-//! the same image, pass one prompt per object to `segment_points_batch`. It decodes
-//! them together on the GPU and returns the same scores and masks as one
-//! `segment_points` call per prompt, all in one host buffer:
+//! `segment_points` segments one object from its clicks. For several objects in the same
+//! image, pass one prompt per object to `segment_points_batch`, which decodes them
+//! together and returns the scores and masks the single calls would:
 //!
 //! ```no_run
 //! use sam3rs::{PointPrompt, Precision, RgbImage, Sam3};
@@ -228,10 +202,9 @@
 //! ```
 //!
 //! Prompts with the same click count share every decoder launch, up to `POINT_BATCH`
-//! (16) at a time. A prompt with a different count starts a separate batch. Scores match
-//! the single calls exactly in `fp32`. In `tf32` and `bf16`, cuBLAS picks other GEMM
-//! kernels for the taller batch, so scores can move by about as much as `tf32` and
-//! `bf16` already differ from `fp32`.
+//! (16) at a time. Scores match the single calls exactly in `fp32`. In `tf32` and `bf16`,
+//! cuBLAS picks other GEMM kernels for the taller batch, so scores can move by about as
+//! much as those modes already differ from `fp32`.
 //!
 //! ## Video tracking
 //!
@@ -265,13 +238,8 @@
 //!
 //! # Results
 //!
-//! Milliseconds on an RTX 5090 (driver 595.99, CUDA 13.2), following the osam benchmark
-//! protocol: `dogs.jpg` (2560x1600), one warm-up, then the median of 5. Model load and JPEG
-//! decoding are excluded. Prompts are one point (1439, 504), one box
-//! (1233, 376, 1649, 691), that box plus a negative box (1400, 500, 1500, 600), and the text
-//! "dog". Each prompt returns full-resolution masks on the host. The text prompt runs the
-//! text encoder on every call. Box prompts use the fixed text "visual", whose features
-//! sam3rs encodes once and reuses, while osam and PyTorch encode it again on every call.
+//! Milliseconds for `dogs.jpg` (2560x1600) on an RTX 5090, following the osam benchmark
+//! protocol, with full-resolution masks returned on the host:
 //!
 //! | Runtime | Encode | Point | Box | Neg box | Text |
 //! |---|---|---|---|---|---|
@@ -282,121 +250,27 @@
 //! | PyTorch 2.14.1 FP32 (TF32 off) | 129.5 | 25.4 | 33.3 | 33.6 | 31.7 |
 //! | **sam3rs `fp32`** | **117.6** (1.10x) | **1.7** (15x) | **26.6** (1.25x) | **26.9** (1.25x) | **28.8** (1.10x) |
 //!
-//! Each sam3rs row sits under the runtime that uses the same numerics, and its speedup
-//! over that row is in parentheses: `tf32` against osam, both FP32 with TF32 matmuls;
-//! `bf16` against PyTorch BF16; `fp32` against PyTorch FP32 with TF32 off.
+//! Each sam3rs row sits under the runtime with the same numerics, and the speedup in
+//! parentheses is over that row.
 //!
-//! Each row is the median of three runs.
+//! Outside the encoder, most of the gap is overhead that sam3rs avoids. osam downloads
+//! 133 MB of image features after encoding and uploads 117 MB of them for every detector
+//! call. PyTorch's click spends 28 of its 36 ms copying six float32 candidate masks to the
+//! host; sam3rs keeps the first pass on the GPU and downloads one mask at a byte per
+//! pixel. PyTorch's box and text prompts launch about 2.8k kernels and keep the GPU 46%
+//! busy, where sam3rs keeps it about 91% busy. Encode is GEMM-bound, so that's where the
+//! margin is thinnest.
 //!
-//! Where the time goes:
-//!
-//! - Image features stay on the GPU. osam downloads 133 MB of features at encode and
-//!   re-uploads 117 MB on every detector call, and part of its point decoder runs on the
-//!   CPU.
-//! - The point path is small kernels, hole filling included: a union-find over the
-//!   low-res masks in four launches. PyTorch's hole filling costs about 0.2 ms; most of
-//!   its point prompt is copying masks to the host. It upsamples all three candidates of
-//!   both passes to full size as float32 and copies them into freshly allocated host
-//!   memory: at 2560x1600, two 49 MB copies, 28 ms of a 36-38 ms prompt. sam3rs keeps
-//!   the first pass on the GPU and downloads one mask at one byte per pixel.
-//! - PyTorch's box and text prompts launch about 2.8k kernels each and keep the GPU 46%
-//!   busy. sam3rs issues about 0.6k GPU operations for a box prompt and 0.95k for a text
-//!   prompt, and keeps the GPU about 91% busy. A BF16 box prompt spends about 1.8 ms in the
-//!   fusion encoder, 1.6 ms in the mask head and 1.2 ms in the DETR decoder, then about
-//!   0.3 ms per kept mask copying it to the host, into memory reused from earlier calls.
-//!   The Python package views those bytes as numpy bool arrays without copying them.
-//! - Encode is GEMM-bound. The backbone MLP and qkv GEMMs run at 195-210 TFLOPS, close to
-//!   the card's dense BF16 rate with FP32 accumulation, so the margin over PyTorch BF16 is
-//!   small. The rest is fused bias and GELU epilogues, BF16 activations fed straight into
-//!   the next GEMM, and the fused attention kernel.
-//! - Strict FP32 has no tensor cores to lean on, so its encode is bound by the FP32 pipes.
-//!   The backbone's attention runs fused on them and takes about 16 ms of the encode,
-//!   where materializing the scores took 42 ms. Its linears run the same CUTLASS SIMT
-//!   GEMMs as PyTorch's, with bias and GELU fused into their epilogues.
-//!
-//! The bench example reproduces the sam3rs rows:
-//!
-//! ```sh
-//! cargo run --release --example bench -- --precision bf16
-//! cargo run --release --example bench -- --precision fp32
-//! ```
-//!
-//! ## Large photos
-//!
-//! The click gap grows with the photo. Measured through the Python package with both
-//! runtimes on cuBLAS 13.8.2, each photo at its own size and the mask returned at that
-//! size. A click runs both decoder passes and hole filling; the cursor columns count masks
-//! a second while a cursor moves at 120 Hz and each side answers the newest position:
-//!
-//! | Photo | sam3rs click | PyTorch click | Speedup | sam3rs cursor | PyTorch cursor |
-//! |---|---|---|---|---|---|
-//! | 1600x1200 (2 MP) | 1.6 ms | 7.8 ms | 4.9x | 120/s | 120/s |
-//! | 4288x2848 (12 MP) | 2.4 ms | 103.2 ms | 43x | 120/s | 10/s |
-//! | 7360x4912 (36 MP) | 4.3 ms | 316.1 ms | 74x | 120/s | 3/s |
-//! | 8160x6144 (50 MP) | 5.4 ms | 460.9 ms | 85x | 120/s | 2/s |
-//! | 12000x9000 (108 MP) | 9.9 ms | 924.7 ms | 93x | 90/s | 1/s |
-//!
-//! Eight clicks per cursor move in one batched call, on the 36 MP photo, take 35 ms
-//! against 2.6 s: 28 updates a second against 0.4.
-//!
-//! PyTorch's `predict_inst` returns all three candidates of both passes at full size as
-//! float32, 24 bytes per pixel, in freshly allocated host memory. sam3rs returns one mask
-//! at one byte per pixel.
-//!
-//! Segmenting everything, as a 16x16 grid of clicks run in batches through
-//! `segment_points_batch` and PyTorch's batched `predict_inst`, takes 1.46 s against
-//! 105.3 s on the 50 MP photo (72x) and 2.77 s against 221.7 s at 108 MP (80x).
-//!
-//! ## Video
-//!
-//! Steady-state milliseconds a frame on the same RTX 5090, BF16, one click per object on
-//! frame 0, masks at the video's size on the host: the median over frames 8 onward of a
-//! 64-frame 720p clip (`horses`), after one warm-up run. PyTorch runs upstream's
-//! tracker-only path (`build_sam3_video_model().tracker`) under BF16 autocast; ComfyUI is
-//! the core `SAM3_VideoTrack` node with SAM 3.1 multiplex FP16 weights, its node time over
-//! the frame count.
-//!
-//! | Runtime | 1 object | 3 objects | Peak VRAM |
-//! |---|---|---|---|
-//! | PyTorch 2.14.1 eager | 45.5 ms, 22 fps | 60.1 ms, 17 fps | 5.6-6.0 GB |
-//! | PyTorch 2.14.1 `torch.compile` | 42.3 ms, 24 fps | 55.9 ms, 18 fps | 5.8-6.5 GB |
-//! | PyTorch 2.14.1 CUDA graphs | 45.1 ms, 22 fps | 59.7 ms, 17 fps | 10-20 GB |
-//! | ComfyUI core (SAM 3.1 multiplex) | 44.7 ms, 22 fps | 46.3 ms, 22 fps | 3.8-4.0 GB |
-//! | **sam3rs `bf16`** | **34.8 ms, 29 fps** (1.31x) | **44.2 ms, 23 fps** (1.36x) | **3.4-3.7 GB** |
-//! | sam3rs `fp32` | 148.5 ms, 7 fps | 214.0 ms, 5 fps | 5.3-5.4 GB |
-//!
-//! The speedups in parentheses are over PyTorch eager. Over the fastest other runtime in
-//! each column, `torch.compile` for 1 object and ComfyUI for 3, they are 1.22x and 1.05x.
-//!
-//! At 1080p and 256 frames sam3rs takes 35.7 and 45.6 ms, 28 and 22 fps. The image encoder and tracker
-//! neck, shared by all objects, are about 30 ms of each frame. Each object adds 4.7 ms,
-//! about 1.8 of them in the memory cross-attention kernel and 0.44 in the memory
-//! self-attention. The GPU is about 99% busy, so CUDA graphs would
-//! save little. ComfyUI's multiplex tracker costs the same for 1 to 16 objects.
-//!
-//! ```sh
-//! cargo run --release --example bench_video -- --frames DIR --clip horses --objects 3
-//! ```
-//!
-//! `--frames` is a directory of decoded frames, read in name order. Clicks come from
-//! `tests/video_prompts.json` (`--prompts`). `--outputs DIR` writes the last run's
-//! scores and masks for an A/B gate.
-//!
-//! `scripts/video_reference.py bench` times the PyTorch rows. `scripts/bench_comfy.py
-//! video-click horses-720p-64:1 horses-720p-64:3` times the ComfyUI row through a stock
-//! ComfyUI server, with per-node times from `scripts/comfy_launch.py`.
-//! `scripts/nsys_frames.py` turns an nsys capture of either into per-frame GPU busy
-//! time, launches and stage times.
+//! [Benchmarks](https://github.com/avencera/sam3rs/blob/master/docs/benchmarks.md) has
+//! the full protocol, where each millisecond goes, the large-photo and video tables, and
+//! the commands that reproduce every row.
 //!
 //! # Parity
 //!
-//! `tests/parity.rs` runs four images and 13 prompts (text, box, negative box, points)
-//! through all three precision modes and compares against PyTorch FP32 outputs of the official
-//! implementation. The fixtures come from `scripts/reference.py dump`. The gate: the same
-//! kept DETR queries, scores within 0.01, box corners within 0.5% of the image's longer
-//! side, and mask IoU of at least 0.99.
-//!
-//! Worst case over 43 checks:
+//! `tests/parity.rs` runs four images and 13 prompts through all three precision modes
+//! and compares them with PyTorch FP32 outputs of the official implementation. Each check
+//! must keep the same DETR queries, with scores within 0.01, box corners within 0.5% of
+//! the image's longer side and mask IoU of at least 0.99. Worst case over 43 checks:
 //!
 //! | Mode | Max score delta | Max box delta | Min mask IoU |
 //! |---|---|---|---|
@@ -404,32 +278,9 @@
 //! | `tf32` | 0.0052 | 0.19 px | 0.9987 |
 //! | `bf16` | 0.0070 | 1.26 px | 0.9964 |
 //!
-//! ```sh
-//! cargo test --release --test parity -- --nocapture
-//! ```
-//!
-//! The ignored `stage_tests::stages` unit test (`cargo test --release --lib -- --ignored`)
-//! compares every intermediate stage (pixels, trunk, FPN levels, text features, scores,
-//! boxes, mask logits) for one fixture.
-//!
-//! The video tracker's gates are ignored tests in `src/video_tests.rs`, against fixtures
-//! from `scripts/video_reference.py dump`: upstream's tracker in true FP32 on a clip, with
-//! every stage's inputs and outputs on a few frames.
-//!
-//! - `video_stages` runs each stage (memory attention, memory encoder, decoder, pointer
-//!   MLP) on the reference's exact inputs: rel L2 within 1e-4 in `fp32` and 5e-3 in
-//!   `tf32` and `bf16` (4e-2 for the backbone and neck, the image path's encoder).
-//! - `video_e2e` tracks the whole clip and needs the reference's memory length, pointer
-//!   count and object presence on every frame, plus a mask IoU per object against FP32:
-//!   at least 0.99 in `fp32`, and in the reduced modes no worse than PyTorch's own BF16
-//!   run (mean minus 0.01, and its worst frame). Up to two frames an object are excused
-//!   from the worst-frame limit where the decoder's top two candidates were within 0.005
-//!   predicted IoU.
-//! - `video_e2e` in `bf16` also runs each checked frame's memory attention over the cached
-//!   per-frame keys against the FP32 model's on the same inputs (rel L2 within 5e-3).
-//! - `attention_d256` checks the two fused attention kernels (values of 256 for
-//!   self-attention, of 64 for the memory cross-attention) against an f64 softmax: rel L2
-//!   within 1e-3.
+//! The video tracker is checked stage by stage and end to end against upstream's tracker
+//! in FP32. On both test clips every mode tracks closer to FP32 than PyTorch's own BF16
+//! run:
 //!
 //! | Mode | Worst stage rel L2 | Mean IoU per object (horses, 3 objects) | Grazing (1 object) |
 //! |---|---|---|---|
@@ -438,27 +289,21 @@
 //! | `bf16` | 4.4e-3 | 0.9949 / 0.9977 / 0.9999 | 0.9997 |
 //! | PyTorch BF16 | | 0.9760 / 0.9918 / 0.9963 | 0.9966 |
 //!
-//! ```sh
-//! SAM3RS_VIDEO=models/video-parity/horses-720p-64-o3-fp32.safetensors SAM3RS_PRECISION=bf16 \
-//!     cargo test --release --lib video_tests -- --ignored --nocapture --test-threads 1
-//! ```
+//! [Parity](https://github.com/avencera/sam3rs/blob/master/docs/parity.md) has each
+//! gate, the stage tests and the commands to run them.
 //!
 //! # Known differences
 //!
-//! - JPEG decoding uses the `image` crate, which differs from PIL's libjpeg-turbo on a few
-//!   percent of bytes. Scores move by up to a few thousandths. The parity test feeds the
-//!   reference's decoded RGB to isolate the model.
+//! - JPEG decoding uses the `image` crate rather than PIL's libjpeg-turbo, which moves
+//!   scores by up to a few thousandths.
 //! - Text cleaning lowercases and collapses whitespace but doesn't port `ftfy` or HTML
 //!   unescaping.
-//! - Video tracking follows SAM 3's tracker-only path ("SAM 3 for SAM 2 video task")
-//!   from clicks on the first frame. The session predictors' per-frame detector, text
-//!   prompts on video, and SAM 3.1 aren't implemented.
-//! - In `bf16`, upstream rounds the memory's sine position encoding to BF16 under
-//!   autocast, and sam3rs keeps it in FP32.
-//! - The lowest `bf16` mask IoU (0.9914, a point prompt) comes from hole filling. A
-//!   rounding difference flips one low-resolution pixel, which cuts a 64-pixel background
-//!   region off from the rest. Hole filling turns background regions of up to 256 pixels
-//!   into foreground, so that region becomes part of the mask. The score is unaffected.
+//! - Video tracking is SAM 3's tracker-only path from first-frame clicks. The per-frame
+//!   detector, text prompts on video and SAM 3.1 aren't implemented.
+//! - In `bf16`, upstream rounds the memory's sine position encoding to BF16, and sam3rs
+//!   keeps it in FP32.
+//! - In `bf16`, hole filling can turn a one-pixel rounding difference into a 64-pixel mask
+//!   difference on a point prompt. The score is unaffected.
 
 #![warn(missing_docs)]
 
