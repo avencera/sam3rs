@@ -23,13 +23,13 @@ name = "sam3rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Real-time Meta SAM 3 on NVIDIA GPUs in native Rust/CUDA: text, box and click segmentation and video tracking, up to 93x faster than PyTorch"
+description = "Real-time Meta SAM 3 in native Rust on NVIDIA GPUs (CUDA) and Apple silicon (Metal): text, box and click segmentation and video tracking, up to 93x faster than PyTorch"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 documentation = "https://docs.rs/sam3rs"
 readme = "README.md"
-keywords = ["sam3", "segmentation", "cuda", "vision", "inference"]
+keywords = ["sam3", "segmentation", "cuda", "metal", "inference"]
 categories = ["computer-vision", "science"]
 include = [
     "/src/**",
@@ -60,6 +60,19 @@ cli = ["dep:clap", "dep:color-eyre"]
 nvtx = ["dep:cc"]
 
 [dependencies]
+bytemuck = "1"
+safetensors = "0.8.0"
+memmap2 = "0.9.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde_json = "1"
+regex = "1.13"
+eyre = "0.6"
+hf-fetch = { version = "0.1.2", default-features = false, optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+color-eyre = { version = "0.6", optional = true }
+
+# the CUDA backend, built everywhere but macOS
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 # libcuda and cuBLAS are loaded at run time and the kernels ship as PTX, so the crate
 # builds without a CUDA toolkit. The 13.0 API floor is cuBLAS 13's (driver r580+).
 # cuBLAS takes only its types from cudarc; src/cuda/cublas.rs opens it by soname instead
@@ -73,16 +86,41 @@ cudarc = { version = "0.19.10", default-features = false, features = [
 ] }
 # opens cuBLAS by soname; cudarc depends on the same version
 libloading = "0.9"
-bytemuck = "1"
-safetensors = "0.8.0"
-memmap2 = "0.9.12"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-serde_json = "1"
-regex = "1.13"
-eyre = "0.6"
-hf-fetch = { version = "0.1.2", default-features = false, optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-color-eyre = { version = "0.6", optional = true }
+
+# the Metal backend on macOS. Kernels are MSL source the OS compiles when a model loads,
+# so building needs no Xcode or Metal toolchain
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSError",
+    "NSDictionary",
+    # counter sample buffers for SAM3RS_METAL_PROFILE
+    "NSArray",
+    "NSData",
+    "NSRange",
+] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "MTLAllocation",
+    "MTLArgument",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePass",
+    "MTLComputePipeline",
+    "MTLCounters",
+    "MTLDataType",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
+half = "2"
 
 [build-dependencies]
 cc = { version = "1", optional = true }

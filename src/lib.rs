@@ -30,7 +30,8 @@
 //! any of them.
 //!
 //! The [Python package](https://github.com/avencera/sam3rs/tree/master/crates/sam3rs-python)
-//! gives the same speed with numpy in and out.
+//! gives the same speed with numpy in and out. On Macs, sam3rs runs on the GPU through
+//! Metal with the same API; see [Apple silicon](#apple-silicon).
 //!
 //! # Install
 //!
@@ -58,6 +59,9 @@
 //! ```
 //!
 //! As a library, `cargo add sam3rs`.
+//!
+//! On macOS, build the command from source with the same `cargo install` line; the release
+//! binary and the Python package are Linux only.
 //!
 //! # What it runs
 //!
@@ -91,7 +95,51 @@
 //! [`Precision`](https://docs.rs/sam3rs/latest/sam3rs/enum.Precision.html) lists which
 //! stages keep which types in each mode.
 //!
+//! # Apple silicon
+//!
+//! On macOS, sam3rs builds a Metal backend in place of the CUDA one, with the same API,
+//! prompts and video tracker. GEMMs and attention run on Metal 4 tensor ops (`matmul2d`
+//! from Metal Performance Primitives), and every other kernel is Metal Shading Language
+//! compiled while the weights load, so nothing beyond macOS needs installing.
+//!
+//! - `bf16` runs the vision backbone and both necks with BF16 weights and activations,
+//!   FP32 accumulation and an FP32 residual stream. Every later stage runs in FP32: Apple
+//!   GPUs do FP32 matrix math within about 20% of BF16, so BF16 would buy little there
+//! - `fp32` runs every stage in FP32
+//! - `tf32` returns an error, since it names a CUDA tensor-core mode
+//!
+//! Both modes pass the image parity gate below, and `fp32` passes the video gate on both
+//! clips. `bf16` passes it on the three-object clip. On the one-object clip, two
+//! candidate masks on the prompted frame score within 0.001 of each other and BF16
+//! rounding picks the other one, so the object is then tracked at IoU 0.988 against FP32
+//! PyTorch, level with PyTorch's own BF16 run on that clip.
+//!
+//! Milliseconds on an M4 Pro (20-core GPU, macOS 27) with the osam benchmark protocol
+//! (dogs.jpg, masks at full resolution on the host), against the official SAM 3 package
+//! on PyTorch's MPS backend in BF16 autocast:
+//!
+//! | Task | sam3rs `bf16` | sam3rs `fp32` | Official SAM 3, MPS | Speedup |
+//! |---|---|---|---|---|
+//! | Encode a new image | 824 | 1071 | 982 | **1.19x** |
+//! | Click to mask | 6.2 | 6.2 | 18.1 | **2.9x** |
+//! | Box prompt | 93 | 95 | 127 | **1.37x** |
+//! | Text prompt | 103 | 105 | 125 | **1.22x** |
+//!
+//! sam3rs peaks at 4.7 GB of memory in `bf16` and 5.7 GB in `fp32`, against 7.3 GB for
+//! the official package. Video tracking at 720p takes 931 ms a frame with one object and
+//! 1194 ms with three in `bf16` (1161 and 1421 in `fp32`).
+//! [Benchmarks](https://github.com/avencera/sam3rs/blob/master/docs/benchmarks.md#apple-silicon)
+//! compares osam and other ports and describes the Metal kernels.
+//!
+//! Requirements: Apple silicon with macOS 26 or newer (Metal 4). Only the M4 Pro has been
+//! tested. Setting `SAM3RS_METAL_PROFILE` gives each kernel its own compute pass with GPU
+//! timestamps at its boundaries and prints GPU time by kernel when the model is dropped
+//! (`trace` also prints every dispatch). The extra passes change scheduling, so end-to-end
+//! times then differ a little from a normal run.
+//!
 //! # Requirements
+//!
+//! Off macOS (on macOS, see [Apple silicon](#apple-silicon)):
 //!
 //! - An NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 //!   and driver r580 or newer. RTX 50 series GPUs load compute_120 PTX, others the
@@ -112,8 +160,8 @@
 //!   weights from Hugging Face through [`hf-fetch`](https://github.com/avencera/hf-fetch)
 //!   into the shared Python Hugging Face cache
 //! - `cli`: the `sam3rs` command
-//! - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems. The only feature that
-//!   needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
+//! - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems (CUDA backend only). The
+//!   only feature that needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
 //!   `/usr/local/cuda`).
 //!
 //! # Weights
@@ -267,26 +315,33 @@
 //!
 //! # Parity
 //!
-//! `tests/parity.rs` runs four images and 13 prompts through all three precision modes
-//! and compares them with PyTorch FP32 outputs of the official implementation. Each check
-//! must keep the same DETR queries, with scores within 0.01, box corners within 0.5% of
-//! the image's longer side and mask IoU of at least 0.99. Worst case over 43 checks:
+//! `tests/parity.rs` runs four images and 13 prompts through every precision mode of the
+//! backend (three on CUDA, two on Metal) and compares them with PyTorch FP32 outputs of
+//! the official implementation. Each check must keep the same DETR queries, with scores
+//! within 0.01, box corners within 0.5% of the image's longer side and mask IoU of at
+//! least 0.99. Worst case over 43 checks:
 //!
 //! | Mode | Max score delta | Max box delta | Min mask IoU |
 //! |---|---|---|---|
 //! | `fp32` | 0.0008 | 0.02 px | 0.9987 |
 //! | `tf32` | 0.0052 | 0.19 px | 0.9987 |
 //! | `bf16` | 0.0070 | 1.26 px | 0.9964 |
+//! | `fp32`, Metal (M4 Pro) | 0.0008 | 0.02 px | 0.9987 |
+//! | `bf16`, Metal (M4 Pro) | 0.0032 | 0.51 px | 0.9953 |
 //!
 //! The video tracker is checked stage by stage and end to end against upstream's tracker
-//! in FP32. On both test clips every mode tracks closer to FP32 than PyTorch's own BF16
-//! run:
+//! in FP32. On both test clips every CUDA mode and Metal's `fp32` track closer to FP32
+//! than PyTorch's own BF16 run. Metal's `bf16` does on the three-object clip, but not on
+//! the one-object clip, where it picks the other of two near-tied masks on the prompted
+//! frame (see [Apple silicon](#apple-silicon)):
 //!
 //! | Mode | Worst stage rel L2 | Mean IoU per object (horses, 3 objects) | Grazing (1 object) |
 //! |---|---|---|---|
 //! | `fp32` | 2.3e-6 | 0.9999 / 1.0000 / 1.0000 | 1.0000 |
 //! | `tf32` | 8.0e-4 | 0.9996 / 0.9987 / 1.0000 | 0.9998 |
 //! | `bf16` | 4.4e-3 | 0.9949 / 0.9977 / 0.9999 | 0.9997 |
+//! | `fp32`, Metal (M4 Pro) | 5.3e-5 | 0.9999 / 1.0000 / 1.0000 | 1.0000 |
+//! | `bf16`, Metal (M4 Pro) | 5.3e-5 | 0.9954 / 0.9978 / 0.9998 | 0.9872 (fails) |
 //! | PyTorch BF16 | | 0.9760 / 0.9918 / 0.9963 | 0.9966 |
 //!
 //! [Parity](https://github.com/avencera/sam3rs/blob/master/docs/parity.md) has each
@@ -307,11 +362,14 @@
 
 #![warn(missing_docs)]
 
+#[cfg(not(target_os = "macos"))]
 mod cuda;
 #[cfg(feature = "online")]
 mod hub;
 mod image;
 mod masks;
+#[cfg(target_os = "macos")]
+mod metal;
 mod output;
 mod posenc;
 mod precision;
@@ -319,11 +377,14 @@ mod prompt;
 mod tokenizer;
 mod weights;
 
+#[cfg(not(target_os = "macos"))]
 pub use cuda::{Embedding, Sam3, VideoTracker};
 #[cfg(feature = "online")]
 pub use hub::{MODEL_FILES, MODEL_REPO, download_model};
 pub use image::{MAX_IMAGE_SIDE, RgbImage};
 pub use masks::MaskBuffer;
+#[cfg(target_os = "macos")]
+pub use metal::{Embedding, Sam3, VideoTracker};
 pub use output::{
     Detection, Detections, POINT_BATCH, PointMask, PointMasks, SCORE_THRESHOLD, TrackedFrame, TrackedObject,
     VISUAL_PROMPT,

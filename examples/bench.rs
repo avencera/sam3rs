@@ -49,7 +49,9 @@ fn median_ms(repeat: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
+    let start = std::time::Instant::now();
     let model = Sam3::load(&args.model, args.device, args.precision)?;
+    eprintln!("load {:.2} s", start.elapsed().as_secs_f64());
     let img = RgbImage::open(&args.image)?;
     let (w, h) = (img.width(), img.height());
 

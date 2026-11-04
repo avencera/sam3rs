@@ -6,6 +6,16 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Apple silicon support: on macOS, sam3rs builds a Metal backend with the same API, every
+  prompt type and the video tracker, in `bf16` and `fp32` (`tf32` returns an error). On
+  an M4 Pro it encodes an image in 824 ms, answers a click in 6.2 ms, a box in 93 ms and
+  a text prompt in 103 ms, 1.19-2.9x faster than the official SAM 3 package on PyTorch's
+  MPS backend, and tracks three objects through 720p video at 1.2 s a frame. It needs
+  macOS 26 or newer; the release binary and Python package remain Linux only, so on
+  macOS build from source.
+
 ### Changed
 
 - The README is shorter. Benchmark protocol, per-stage timings, the large-photo and

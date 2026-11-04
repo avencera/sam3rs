@@ -4,8 +4,8 @@
 //! checks the gate: the same kept queries, scores within 0.01, boxes within 0.5% of the
 //! image's longer side and mask IoU >= 0.99. The image comes from the fixture's decoded
 //! RGB because the `image` crate's JPEG decoder differs from PIL's libjpeg-turbo on a few
-//! percent of bytes. Needs a CUDA GPU and the weights from scripts/fetch-models.sh. Both
-//! precision modes must pass the same gate
+//! percent of bytes. Needs a CUDA GPU (or a Metal 4 Mac) and the weights from
+//! scripts/fetch-models.sh. Every precision mode the backend has must pass the same gate
 //!
 //! The batched point API is checked against single calls on every image: the fixture's
 //! point prompt mixed into more clicks than one decoder batch holds, with several click
@@ -84,7 +84,13 @@ fn matches_pytorch() -> Result<()> {
     // FP32 single-call results of the batched-points check, per image, which the reduced
     // precisions are judged against; FP32 has to run first
     let mut truth = Vec::new();
-    for precision in [Precision::Fp32, Precision::Tf32, Precision::Bf16] {
+    // Metal has no TF32 mode, so the Apple backend runs the other two
+    let precisions: &[Precision] = if cfg!(target_os = "macos") {
+        &[Precision::Fp32, Precision::Bf16]
+    } else {
+        &[Precision::Fp32, Precision::Tf32, Precision::Bf16]
+    };
+    for &precision in precisions {
         println!("== {precision:?}");
         let model = Sam3::load(model_dir, 0, precision)?;
         let worst = check(&model, &mut failures, precision, &mut truth)?;
