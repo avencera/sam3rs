@@ -6,6 +6,13 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `ModelManager` downloads the weights into the default Hugging Face cache or, with
+  `ModelManager::with_cache_dir`, any directory, and returns the folder to pass to
+  `Sam3::load`. `HubError` and `default_hub_cache_dir` are re-exported from the crate
+  root. All three need the `online` feature.
+
 ### Changed
 
 - The weights now download from
@@ -14,6 +21,9 @@ All notable changes to sam3rs are documented here. The format follows
   License, so `Sam3::from_pretrained`, `Sam3.from_pretrained()` and the CLI no longer
   need a Hugging Face token or Meta's approval. Because the repo changed, the first run
   after upgrading downloads the 3.4 GB checkpoint into the cache again.
+- Downloads are pinned to a commit of the weights repo (`MODEL_REVISION`), so a cached
+  checkpoint loads without a network request and a later push to the repo can't change
+  what a release loads.
 - `scripts/fetch-models.sh` fetches from the same mirror without a token by default.
   `--official` fetches from facebook/sam3 with a token, and replaces `--mirror`.
 

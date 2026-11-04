@@ -164,9 +164,10 @@ dynamic loader finds one (`LD_LIBRARY_PATH`, then the ldconfig cache).
 
 Cargo features:
 
-- `online` (default): `Sam3::from_pretrained` and `download_model`, which fetch the
-  weights from Hugging Face through [`hf-fetch`](https://github.com/avencera/hf-fetch)
-  into the shared Python Hugging Face cache
+- `online` (default): `Sam3::from_pretrained`, `download_model` and `ModelManager`,
+  which fetch the weights from Hugging Face through
+  [`hf-fetch`](https://github.com/avencera/hf-fetch) into the shared Python Hugging
+  Face cache or a directory of your choice
 - `cli`: the `sam3rs` command
 - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems (CUDA backend only). The
   only feature that needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
@@ -181,7 +182,16 @@ and aren't part of this repository or its packages.
 mirrors them unchanged: byte-identical copies of facebook/sam3's `model.safetensors`,
 `vocab.json` and `merges.txt`. `Sam3::from_pretrained` and the CLI without `--model`
 download the 3.4 GB checkpoint into the Hugging Face cache on first use, with no
-account or token.
+account or token. Downloads are pinned to the repo commit in `MODEL_REVISION`, so a
+cached checkpoint loads offline. To keep the weights somewhere else, point a
+`ModelManager` at that directory and load what it returns:
+
+```rust
+use sam3rs::{ModelManager, Precision, Sam3};
+
+let dir = ModelManager::with_cache_dir("/data/hf-cache".into())?.ensure()?;
+let model = Sam3::load(&dir, 0, Precision::Bf16)?;
+```
 
 For the tests and benchmarks, `scripts/fetch-models.sh` downloads the checkpoint into
 `models/sam3`, fetches the test images into `models/images`, and checks the weights
