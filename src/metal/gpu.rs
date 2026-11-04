@@ -20,7 +20,7 @@ use bytemuck::Pod;
 use eyre::{Result, bail, ensure, eyre};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSRange, NSString};
+use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo, NSRange, NSString};
 use objc2_metal::{
     MTLBinding, MTLBindingType, MTLBuffer, MTLBufferBinding, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp, MTLCompileOptions, MTLComputeCommandEncoder,
@@ -550,7 +550,9 @@ pub struct Gpu {
     inflight: RefCell<Inflight>,
     /// The highest batch known complete
     completed: Cell<u64>,
-    /// The error of a failed batch that `poll` retired, for the next `synchronize` to return
+    /// The first failed batch's error. Every later `synchronize` returns it, like a CUDA
+    /// context fault: outputs that batch left unwritten may already be cached (the visual
+    /// prompt's text features, video memory), so nothing after it can be trusted
     failure: RefCell<Option<String>>,
     pool: Arc<Pool>,
     precision: Precision,
@@ -572,6 +574,21 @@ impl Gpu {
         ensure!(
             precision != Precision::Tf32,
             "tf32 is a CUDA mode (TF32 tensor cores); on Metal use fp32, whose GEMMs run near the BF16 rate"
+        );
+        // older systems lack Metal 4 and some selectors the kernel build calls, which would
+        // raise an Objective-C exception instead of returning an error
+        let info = NSProcessInfo::processInfo();
+        let v = info.operatingSystemVersion();
+        ensure!(
+            info.isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
+                majorVersion: 26,
+                minorVersion: 0,
+                patchVersion: 0
+            }),
+            "the Metal backend needs macOS 26 or newer (Metal 4), and this is macOS {}.{}.{}",
+            v.majorVersion,
+            v.minorVersion,
+            v.patchVersion
         );
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| eyre!("no Metal device"))?;
         let queue = device.newCommandQueue().ok_or_else(|| eyre!("Metal could not create a command queue"))?;
@@ -763,11 +780,10 @@ impl Gpu {
     pub fn synchronize(&self) -> Result<()> {
         self.flush()?;
         let mut inflight = self.inflight.borrow_mut();
-        let mut failure = self.failure.take();
         while let Some((batch, cb)) = inflight.pop_front() {
             cb.waitUntilCompleted();
-            if cb.status() == MTLCommandBufferStatus::Error && failure.is_none() {
-                failure = Some(failure_reason(&cb));
+            if cb.status() == MTLCommandBufferStatus::Error {
+                self.failure.borrow_mut().get_or_insert_with(|| failure_reason(&cb));
             }
             self.completed.set(batch);
         }
@@ -775,7 +791,10 @@ impl Gpu {
         if let Some(p) = &self.profile {
             p.borrow_mut().resolve(&self.pool.device)?;
         }
-        failure.map_or(Ok(()), |why| Err(eyre!("Metal command buffer failed: {why}")))
+        match &*self.failure.borrow() {
+            Some(why) => Err(eyre!("a Metal command buffer failed ({why}); load the model again")),
+            None => Ok(()),
+        }
     }
 
     /// Marks finished command buffers complete without waiting, so their buffers become
@@ -785,12 +804,9 @@ impl Gpu {
         while let Some((batch, cb)) = inflight.front() {
             match cb.status() {
                 MTLCommandBufferStatus::Completed => {}
-                // kept so the next `synchronize` fails instead of returning stale results
+                // kept so `synchronize` fails instead of returning stale results
                 MTLCommandBufferStatus::Error => {
-                    let mut failure = self.failure.borrow_mut();
-                    if failure.is_none() {
-                        *failure = Some(failure_reason(cb));
-                    }
+                    self.failure.borrow_mut().get_or_insert_with(|| failure_reason(cb));
                 }
                 _ => break,
             }

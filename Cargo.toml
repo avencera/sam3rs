@@ -96,6 +96,8 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSString",
     "NSError",
     "NSDictionary",
+    # the macOS version check before any Metal 4 call
+    "NSProcessInfo",
     # counter sample buffers for SAM3RS_METAL_PROFILE
     "NSArray",
     "NSData",
