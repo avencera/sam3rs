@@ -6,6 +6,8 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
 ### Added
 
 - `ModelManager` downloads the weights into the default Hugging Face cache or, with
@@ -79,7 +81,8 @@ First release.
 - The `sam3rs` Python package on PyPI, with numpy in and out, the same command, and
   cuBLAS from the `cuda` extra.
 
-[Unreleased]: https://github.com/avencera/sam3rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/avencera/sam3rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/avencera/sam3rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/avencera/sam3rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/avencera/sam3rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/avencera/sam3rs/releases/tag/v0.1.0
