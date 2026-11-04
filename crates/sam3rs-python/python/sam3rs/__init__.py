@@ -50,8 +50,8 @@ __all__ = [
 
 __version__: str = _native.__version__
 
-#: Hugging Face repo :meth:`Sam3.from_pretrained` downloads; it is gated, so accept
-#: Meta's terms on its model page first
+#: Hugging Face repo :meth:`Sam3.from_pretrained` downloads, an ungated, unchanged mirror
+#: of Meta's facebook/sam3 weights that needs no token
 MODEL_REPO: str = _native.MODEL_REPO
 #: Detections scoring at or below this are dropped, as in upstream ``Sam3Processor``
 SCORE_THRESHOLD: float = _native.SCORE_THRESHOLD
@@ -118,10 +118,9 @@ class Sam3:
 
     @classmethod
     def from_pretrained(cls, device: int = 0, precision: Precision = "bf16") -> Sam3:
-        """Download the gated ``facebook/sam3`` checkpoint and load it.
+        """Download the SAM 3 checkpoint from :data:`MODEL_REPO` and load it.
 
-        Accept Meta's SAM License at https://huggingface.co/facebook/sam3, then log
-        in with ``hf auth login`` or set ``HF_TOKEN``. Files land in the standard
+        No Hugging Face account or token is needed. Files land in the standard
         Hugging Face cache, so later calls skip the 3.4 GB download.
         """
         prepare_libraries()

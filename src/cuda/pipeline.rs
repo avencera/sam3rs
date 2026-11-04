@@ -90,7 +90,7 @@ impl Sam3 {
         Self::load_onto(Gpu::new(device, precision)?, dir)
     }
 
-    /// Downloads facebook/sam3 from Hugging Face (see [`crate::download_model`]), then
+    /// Downloads the weights from Hugging Face (see [`crate::download_model`]), then
     /// loads it like [`Sam3::load`]
     ///
     /// Opens the GPU first, so a machine that can't run the model fails before the

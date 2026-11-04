@@ -164,9 +164,10 @@ dynamic loader finds one (`LD_LIBRARY_PATH`, then the ldconfig cache).
 
 Cargo features:
 
-- `online` (default): `Sam3::from_pretrained` and `download_model`, which fetch the
-  weights from Hugging Face through [`hf-fetch`](https://github.com/avencera/hf-fetch)
-  into the shared Python Hugging Face cache
+- `online` (default): `Sam3::from_pretrained`, `download_model` and `ModelManager`,
+  which fetch the weights from Hugging Face through
+  [`hf-fetch`](https://github.com/avencera/hf-fetch) into the shared Python Hugging
+  Face cache or a directory of your choice
 - `cli`: the `sam3rs` command
 - `nvtx`: NVTX ranges per pipeline stage for Nsight Systems (CUDA backend only). The
   only feature that needs a CUDA toolkit to build, for its headers (`CUDA_HOME`, default
@@ -174,16 +175,27 @@ Cargo features:
 
 ## Weights
 
-SAM 3 weights are under Meta's SAM License and aren't part of this repository or its
-packages. [facebook/sam3](https://huggingface.co/facebook/sam3) on Hugging Face is
-gated: accept Meta's terms on the model page while logged in, then run
-`hf auth login` or set `HF_TOKEN` to a token of that account.
-`Sam3::from_pretrained` and the CLI without `--model` download the checkpoint into
-the Hugging Face cache on first use.
+The SAM 3 weights are Meta's, under the
+[SAM License](https://huggingface.co/avencera/sam3-safetensors/blob/main/LICENSE),
+and aren't part of this repository or its packages.
+[avencera/sam3-safetensors](https://huggingface.co/avencera/sam3-safetensors) on Hugging Face
+mirrors them unchanged: byte-identical copies of facebook/sam3's `model.safetensors`,
+`vocab.json` and `merges.txt`. `Sam3::from_pretrained` and the CLI without `--model`
+download the 3.4 GB checkpoint into the Hugging Face cache on first use, with no
+account or token. Downloads are pinned to the repo commit in `MODEL_REVISION`, so a
+cached checkpoint loads offline. To keep the weights somewhere else, point a
+`ModelManager` at that directory and load what it returns:
+
+```rust
+use sam3rs::{ModelManager, Precision, Sam3};
+
+let dir = ModelManager::with_cache_dir("/data/hf-cache".into())?.ensure()?;
+let model = Sam3::load(&dir, 0, Precision::Bf16)?;
+```
 
 For the tests and benchmarks, `scripts/fetch-models.sh` downloads the checkpoint into
-`models/sam3` with the same token, fetches the test images into `models/images`, and
-checks the weights against the official sha256 hashes:
+`models/sam3`, fetches the test images into `models/images`, and checks the weights
+against the official sha256 hashes:
 
 ```sh
 scripts/fetch-models.sh
@@ -358,6 +370,7 @@ gate, the stage tests and the commands to run them.
 ## License
 
 sam3rs is licensed under the [Apache License 2.0](LICENSE). It is an independent
-implementation and contains no SAM 3 weights. Meta distributes the weights under the
-[SAM License](https://huggingface.co/facebook/sam3), and each user accepts it on Hugging
-Face before downloading them.
+implementation and contains no SAM 3 weights. The weights are Meta's, under the
+[SAM License](https://huggingface.co/avencera/sam3-safetensors/blob/main/LICENSE),
+and download from the unchanged mirror at
+[avencera/sam3-safetensors](https://huggingface.co/avencera/sam3-safetensors).

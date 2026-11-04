@@ -58,11 +58,13 @@ missing.
 
 ## Weights
 
-The weights come from the gated [facebook/sam3](https://huggingface.co/facebook/sam3)
-repo. Accept Meta's terms on the model page while logged in, then give sam3rs a token
-from that account, with `hf auth login` or the `HF_TOKEN` environment variable.
-`Sam3.from_pretrained()` downloads the 3.4 GB checkpoint into the Hugging Face cache on
-first use. `Sam3.load(path)` reads a directory that already holds `model.safetensors`,
+The weights are Meta's, under the
+[SAM License](https://huggingface.co/avencera/sam3-safetensors/blob/main/LICENSE),
+mirrored unchanged at
+[avencera/sam3-safetensors](https://huggingface.co/avencera/sam3-safetensors)
+(byte-identical copies of facebook/sam3's files). `Sam3.from_pretrained()` downloads
+the 3.4 GB checkpoint into the Hugging Face cache on first use, with no account or
+token. `Sam3.load(path)` reads a directory that already holds `model.safetensors`,
 `vocab.json` and `merges.txt`.
 
 ## Usage
@@ -141,6 +143,7 @@ uvx --from "sam3rs[cuda]" sam3rs dogs.jpg --text dog --out dogs.png
 
 sam3rs is licensed under the [Apache License
 2.0](https://github.com/avencera/sam3rs/blob/master/LICENSE). It is an independent
-implementation and contains no SAM 3 weights. Meta distributes the weights under the
-[SAM License](https://huggingface.co/facebook/sam3), and each user accepts it on Hugging
-Face before downloading them.
+implementation and contains no SAM 3 weights. The weights are Meta's, under the
+[SAM License](https://huggingface.co/avencera/sam3-safetensors/blob/main/LICENSE),
+and download from the unchanged mirror at
+[avencera/sam3-safetensors](https://huggingface.co/avencera/sam3-safetensors).

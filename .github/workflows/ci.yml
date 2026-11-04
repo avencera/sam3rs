@@ -88,7 +88,7 @@ jobs:
           f526393189112391ce6f9795d4695f704121ce452c3aad1f5335cc41337eba85  $SAM3RS_TOKENIZER_DIR/merges.txt
           EOF
 
-      # the parity and stage tests need a GPU and the gated weights, so they run locally
+      # the parity and stage tests need a GPU and the 3.4 GB weights, so they run locally
       - name: Unit tests
         run: cargo test --workspace --lib --locked
 

@@ -4,8 +4,8 @@
     sam3rs image.jpg --box 1233,376,1649,691 --neg-box 1400,500,1500,600
     sam3rs image.jpg --point 1439,504 --neg-point 1500,600
 
-Prints one JSON object per result. Without ``--model``, the weights come from the
-gated facebook/sam3 Hugging Face repo.
+Prints one JSON object per result. Without ``--model``, the weights download from the
+avencera/sam3-safetensors Hugging Face repo, with no account or token.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
         "--model",
         type=Path,
         help="directory with model.safetensors, vocab.json and merges.txt "
-        "[default: download facebook/sam3 from Hugging Face]",
+        "[default: download avencera/sam3-safetensors from Hugging Face]",
     )
     p.add_argument("--device", type=int, default=0)
     p.add_argument(
