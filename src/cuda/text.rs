@@ -4,11 +4,9 @@ use eyre::Result;
 
 use crate::cuda::gpu::{Gpu, Tensor, launch};
 use crate::cuda::ops::{Act, B256, LayerNorm, Linear, Mask, ew, mha};
+use crate::model::text::{HEADS, WIDTH};
 use crate::tokenizer::CONTEXT;
 use crate::weights::Weights;
-
-const WIDTH: usize = 1024;
-const HEADS: usize = 16;
 
 struct Layer {
     ln1: LayerNorm,

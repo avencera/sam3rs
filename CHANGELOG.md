@@ -6,6 +6,13 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `Sam3`, `Embedding` and `VideoTracker` are one implementation shared by the CUDA and
+  Metal backends, so input checks, prompt batching and the video tracker's memory
+  selection behave the same on both. Outputs are unchanged.
+- `Precision`'s docs describe what each mode runs on CUDA and on Metal.
+
 ## [0.4.0] - 2026-11-04
 
 ### Added

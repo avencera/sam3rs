@@ -1,55 +1,27 @@
-//! SAM 3 video tracking (the tracker-only "SAM 3 for the SAM 2 video task" path): objects
-//! clicked on the first frame, followed forward through the video with the tracker's
-//! memory bank
-//!
-//! Per frame: the image backbone and tracker neck, memory attention from the frame's
-//! features to earlier frames' memories and object pointers, the point decoder on the
-//! result, then the memory encoder on the chosen mask, whose output joins the bank. This
-//! follows upstream's `Sam3TrackerPredictor` (`sam3_tracker_base.py` and
-//! `sam3_tracking_predictor.py` at f1647e8): all objects share one state, so the memory
-//! selection uses their mean score, and the bank is stored in BF16 in every mode
-
-use crate::output::{TrackedFrame, TrackedObject};
-use std::collections::VecDeque;
+//! The video tracker's stages on CUDA: memory attention, memory encoder and the object
+//! pointer heads, plus the per-frame steps [`crate::tracker`] runs them through. The bank
+//! is stored in BF16 in every mode, and BF16 mode keeps each bank frame's memory-attention
+//! keys while memory selection can still pick it
 
 use eyre::{Result, ensure, eyre};
 
 use crate::cuda::gpu::{Arg, Buf, Gpu, Tensor, launch};
-use crate::cuda::image::{AaResize, preprocess};
-use crate::cuda::nvtx::range;
+use crate::cuda::image::AaResize;
 use crate::cuda::ops::{
     Act, B256, LayerNorm, Linear, Mask, Mlp, add, attention_f16_d256, attention_f16_qk256_v64, ew, mha,
 };
-use crate::cuda::pipeline::Sam3;
-use crate::cuda::point::{Decoded, LOW_RES, MASK_TOKEN_ROW, MaskResize, PointImage, argmax, row};
-use crate::cuda::vision::{GRID, IMAGE_SIZE, Trunk};
-use crate::image::RgbImage;
-use crate::posenc::sine_2d;
+use crate::cuda::pipeline::Cuda;
+use crate::cuda::point::PointImage;
+use crate::cuda::vision::Trunk;
+use crate::host::{fold_layer_scale, fold_value_out, memory_positions};
+use crate::model::point::LOW_RES;
+use crate::model::tracker::{D, MASK_SIDE, MEM_D, NUM_MASKMEM, TOKENS};
+use crate::model::vision::{GRID, IMAGE_SIZE};
+use crate::nvtx::range;
+use crate::posenc::{memory_rope, memory_src_pos, pointer_sine, sine_2d};
 use crate::precision::Precision;
-use crate::prompt::PointPrompt;
+use crate::tracker::Selection;
 use crate::weights::Weights;
-
-const D: usize = 256;
-/// Channels of a memory frame
-const MEM_D: usize = 64;
-/// Tokens of one frame's 72x72 feature map
-const TOKENS: usize = GRID * GRID;
-/// `num_maskmem`: memory frames per step, the conditioning frame's position plus 6
-const NUM_MASKMEM: usize = 7;
-/// `max_cond_frames_in_attn`
-const MAX_COND_FRAMES: usize = 4;
-/// `max_obj_ptrs_in_encoder`
-const MAX_OBJ_PTRS: usize = 16;
-/// Clicks per object the prompt encoder sees: the first 8 and the last 8 of more
-/// (`max_point_num_in_prompt_enc`, to stay near the 8-point training prompts)
-const MAX_CLICKS: usize = 16;
-/// `mf_threshold`: earlier frames whose score is at most this are skipped as memories
-const MEMORY_SCORE_THRESHOLD: f32 = 0.01;
-/// `NO_OBJ_SCORE`, the logit upstream gives every pixel of an absent object's mask
-const NO_OBJ_SCORE: f32 = -1024.0;
-/// Side of the memory encoder's mask input, upsampled from the 1008 frame
-const MASK_SIDE: usize = 1152;
-const ROPE_THETA: f32 = 10000.0;
 
 /// `RoPEAttention` with one head of 256: projections, then axial RoPE on q and on the
 /// first `rope_keys` keys
@@ -75,22 +47,7 @@ impl RopeAttention {
     fn load_cross(gpu: &Gpu, wts: &Weights, prefix: &str) -> Result<Self> {
         let mut out = Self::load(gpu, wts, prefix)?;
         if gpu.precision() == Precision::Bf16 {
-            let (wv, sv) = wts.host(&format!("{prefix}.v_proj.weight"))?;
-            let (bv, _) = wts.host(&format!("{prefix}.v_proj.bias"))?;
-            let (wo, so) = wts.host(&format!("{prefix}.o_proj.weight"))?;
-            let (bo, _) = wts.host(&format!("{prefix}.o_proj.bias"))?;
-            ensure!(sv == [D, MEM_D] && so == [D, D], "{prefix}: v_proj {sv:?}, o_proj {so:?}");
-            // f64 sums, rounded once
-            let mut w = vec![0f32; D * MEM_D];
-            let mut b = vec![0f32; D];
-            for i in 0..D {
-                let row = &wo[i * D..(i + 1) * D];
-                for j in 0..MEM_D {
-                    w[i * MEM_D + j] =
-                        row.iter().enumerate().map(|(k, &x)| x as f64 * wv[k * MEM_D + j] as f64).sum::<f64>() as f32;
-                }
-                b[i] = (row.iter().zip(&bv).map(|(&x, &y)| x as f64 * y as f64).sum::<f64>() + bo[i] as f64) as f32;
-            }
+            let (w, b) = fold_value_out(wts, prefix)?;
             out.vo = Some(Linear::new(gpu.upload(w, &[D, MEM_D])?, Some(gpu.upload(b, &[D])?)).bf16(gpu)?);
         }
         Ok(out)
@@ -166,8 +123,7 @@ impl RopeAttention {
     }
 }
 
-/// Axial RoPE angles for the 72x72 grid at head dim 256: pairs 0 to 63 rotate with the
-/// column, 64 to 127 with the row (`compute_axial_cis`)
+/// Axial RoPE angles for the 72x72 grid at head dim 256 (see [`memory_rope`])
 struct Rope {
     /// `[TOKENS, 128]`
     cos: Tensor,
@@ -176,18 +132,7 @@ struct Rope {
 
 impl Rope {
     fn new(gpu: &Gpu) -> Result<Self> {
-        let quarter = D / 4;
-        // f32 as upstream computes them: `1 / theta ** (4i / dim)`, then position * freq
-        let freqs: Vec<f32> = (0..quarter).map(|i| 1.0 / ROPE_THETA.powf((4 * i) as f32 / D as f32)).collect();
-        let (mut cos, mut sin) = (Vec::with_capacity(TOKENS * D / 2), Vec::with_capacity(TOKENS * D / 2));
-        for t in 0..TOKENS {
-            let (x, y) = ((t % GRID) as f32, (t / GRID) as f32);
-            for (pos, f) in freqs.iter().map(|f| (x, f)).chain(freqs.iter().map(|f| (y, f))) {
-                let angle = (pos * f) as f64;
-                cos.push(angle.cos() as f32);
-                sin.push(angle.sin() as f32);
-            }
-        }
+        let (cos, sin) = memory_rope();
         Ok(Self { cos: gpu.upload(cos, &[TOKENS, D / 2])?, sin: gpu.upload(sin, &[TOKENS, D / 2])? })
     }
 
@@ -275,8 +220,6 @@ impl MemoryAttention {
                 })
             })
             .collect::<Result<_>>()?;
-        // f32 products, as `output + 0.1 * src_pos` rounds them
-        let src_pos = sine_2d(GRID, D).into_iter().map(|v| 0.1 * v).collect();
         let mut tpos_keys = Vec::new();
         if gpu.precision() == Precision::Bf16 {
             let (tpos, _) = wts.host("tracker_model.memory_temporal_positional_encoding")?;
@@ -302,7 +245,7 @@ impl MemoryAttention {
             layers,
             norm: LayerNorm::load(gpu, wts, &format!("{p}.layer_norm"), 1e-5)?,
             rope: Rope::new(gpu)?,
-            src_pos: gpu.upload(src_pos, &[TOKENS, D])?,
+            src_pos: gpu.upload(memory_src_pos(), &[TOKENS, D])?,
             mem_sine: gpu.upload(sine_2d(GRID, MEM_D), &[TOKENS, MEM_D])?,
             tpos_keys,
         })
@@ -526,14 +469,7 @@ impl MemoryEncoder {
         let mut fuser = Vec::new();
         for i in 0..2 {
             let l = format!("{p}.memory_fuser.layers.{i}");
-            // gamma * (x W2^T + b2) as (gamma W2) and gamma b2: one rounding apart
-            let (gamma, _) = wts.host(&format!("{l}.scale"))?;
-            let (mut w2, shape) = wts.host(&format!("{l}.pointwise_conv2.weight"))?;
-            let (mut b2, _) = wts.host(&format!("{l}.pointwise_conv2.bias"))?;
-            for (o, g) in gamma.iter().enumerate() {
-                w2[o * shape[1]..][..shape[1]].iter_mut().for_each(|v| *v *= g);
-                b2[o] *= g;
-            }
+            let (w2, shape, b2) = fold_layer_scale(wts, &l)?;
             fuser.push(CxBlock {
                 dw_w: wts.get(gpu, &format!("{l}.depthwise_conv.weight"))?,
                 dw_b: wts.get(gpu, &format!("{l}.depthwise_conv.bias"))?,
@@ -614,16 +550,8 @@ pub struct Tracker {
 impl Tracker {
     pub fn load(gpu: &Gpu, wts: &Weights) -> Result<Self> {
         let p = "tracker_model";
-        let (tpos, _) = wts.host(&format!("{p}.memory_temporal_positional_encoding"))?;
-        let sine = sine_2d(GRID, MEM_D);
-        let mem_pos = tpos
-            .chunks(MEM_D)
-            .map(|t| {
-                let pos: Vec<f32> = sine.iter().enumerate().map(|(i, v)| v + t[i % MEM_D]).collect();
-                gpu.upload(pos, &[TOKENS, MEM_D])
-            })
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(mem_pos.len() == NUM_MASKMEM, "{} temporal encodings, expected {NUM_MASKMEM}", mem_pos.len());
+        let mem_pos =
+            memory_positions(wts)?.into_iter().map(|pos| gpu.upload(pos, &[TOKENS, MEM_D])).collect::<Result<_>>()?;
         let no_obj_spatial = wts.get(gpu, &format!("{p}.occlusion_spatial_embedding_parameter"))?;
         Ok(Self {
             mem_attn: MemoryAttention::load(gpu, wts)?,
@@ -654,71 +582,9 @@ impl Tracker {
 
     /// `obj_ptr_tpos_proj(get_1d_sine_pe(pos / (max_abs_pos - 1), 256))` per pointer
     fn pointer_pos(&self, gpu: &Gpu, positions: &[usize], max_abs_pos: usize) -> Result<Tensor> {
-        let t_max = max_abs_pos.saturating_sub(1).max(1) as f32;
-        let half = D / 2;
-        let dims: Vec<f32> = (0..half).map(|i| 10000f32.powf((2 * (i / 2)) as f32 / half as f32)).collect();
-        let mut pe = Vec::with_capacity(positions.len() * D);
-        for &p in positions {
-            let v = p as f32 / t_max;
-            pe.extend(dims.iter().map(|d| ((v / d) as f64).sin() as f32));
-            pe.extend(dims.iter().map(|d| ((v / d) as f64).cos() as f32));
-        }
+        let pe = pointer_sine(positions, max_abs_pos);
         self.tpos_proj.forward(gpu, &gpu.upload(pe, &[positions.len(), D])?)
     }
-}
-
-/// One frame's memory for every object, and its object pointers
-struct MemFrame {
-    frame: usize,
-    /// `[5184, 64]` per object
-    mem: Vec<Tensor>,
-    /// `[1, 256]` per object
-    ptr: Vec<Tensor>,
-    /// Per object, the memory attention's keys and values for this frame in BF16 mode;
-    /// emptied once memory selection can no longer pick the frame
-    keys: Vec<FrameKeys>,
-}
-
-/// The memory frames and object pointers upstream's selection gives one frame
-pub(crate) struct Selection<'a> {
-    /// Memory frames with their temporal encoding index, in bank order
-    frames: Vec<(&'a MemFrame, usize)>,
-    /// Frames whose object pointers join the memory
-    ptr_frames: Vec<&'a MemFrame>,
-    /// `[ptr_frames, 64]`, each pointer's temporal position
-    ptr_pos: Tensor,
-}
-
-impl Selection<'_> {
-    /// Memory tokens from object pointers, 4 a pointer
-    pub(crate) fn ptr_tokens(&self) -> usize {
-        self.ptr_frames.len() * (D / MEM_D)
-    }
-}
-
-/// Memory-attention inputs of one frame, `(memory, memory_pos)` per object
-pub(crate) struct MemoryInputs {
-    pub(crate) objects: Vec<(Tensor, Tensor)>,
-}
-
-/// Follows clicked objects through a video one frame at a time, starting from the frame
-/// they were clicked on (see [`Sam3::track`])
-///
-/// Holds the memory bank: the clicked frame's memory and the earlier frames upstream's
-/// memory selection can still pick, which is a constant amount whatever the video's length
-pub struct VideoTracker<'a> {
-    model: &'a Sam3,
-    width: usize,
-    height: usize,
-    num_frames: usize,
-    next_frame: usize,
-    objects: usize,
-    cond: Vec<MemFrame>,
-    /// The last frames (up to `min(num_frames, 16) - 1`) whose score passed
-    /// [`MEMORY_SCORE_THRESHOLD`], oldest first
-    passing: VecDeque<MemFrame>,
-    /// The previous frame when its score didn't pass: upstream always keeps it
-    prev: Option<MemFrame>,
 }
 
 /// Features of one video frame
@@ -728,7 +594,29 @@ pub(crate) struct FrameFeatures {
     pub(crate) coarse: Tensor,
 }
 
-impl Sam3 {
+/// What the bank keeps of one frame for every object
+pub(crate) struct FrameMemory {
+    /// `[5184, 64]` per object
+    pub(crate) mem: Vec<Tensor>,
+    /// `[1, 256]` per object
+    pub(crate) ptr: Vec<Tensor>,
+    /// Per object, the memory attention's keys and values for this frame in BF16 mode;
+    /// emptied once memory selection can no longer pick the frame as a memory
+    pub(crate) keys: Vec<FrameKeys>,
+}
+
+/// The memory attention's state for one frame, which every object's attention reads
+pub(crate) enum FrameAttention {
+    /// Each object's assembled memory and its position, in object order (FP32 and TF32)
+    Assembled(std::vec::IntoIter<(Tensor, Tensor)>),
+    /// Layer 0's shared start and the pointers' positions, for attention over the bank
+    /// frames' cached keys (BF16)
+    Cached { start: FrameStart, ptr_pos: Tensor },
+}
+
+type Sel<'a> = Selection<'a, FrameMemory>;
+
+impl Cuda {
     /// Backbone and tracker neck of one video frame
     pub(crate) fn video_features(&self, pixels: &Tensor) -> Result<FrameFeatures> {
         let gpu = &self.gpu;
@@ -742,387 +630,76 @@ impl Sam3 {
         Ok(FrameFeatures { point, coarse: fpn.coarse })
     }
 
-    /// Starts tracking objects through a video of `num_frames` frames: segments each
-    /// object from its clicks on `first` (frame 0), whose masks come back with the tracker
-    ///
-    /// Each entry of `objects` is one object's clicks, in `first`'s pixels; past 16, only
-    /// the first and last 8 reach the decoder, as upstream. Upstream
-    /// scales the object pointers' temporal positions by the video's length, so
-    /// `num_frames` must be the real frame count; [`VideoTracker::next`] stops after it
-    pub fn track(
-        &self,
-        first: &RgbImage,
-        objects: &[Vec<PointPrompt>],
-        num_frames: usize,
-    ) -> Result<(VideoTracker<'_>, TrackedFrame)> {
-        self.gpu.bind()?;
-        let pixels = preprocess(&self.gpu, first)?;
-        self.track_pixels(&pixels, first.width(), first.height(), objects, num_frames)
-    }
-
-    /// [`Self::track`] from preprocessed pixels `[3, 1008, 1008]` of a `width` x
-    /// `height` frame
-    pub(crate) fn track_pixels(
-        &self,
-        pixels: &Tensor,
-        width: usize,
-        height: usize,
-        objects: &[Vec<PointPrompt>],
-        num_frames: usize,
-    ) -> Result<(VideoTracker<'_>, TrackedFrame)> {
-        ensure!(!objects.is_empty(), "track needs at least one object");
-        ensure!(objects.iter().all(|o| !o.is_empty()), "every object needs at least one click");
-        ensure!(num_frames >= 1, "a video has at least one frame");
-        let mut tracker = VideoTracker {
-            model: self,
-            width,
-            height,
-            num_frames,
-            next_frame: 1,
-            objects: objects.len(),
-            cond: Vec::new(),
-            passing: VecDeque::new(),
-            prev: None,
-        };
-        let out = tracker.prompt_frame(pixels, objects)?;
-        Ok((tracker, out))
-    }
-}
-
-impl VideoTracker<'_> {
-    /// Tracks the objects into the next frame, which must have the first frame's size
-    pub fn next(&mut self, frame: &RgbImage) -> Result<TrackedFrame> {
-        ensure!(
-            (frame.width(), frame.height()) == (self.width, self.height),
-            "frame is {}x{}, the video {}x{}",
-            frame.width(),
-            frame.height(),
-            self.width,
-            self.height
-        );
-        let gpu = &self.model.gpu;
-        gpu.bind()?;
-        let pixels = preprocess(gpu, frame)?;
-        self.next_pixels(&pixels)
-    }
-
-    /// The clicked frame: each object decoded from its clicks without memory, then the
-    /// memory encoder over all objects' masks with overlaps resolved, as upstream's
-    /// preflight consolidation does
-    fn prompt_frame(&mut self, pixels: &Tensor, objects: &[Vec<PointPrompt>]) -> Result<TrackedFrame> {
-        let (m, gpu) = (self.model, &self.model.gpu);
-        let feats = self.model.video_features(pixels)?;
-        let side = LOW_RES * LOW_RES;
-        let low_res = gpu.empty(&[objects.len(), side])?;
-        let (mut scores, mut ptrs, mut picks) = (Vec::new(), Vec::new(), Vec::new());
-        for (b, points) in objects.iter().enumerate() {
-            let _r = range(c"decoder");
-            let points = &cap_clicks(points);
-            let dec =
-                m.point.decode(gpu, &feats.point.embed, &feats.point, points, (self.width, self.height), None, 0)?;
-            let score = gpu.download(&m.point.obj_score(gpu, &dec)?)?[0];
-            let iou = gpu.download(&dec.iou)?;
-            // one click (or none) gives three candidates; more give the single-mask token,
-            // unless its mask is unstable (`_dynamic_multimask_via_stability`)
-            let (mask, token) = if points.len() <= 1 {
-                let best = 1 + argmax(&iou[1..]);
-                (best, best)
-            } else {
-                let stable = stability(&gpu.download(&row(gpu, &dec.low_res, 0)?)?) >= 0.98;
-                (if stable { 0 } else { 1 + argmax(&iou[1..]) }, 0)
-            };
-            self.select_mask(&dec, mask, score > 0.0, &low_res, b)?;
-            let token = row(gpu, &dec.tokens, MASK_TOKEN_ROW + token)?;
-            ptrs.push(m.tracker.pointer(gpu, &token, score > 0.0)?);
-            scores.push(score);
-            picks.push((iou, mask));
-        }
-
-        let _r = range(c"memory_encoder");
-        let high = upsample(gpu, (&low_res).into(), objects.len(), IMAGE_SIZE, IMAGE_SIZE)?;
-        let high = if objects.len() > 1 {
-            let out = gpu.empty(high.shape())?;
-            launch!(gpu, "nonoverlap", ew(out.len()), B256, 0; &out, &high, objects.len())?;
-            out
-        } else {
-            high
-        };
-        let input = mask_for_mem(gpu, &high, true)?;
-        let n = IMAGE_SIZE * IMAGE_SIZE;
-        let mut mem = Vec::new();
-        for (b, &score) in scores.iter().enumerate() {
-            let mask = gpu.empty(&[n])?;
-            gpu.copy_dtod(input.at(b * n), mask.ptr(), n * 4)?;
-            mem.push(m.tracker.memory(gpu, &feats.coarse, &mask, score > 0.0)?);
-        }
-        let keys = self.frame_keys(&mem)?;
-        self.cond.push(MemFrame { frame: 0, mem, ptr: ptrs, keys });
-        self.output(0, low_res, &scores, picks, 0, 0)
-    }
-
-    /// Writes mask `index` of a decoder pass into row `b` of `low_res`, or
-    /// `NO_OBJ_SCORE` everywhere for an absent object
-    fn select_mask(&self, dec: &Decoded, index: usize, present: bool, low_res: &Tensor, b: usize) -> Result<()> {
-        let gpu = &self.model.gpu;
-        let side = LOW_RES * LOW_RES;
-        let first = 4 - dec.low_res.rows();
-        gpu.copy_dtod(dec.low_res.at((index - first) * side), low_res.at(b * side), side * 4)?;
-        if !present {
-            launch!(gpu, "clamp", ew(side), B256, 0; Arg::slice(low_res.at(b * side), side), NO_OBJ_SCORE, NO_OBJ_SCORE)?;
-        }
-        Ok(())
-    }
-
-    /// Frames upstream's `frame_filter` selects for frame `t`, oldest first
-    fn selected(&self) -> Vec<&MemFrame> {
-        let mut out: Vec<&MemFrame> = self.passing.iter().collect();
-        out.extend(self.prev.as_ref());
-        out
-    }
-
-    /// The bank's selection for the next frame, as upstream's
-    /// `_prepare_memory_conditioned_features` makes it
-    pub(crate) fn selection(&self) -> Result<Selection<'_>> {
-        let (m, gpu) = (self.model, &self.model.gpu);
-        let t = self.next_frame;
-        // memories: up to 4 conditioning frames at temporal index 6, then the last 6
-        // selected frames at indices 5 (oldest) to 0
-        let selected = self.selected();
-        let cond = &self.cond[self.cond.len().saturating_sub(MAX_COND_FRAMES)..];
-        let mut frames: Vec<(&MemFrame, usize)> = cond.iter().map(|f| (f, NUM_MASKMEM - 1)).collect();
-        for t_pos in 1..NUM_MASKMEM {
-            let t_rel = NUM_MASKMEM - t_pos;
-            if t_rel <= selected.len() {
-                frames.push((selected[selected.len() - t_rel], NUM_MASKMEM - 1 - t_pos));
-            }
-        }
-        // pointers: the conditioning frames' at their distance, then selected frames
-        // -1 to -(L - 1) at positions 1 to L - 1 (upstream stops one short of the oldest)
-        let max_abs_pos = self.num_frames.min(MAX_OBJ_PTRS);
-        let mut ptr_frames: Vec<(&MemFrame, usize)> = cond.iter().map(|f| (f, t - f.frame)).collect();
-        for t_diff in 1..max_abs_pos {
-            if t_diff >= selected.len() {
-                break;
-            }
-            ptr_frames.push((selected[selected.len() - t_diff], t_diff));
-        }
-        let positions: Vec<usize> = ptr_frames.iter().map(|(_, p)| *p).collect();
-        let ptr_pos = m.tracker.pointer_pos(gpu, &positions, max_abs_pos)?;
-        Ok(Selection { frames, ptr_frames: ptr_frames.into_iter().map(|(f, _)| f).collect(), ptr_pos })
+    /// `[pointers, 64]`, each selected pointer's temporal position
+    pub(crate) fn pointer_pos(&self, sel: &Sel) -> Result<Tensor> {
+        self.tracker.pointer_pos(&self.gpu, &sel.positions, sel.max_abs_pos)
     }
 
     /// Object `b`'s pointer tokens `[4 * pointers, 64]` and their positions: each 256-d
     /// pointer is 4 tokens of 64, all at the pointer's position
-    fn pointer_tokens(&self, sel: &Selection, b: usize) -> Result<(Tensor, Tensor)> {
-        let gpu = &self.model.gpu;
+    fn pointer_tokens(&self, sel: &Sel, ptr_pos: &Tensor, b: usize) -> Result<(Tensor, Tensor)> {
+        let gpu = &self.gpu;
         let split = D / MEM_D;
-        let rows = sel.ptr_frames.len() * split;
+        let rows = sel.pointers.len() * split;
         let (ptr, pos) = (gpu.empty(&[rows, MEM_D])?, gpu.empty(&[rows, MEM_D])?);
-        for (i, f) in sel.ptr_frames.iter().enumerate() {
-            gpu.copy_dtod(f.ptr[b].ptr(), ptr.at(i * D), D * 4)?;
+        for (i, f) in sel.pointers.iter().enumerate() {
+            gpu.copy_dtod(f.memory.ptr[b].ptr(), ptr.at(i * D), D * 4)?;
             for s in 0..split {
-                gpu.copy_dtod(sel.ptr_pos.at(i * MEM_D), pos.at(i * D + s * MEM_D), MEM_D * 4)?;
+                gpu.copy_dtod(ptr_pos.at(i * MEM_D), pos.at(i * D + s * MEM_D), MEM_D * 4)?;
             }
         }
         Ok((ptr, pos))
     }
 
-    /// Memory-attention inputs for the next frame: each object's memory `[L, 64]` and its
-    /// positional encoding, which select from the bank as upstream's
-    /// `_prepare_memory_conditioned_features` does
-    pub(crate) fn memory_inputs(&self) -> Result<MemoryInputs> {
-        let (m, gpu) = (self.model, &self.model.gpu);
-        let sel = self.selection()?;
-        let ptr_tokens = sel.ptr_tokens();
-        let mem_tokens = sel.frames.len() * TOKENS + ptr_tokens;
-
-        let mut objects = Vec::with_capacity(self.objects);
-        for b in 0..self.objects {
+    /// Memory-attention inputs for a frame: each object's memory `[L, 64]` and its
+    /// positional encoding, from the bank's selection `sel`
+    pub(crate) fn memory_inputs(&self, sel: &Sel, ptr_pos: &Tensor) -> Result<Vec<(Tensor, Tensor)>> {
+        let gpu = &self.gpu;
+        let (ptr_tokens, mem_tokens) = (sel.ptr_tokens(), sel.mem_tokens());
+        let objects = sel.frames.first().map_or(0, |(f, _)| f.memory.mem.len());
+        let mut inputs = Vec::with_capacity(objects);
+        for b in 0..objects {
             let memory = gpu.empty(&[mem_tokens, MEM_D])?;
             let memory_pos = gpu.empty(&[mem_tokens, MEM_D])?;
             let bytes = TOKENS * MEM_D * 4;
             for (i, (f, tpos)) in sel.frames.iter().enumerate() {
-                gpu.copy_dtod(f.mem[b].ptr(), memory.at(i * TOKENS * MEM_D), bytes)?;
-                gpu.copy_dtod(m.tracker.mem_pos[*tpos].ptr(), memory_pos.at(i * TOKENS * MEM_D), bytes)?;
+                gpu.copy_dtod(f.memory.mem[b].ptr(), memory.at(i * TOKENS * MEM_D), bytes)?;
+                gpu.copy_dtod(self.tracker.mem_pos[*tpos].ptr(), memory_pos.at(i * TOKENS * MEM_D), bytes)?;
             }
             let base = sel.frames.len() * TOKENS * MEM_D;
-            let (ptr, pos) = self.pointer_tokens(&sel, b)?;
+            let (ptr, pos) = self.pointer_tokens(sel, ptr_pos, b)?;
             gpu.copy_dtod(ptr.ptr(), memory.at(base), ptr_tokens * MEM_D * 4)?;
             gpu.copy_dtod(pos.ptr(), memory_pos.at(base), ptr_tokens * MEM_D * 4)?;
-            objects.push((memory, memory_pos));
+            inputs.push((memory, memory_pos));
         }
-        Ok(MemoryInputs { objects })
+        Ok(inputs)
     }
 
     /// Object `b`'s memory attention over the bank from the frames' cached keys (BF16
     /// mode)
-    pub(crate) fn memory_attention_cached(&self, sel: &Selection, b: usize, start: &FrameStart) -> Result<Tensor> {
+    pub(crate) fn memory_attention_cached(
+        &self,
+        sel: &Sel,
+        ptr_pos: &Tensor,
+        b: usize,
+        start: &FrameStart,
+    ) -> Result<Tensor> {
         let slots: Vec<(&FrameKeys, usize)> = sel
             .frames
             .iter()
             .map(|(f, tpos)| {
-                let keys = f.keys.get(b).ok_or_else(|| eyre!("frame {} has no cached keys", f.frame))?;
+                let keys = f.memory.keys.get(b).ok_or_else(|| eyre!("frame {} has no cached keys", f.frame))?;
                 Ok((keys, *tpos))
             })
             .collect::<Result<_>>()?;
-        let (ptr, pos) = self.pointer_tokens(sel, b)?;
-        self.model.tracker.mem_attn.forward_cached(&self.model.gpu, start, &slots, &ptr, &pos)
-    }
-
-    /// Every object's [`FrameKeys`] for a new memory frame in BF16 mode, else none
-    fn frame_keys(&self, mems: &[Tensor]) -> Result<Vec<FrameKeys>> {
-        let gpu = &self.model.gpu;
-        if gpu.precision() != Precision::Bf16 {
-            return Ok(Vec::new());
-        }
-        mems.iter().map(|mem| self.model.tracker.mem_attn.frame_keys(gpu, mem)).collect()
-    }
-
-    pub(crate) fn next_pixels(&mut self, pixels: &Tensor) -> Result<TrackedFrame> {
-        ensure!(self.next_frame < self.num_frames, "the video has {} frames", self.num_frames);
-        let (m, gpu) = (self.model, &self.model.gpu);
-        let t = self.next_frame;
-        let feats = self.model.video_features(pixels)?;
-        let max_abs_pos = self.num_frames.min(MAX_OBJ_PTRS);
-        let sel = self.selection()?;
-        let ptr_tokens = sel.ptr_tokens();
-        let mem_tokens = sel.frames.len() * TOKENS + ptr_tokens;
-        // BF16 reads each frame's cached keys; the other modes assemble the memory
-        let mut inputs =
-            if gpu.precision() == Precision::Bf16 { None } else { Some(self.memory_inputs()?.objects.into_iter()) };
-        // layer 0 up to its cross-attention is the same for every object
-        let start = if inputs.is_none() {
-            let _r = range(c"memory_attention");
-            Some(m.tracker.mem_attn.frame_start(gpu, &feats.coarse)?)
-        } else {
-            None
-        };
-
-        let side = LOW_RES * LOW_RES;
-        let low_res = gpu.empty(&[self.objects, side])?;
-        let (mut scores, mut ptrs, mut mems, mut picks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let (mut norm_sum, mut iou_sum) = (0f32, 0f32);
-        for b in 0..self.objects {
-            let embed = {
-                let _r = range(c"memory_attention");
-                match inputs.as_mut().and_then(Iterator::next) {
-                    Some((memory, memory_pos)) => {
-                        m.tracker.mem_attn.forward(gpu, &feats.coarse, &memory, &memory_pos, ptr_tokens)?
-                    }
-                    None => self.memory_attention_cached(&sel, b, start.as_ref().expect("BF16 frame start"))?,
-                }
-            };
-            let _r = range(c"decoder");
-            let dec = m.point.decode(gpu, &embed, &feats.point, &[], (self.width, self.height), None, 1)?;
-            let score = gpu.download(&m.point.obj_score(gpu, &dec)?)?[0];
-            let iou = gpu.download(&dec.iou)?;
-            let best = 1 + argmax(&iou[1..]);
-            let present = score > 0.0;
-            self.select_mask(&dec, best, present, &low_res, b)?;
-            ptrs.push(m.tracker.pointer(gpu, &row(gpu, &dec.tokens, MASK_TOKEN_ROW + best)?, present)?);
-
-            let _r = range(c"memory_encoder");
-            let high = upsample(gpu, Arg::slice(low_res.at(b * side), side), 1, IMAGE_SIZE, IMAGE_SIZE)?;
-            let input = mask_for_mem(gpu, &high, false)?;
-            mems.push(m.tracker.memory(gpu, &feats.coarse, &input, present)?);
-            // `cal_mem_score`: present objects' rescaled score and their best IoU
-            norm_sum += if present { 2.0 / (1.0 + (-score).exp()) - 1.0 } else { 0.0 };
-            iou_sum += iou[best];
-            scores.push(score);
-            picks.push((iou, best));
-        }
-        // upstream multiplies scores shaped [B, 1] by IoUs shaped [B], so its mean over the
-        // broadcast [B, B] product is mean(score) * mean(IoU), not the mean of per-object
-        // products; with several objects the two land on opposite sides of the threshold
-        let n = self.objects as f32;
-        let eff = (norm_sum / n) * (iou_sum / n);
-
-        drop(sel);
-        let keys = self.frame_keys(&mems)?;
-        let frame = MemFrame { frame: t, mem: mems, ptr: ptrs, keys };
-        self.prev = None;
-        if eff > MEMORY_SCORE_THRESHOLD {
-            self.passing.push_back(frame);
-            // `frame_filter` stops at `min(num_frames, 16) - 1` passing frames
-            if self.passing.len() >= max_abs_pos {
-                self.passing.pop_front();
-            }
-            // the memory takes the last 6 selected frames, and passing frames only leave
-            // that window: older ones keep their pointers but drop their keys
-            let window = self.passing.len().saturating_sub(NUM_MASKMEM - 1);
-            for f in self.passing.iter_mut().take(window) {
-                f.keys.clear();
-            }
-        } else {
-            self.prev = Some(frame);
-        }
-        self.next_frame += 1;
-        self.output(t, low_res, &scores, picks, mem_tokens, ptr_tokens)
-    }
-
-    /// Masks at the video's size from `low_res [objects, 288^2]`
-    fn output(
-        &self,
-        frame: usize,
-        low_res: Tensor,
-        scores: &[f32],
-        picks: Vec<(Vec<f32>, usize)>,
-        mem_tokens: usize,
-        ptr_tokens: usize,
-    ) -> Result<TrackedFrame> {
-        let gpu = &self.model.gpu;
-        let _r = range(c"postprocess");
-        let (w, h) = (self.width, self.height);
-        // each group is downloaded before the next, so the GPU holds one group's bytes
-        let resize = MaskResize::new(gpu, self.objects, w, h)?;
-        let plane = w * h;
-        let mask = gpu.alloc_bytes(resize.group() * plane)?;
-        let mut masks = Vec::with_capacity(self.objects);
-        for range in resize.groups() {
-            let n = range.len() * plane;
-            resize.run(gpu, &low_res, range, Arg::slice(mask.ptr(), n))?;
-            let mut bytes = vec![0u8; n];
-            gpu.download_into(&mask, &mut bytes)?;
-            masks.extend(bytes.chunks_exact(plane).map(<[u8]>::to_vec));
-        }
-        let logits = gpu.download(&low_res)?;
-        let objects = scores
-            .iter()
-            .zip(masks)
-            .zip(logits.chunks(LOW_RES * LOW_RES))
-            .zip(picks)
-            .map(|(((&score, mask), low_res), (ious, chosen))| TrackedObject {
-                score,
-                mask,
-                low_res: low_res.to_vec(),
-                ious,
-                chosen,
-            })
-            .collect();
-        Ok(TrackedFrame { frame, objects, memory_tokens: mem_tokens, pointer_tokens: ptr_tokens })
+        let (ptr, pos) = self.pointer_tokens(sel, ptr_pos, b)?;
+        self.tracker.mem_attn.forward_cached(&self.gpu, start, &slots, &ptr, &pos)
     }
 }
 
 /// Bilinear upsampling (`align_corners=False`) of `[n, 288^2]` logits to `[n, h * w]`
-fn upsample(gpu: &Gpu, low_res: Arg, n: usize, h: usize, w: usize) -> Result<Tensor> {
+pub(crate) fn upsample(gpu: &Gpu, low_res: Arg, n: usize, h: usize, w: usize) -> Result<Tensor> {
     let out = gpu.empty(&[n, h * w])?;
     launch!(gpu, "resize_bilinear", ew(out.len()), B256, 0; &out, low_res, LOW_RES, LOW_RES, h, w)?;
     Ok(out)
-}
-
-/// Upstream's `_get_stability_scores` at delta 0.05: the area above +delta over the area
-/// above -delta
-fn stability(logits: &[f32]) -> f32 {
-    let inter = logits.iter().filter(|&&v| v > 0.05).count();
-    let union = logits.iter().filter(|&&v| v > -0.05).count();
-    if union > 0 { inter as f32 / union as f32 } else { 1.0 }
-}
-
-/// All the clicks, or the first and last half of [`MAX_CLICKS`] when there are more
-fn cap_clicks(points: &[PointPrompt]) -> Vec<PointPrompt> {
-    if points.len() <= MAX_CLICKS {
-        return points.to_vec();
-    }
-    let first = MAX_CLICKS / 2;
-    points[..first].iter().chain(&points[points.len() - (MAX_CLICKS - first)..]).copied().collect()
 }

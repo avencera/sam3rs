@@ -13,53 +13,20 @@ use eyre::Result;
 
 use crate::metal::gpu::{DType, Gpu, Tensor};
 use crate::metal::ops::{Act, Conv3x3, ConvT2x2, LayerNorm, Linear, add_assign, convert, weight_dtype};
+use crate::model::vision::{DIM, GLOBAL_BLOCKS, GRID, HEAD_DIM, HEADS, IMAGE_SIZE, PATCH, TOKENS, WINDOW};
+use crate::posenc::vision_rope;
 use crate::weights::Weights;
 
-pub const IMAGE_SIZE: usize = 1008;
-pub const PATCH: usize = 14;
-pub const GRID: usize = IMAGE_SIZE / PATCH;
-const TOKENS: usize = GRID * GRID;
-const DIM: usize = 1024;
-const HEADS: usize = 16;
-const HEAD_DIM: usize = DIM / HEADS;
-const WINDOW: usize = 24;
-const GLOBAL_BLOCKS: [usize; 4] = [7, 15, 23, 31];
 /// Query rows of each attention SIMD group, and SIMD groups a threadgroup (the
 /// `vit_attn_*` instantiation's BQ and SGS)
 const ATTN_ROWS: usize = 16;
 const ATTN_SIMDGROUPS: usize = 4;
 
-/// The raster index of row `r` of the window-major token order; the host twin of the
-/// kernels' `window_to_raster`
-fn window_to_raster(r: usize) -> usize {
-    let nwx = GRID / WINDOW;
-    let (w, l) = (r / (WINDOW * WINDOW), r % (WINDOW * WINDOW));
-    ((w / nwx) * WINDOW + l / WINDOW) * GRID + (w % nwx) * WINDOW + l % WINDOW
-}
-
-/// Axial RoPE tables `[side * side, HEAD_DIM / 2]` for a `side` x `side` token grid, rows
-/// in raster order, or in window-major order with `window_major`
-///
-/// Matches `compute_axial_cis`: the first 16 complex pairs rotate by x, the last 16 by y,
-/// and positions are scaled by `scale` (1/3 for global blocks, interpolated from the
-/// 24x24 pretraining grid). Angles are formed in f32 like PyTorch before cos/sin
+/// Axial RoPE tables `[side * side, HEAD_DIM / 2]` for a `side` x `side` token grid,
+/// uploaded (see [`vision_rope`])
 fn rope_tables(gpu: &Gpu, side: usize, scale: f32, window_major: bool) -> Result<(Tensor, Tensor)> {
-    let quarter = HEAD_DIM / 4;
-    let freqs: Vec<f32> = (0..quarter).map(|i| 1.0 / 10000f32.powf((4 * i) as f32 / HEAD_DIM as f32)).collect();
-    let half = HEAD_DIM / 2;
-    let mut cos = vec![0f32; side * side * half];
-    let mut sin = vec![0f32; side * side * half];
-    for row in 0..side * side {
-        let tok = if window_major { window_to_raster(row) } else { row };
-        let tx = (tok % side) as f32 * scale;
-        let ty = (tok / side) as f32 * scale;
-        for p in 0..half {
-            let angle = if p < quarter { tx * freqs[p] } else { ty * freqs[p - quarter] };
-            cos[row * half + p] = (angle as f64).cos() as f32;
-            sin[row * half + p] = (angle as f64).sin() as f32;
-        }
-    }
-    let shape = [side * side, half];
+    let (cos, sin) = vision_rope(side, scale, window_major);
+    let shape = [side * side, HEAD_DIM / 2];
     Ok((gpu.upload_f32(&cos, &shape)?, gpu.upload_f32(&sin, &shape)?))
 }
 

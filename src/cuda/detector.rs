@@ -4,22 +4,20 @@
 use eyre::{Result, eyre};
 
 use crate::cuda::gpu::{Buf, Gpu, Tensor, blocks, launch};
-use crate::cuda::nvtx::range;
 use crate::cuda::ops::{
     Act, Attention, B256, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add, add_assign, bias_act, concat_rows, ew,
     group_norm_stats, upload_i32,
 };
 use crate::cuda::text::TextFeatures;
-use crate::cuda::vision::{Fpn, GRID};
-use crate::posenc::{box_encoding, sine_2d};
+use crate::cuda::vision::Fpn;
+use crate::host::BoxInputs;
+use crate::model::detector::{D, HEADS, QUERIES, ROI};
+use crate::model::vision::GRID;
+use crate::nvtx::range;
+use crate::posenc::sine_2d;
 use crate::precision::Precision;
 use crate::prompt::BoxPrompt;
 use crate::weights::Weights;
-
-const D: usize = 256;
-const HEADS: usize = 8;
-pub const QUERIES: usize = 200;
-const ROI: usize = 7;
 
 /// Image features the detector reads, computed once per image
 pub struct DetectorImage {
@@ -228,30 +226,20 @@ impl Detector {
         let embeds = if n == 0 {
             gpu.clone_tensor(&g.cls)?
         } else {
-            let raw: Vec<f32> = boxes.iter().flat_map(BoxPrompt::cxcywh).collect();
-            let raw = gpu.upload(raw, &[n, 4])?;
+            let inputs = BoxInputs::new(boxes);
+            let raw = gpu.upload(inputs.cxcywh, &[n, 4])?;
             let x = g.direct.forward(gpu, &raw)?;
 
-            let side = GRID as f32;
-            let xyxy: Vec<f32> = boxes
-                .iter()
-                .flat_map(|b| {
-                    let [cx, cy, w, h] = b.cxcywh();
-                    [(cx - 0.5 * w) * side, (cy - 0.5 * h) * side, (cx + 0.5 * w) * side, (cy + 0.5 * h) * side]
-                })
-                .collect();
-            let xyxy = gpu.upload(xyxy, &[n, 4])?;
+            let xyxy = gpu.upload(inputs.grid_xyxy, &[n, 4])?;
             let pooled = gpu.empty(&[n, D * ROI * ROI])?;
             launch!(gpu, "roi_align", ew(pooled.len()), B256, 0;
                 &pooled, &img.coarse_normed, &xyxy, GRID, GRID, D, ROI)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
-            let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh())).collect();
-            let enc = gpu.upload(enc, &[n, 258])?;
+            let enc = gpu.upload(inputs.encoding, &[n, 258])?;
             g.pos.forward_residual(gpu, &enc, &x)?;
 
-            let labels: Vec<i32> = boxes.iter().map(|b| b.positive() as i32).collect();
-            let labels = upload_i32(gpu, labels)?;
+            let labels = upload_i32(gpu, inputs.labels)?;
             let label = gpu.empty(&[n, D])?;
             launch!(gpu, "gather_rows", ew(label.len()), B256, 0; &label, &g.label, labels.slice::<i32>(), D)?;
             add_assign(gpu, &x, &label)?;

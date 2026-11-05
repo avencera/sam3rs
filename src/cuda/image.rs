@@ -5,8 +5,8 @@ use eyre::Result;
 
 use crate::cuda::gpu::{Buf, Gpu, Tensor, launch};
 use crate::cuda::ops::{B256, ew, upload_i32};
-use crate::cuda::vision::IMAGE_SIZE;
 use crate::image::{RgbImage, Taps, aa_taps};
+use crate::model::vision::IMAGE_SIZE;
 
 /// One antialiased bilinear resize (`_upsample_bilinear2d_aa`) of planes from one size to
 /// another, with the taps uploaded once

@@ -1,19 +1,16 @@
 //! SAM 2 style interactive decoder for point prompts on Metal: prompt encoder, two-way
 //! transformer, high-resolution upscaling and the multimask heads, all in FP32
 
-use std::f64::consts::PI;
-
 use eyre::{Result, ensure};
 
+use crate::host::PointEncoding;
 use crate::metal::gpu::{DType, Gpu, Tensor};
-use crate::metal::masks::LOW_RES;
 use crate::metal::ops::{Act, Attention, ConvT2x2, LayerNorm, Linear, Mask, Mlp, add_assign, bias_act};
-use crate::metal::vision::{Fpn, GRID, IMAGE_SIZE};
+use crate::metal::vision::Fpn;
+use crate::model::point::{D, HEADS, LOW_RES, MASK_TOKEN_ROW};
+use crate::model::vision::GRID;
 use crate::prompt::PointPrompt;
 use crate::weights::Weights;
-
-const D: usize = 256;
-const HEADS: usize = 8;
 
 /// Image features the point decoder reads, computed once per image
 pub struct PointImage {
@@ -37,9 +34,6 @@ pub struct Decoded {
     /// mask tokens 0 to 3
     pub tokens: Tensor,
 }
-
-/// Row of mask token 0 in each prompt's [`Decoded::tokens`]
-pub const MASK_TOKEN_ROW: usize = 2;
 
 struct TwoWayLayer {
     self_attn: Attention,
@@ -77,9 +71,7 @@ fn image_proj(gpu: &Gpu, t2i: &Attention, i2t: Option<&Attention>, dense_pe: &Te
 /// The tracker's prompt encoder and mask decoder, which answer point prompts on an image
 /// and decode every tracked frame of a video
 pub struct PointDecoder {
-    gaussian: Vec<f32>,
-    point_embed: Vec<f32>,
-    not_a_point: Vec<f32>,
+    prompts: PointEncoding,
     no_mask: Tensor,
     mask_conv1: Linear,
     mask_ln1: LayerNorm,
@@ -103,31 +95,13 @@ pub struct PointDecoder {
     conv_s1: Linear,
 }
 
-/// Random Fourier features of normalized (x, y) coords in [0, 1]
-fn fourier(gaussian: &[f32], x: f32, y: f32, out: &mut [f32]) {
-    let (cx, cy) = (2.0 * x - 1.0, 2.0 * y - 1.0);
-    let n = gaussian.len() / 2;
-    for i in 0..n {
-        let v = (cx * gaussian[i] + cy * gaussian[n + i]) * (2.0 * PI) as f32;
-        out[i] = (v as f64).sin() as f32;
-        out[n + i] = (v as f64).cos() as f32;
-    }
-}
-
 impl PointDecoder {
     pub fn load(gpu: &Gpu, wts: &Weights) -> Result<Self> {
         let pe = "tracker_model.prompt_encoder";
         let md = "tracker_model.mask_decoder";
         let f32_linear = |name: &str| Linear::load(gpu, wts, name, DType::F32);
-        let gaussian = wts.host(&format!("{pe}.shared_embedding.positional_embedding"))?.0;
-
-        let mut dense = vec![0f32; GRID * GRID * D];
-        for y in 0..GRID {
-            for x in 0..GRID {
-                let (fx, fy) = ((x as f32 + 0.5) / GRID as f32, (y as f32 + 0.5) / GRID as f32);
-                fourier(&gaussian, fx, fy, &mut dense[(y * GRID + x) * D..][..D]);
-            }
-        }
+        let prompts = PointEncoding::load(wts)?;
+        let dense = prompts.dense_pe();
 
         let mut output_tokens = wts.host(&format!("{md}.obj_score_token.weight"))?.0;
         output_tokens.extend(wts.host(&format!("{md}.iou_token.weight"))?.0);
@@ -156,9 +130,7 @@ impl PointDecoder {
         let final_attn = Attention::load(gpu, wts, &format!("{t}.final_attn_token_to_image"), HEADS)?;
 
         Ok(Self {
-            gaussian,
-            point_embed: wts.host(&format!("{pe}.point_embed.weight"))?.0,
-            not_a_point: wts.host(&format!("{pe}.not_a_point_embed.weight"))?.0,
+            prompts,
             no_mask: wts.get(gpu, &format!("{pe}.no_mask_embed.weight"))?,
             mask_conv1: f32_linear(&format!("{pe}.mask_embed.conv1"))?,
             mask_ln1: LayerNorm::load(gpu, wts, &format!("{pe}.mask_embed.layer_norm1"), 1e-6)?,
@@ -190,31 +162,6 @@ impl PointDecoder {
             feat_s0: self.conv_s0.forward(gpu, &fpn.fine, Act::None)?,
             feat_s1: self.conv_s1.forward(gpu, &fpn.mid, Act::None)?,
         })
-    }
-
-    /// Sparse prompt tokens: one per point plus the padding point. Without points (a
-    /// tracked frame) upstream still passes one point labelled -1 before the padding, so
-    /// there are two padding tokens
-    fn sparse_tokens(&self, points: &[PointPrompt], width: usize, height: usize) -> Vec<f32> {
-        if points.is_empty() {
-            return [self.not_a_point.as_slice(), self.not_a_point.as_slice()].concat();
-        }
-        let n = points.len() + 1;
-        let mut out = vec![0f32; n * D];
-        let size = IMAGE_SIZE as f32;
-        for (i, p) in points.iter().enumerate() {
-            // pixels -> 1008 input frame, shifted to the pixel center, normalized back
-            let x = (p.x() / width as f32 * size + 0.5) / size;
-            let y = (p.y() / height as f32 * size + 0.5) / size;
-            let row = &mut out[i * D..][..D];
-            fourier(&self.gaussian, x, y, row);
-            let label = p.positive() as usize;
-            for (v, e) in row.iter_mut().zip(&self.point_embed[label * D..][..D]) {
-                *v += e;
-            }
-        }
-        out[(n - 1) * D..].copy_from_slice(&self.not_a_point);
-        out
     }
 
     /// Dense prompt embeddings `[k * 72^2, 256]` of `k` prompts, from their low-res masks
@@ -285,7 +232,7 @@ impl PointDecoder {
         for points in prompts {
             let start = tokens.len();
             tokens.extend_from_slice(&self.output_tokens);
-            tokens.extend(self.sparse_tokens(points, width, height));
+            tokens.extend(self.prompts.sparse_tokens(points, width, height));
             // compared per prompt, since unequal counts can still sum to a multiple of k
             let len = tokens.len() - start;
             ensure!(*per_prompt.get_or_insert(len) == len, "the prompts of one decoder batch need equal point counts");
@@ -470,20 +417,9 @@ pub fn add_tiled(gpu: &Gpu, x: &Tensor, b: &Tensor) -> Result<()> {
     gpu.dispatch_1d("add_tiled", x.len(), &[x.arg(), b.arg(), b.len().into()])
 }
 
-/// First index of the maximum, like `torch.argmax`
-pub fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    for (i, x) in v.iter().enumerate() {
-        if *x > v[best] {
-            best = i;
-        }
-    }
-    best
-}
-
 /// Each prompt's best multimask candidate from a pass with masks for tokens 1 to 3,
 /// `low_res [K * 3, 288^2]` and `iou [K, 4]`, picked on the GPU as `[K, 288^2]`: the
-/// first argmax of the prompt's candidate IoUs, as [`argmax`] picks on the host. With
+/// first argmax of the prompt's candidate IoUs, as [`crate::host::argmax`] picks on the host. With
 /// `clamp`, clamped to +-32 as the next pass's mask input
 pub fn best_masks(gpu: &Gpu, low_res: &Tensor, iou: &Tensor, clamp: bool) -> Result<Tensor> {
     let k = iou.rows();
@@ -519,113 +455,4 @@ pub fn fill_holes(gpu: &Gpu, logits: &Tensor, max_area: usize) -> Result<()> {
     gpu.dispatch_1d("holes_merge", n, &[labels.arg(), logits.arg(), LOW_RES.into()])?;
     gpu.dispatch_1d("holes_count", n, &[labels.arg(), area.arg()])?;
     gpu.dispatch_1d("holes_fill", n, &[logits.arg(), labels.arg(), area.arg(), max_area.into()])
-}
-
-#[cfg(test)]
-mod tests {
-    use eyre::Result;
-
-    use super::fill_holes;
-    use crate::metal::gpu::Gpu;
-    use crate::metal::masks::LOW_RES;
-    use crate::precision::Precision;
-
-    /// The host flood fill the GPU fill replaced: background regions (logit <= 0),
-    /// 8-connected, of at most `max_area` pixels become foreground (+10). NaN is
-    /// foreground, as upstream's `mask <= mask_threshold`
-    fn fill_holes_host(logits: &mut [f32], side: usize, max_area: usize) {
-        let mut seen = vec![false; logits.len()];
-        let mut stack = Vec::new();
-        let mut component = Vec::new();
-        for start in 0..logits.len() {
-            if seen[start] || logits[start] > 0.0 || logits[start].is_nan() {
-                continue;
-            }
-            seen[start] = true;
-            stack.push(start);
-            component.clear();
-            while let Some(p) = stack.pop() {
-                component.push(p);
-                let (y, x) = ((p / side) as isize, (p % side) as isize);
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let (ny, nx) = (y + dy, x + dx);
-                        if ny < 0 || nx < 0 || ny >= side as isize || nx >= side as isize {
-                            continue;
-                        }
-                        let q = ny as usize * side + nx as usize;
-                        if !seen[q] && logits[q] <= 0.0 {
-                            seen[q] = true;
-                            stack.push(q);
-                        }
-                    }
-                }
-            }
-            if component.len() <= max_area {
-                for &p in &component {
-                    logits[p] = 10.0;
-                }
-            }
-        }
-    }
-
-    /// Logits with regions of many sizes and shapes: box-blurred noise of growing radius,
-    /// with NaN pixels, then an all-background and an all-foreground mask
-    fn logits(masks: usize) -> Vec<f32> {
-        let side = LOW_RES;
-        let mut state = 0x9e37_79b9_u32;
-        let mut noise = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as f32 / u32::MAX as f32 - 0.5
-        };
-        let mut out = Vec::new();
-        for m in 0..masks {
-            let raw: Vec<f32> = (0..side * side).map(|_| noise()).collect();
-            let r = 1 + m as isize;
-            let last = side as isize - 1;
-            let mut mask = vec![0f32; side * side];
-            for y in 0..side as isize {
-                for x in 0..side as isize {
-                    let mut sum = 0.0;
-                    for dy in -r..=r {
-                        for dx in -r..=r {
-                            let (yy, xx) = ((y + dy).clamp(0, last), (x + dx).clamp(0, last));
-                            sum += raw[yy as usize * side + xx as usize];
-                        }
-                    }
-                    mask[y as usize * side + x as usize] = sum + 0.05 * m as f32;
-                }
-            }
-            for p in (m * 7919..side * side).step_by(9973) {
-                mask[p] = f32::NAN;
-            }
-            out.extend(mask);
-        }
-        out.extend(vec![-1.0; side * side]);
-        out.extend(vec![1.0; side * side]);
-        out
-    }
-
-    #[test]
-    #[ignore = "needs a Metal 4 GPU"]
-    fn gpu_fill_matches_the_host_flood_fill() -> Result<()> {
-        let gpu = Gpu::new(0, Precision::Fp32)?;
-        let side = LOW_RES;
-        let host = logits(6);
-        let n = host.len() / (side * side);
-        let mut want = host.clone();
-        want.chunks_mut(side * side).for_each(|m| fill_holes_host(m, side, 256));
-        let changed = want.iter().zip(&host).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-        assert!(changed > 1000, "the fixture fills only {changed} pixels");
-
-        let t = gpu.upload_f32(&host, &[n, side * side])?;
-        fill_holes(&gpu, &t, 256)?;
-        let got = gpu.download(&t)?;
-        assert_eq!(got.len(), want.len());
-        let wrong = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-        assert_eq!(wrong, 0, "{wrong} of {} pixels differ from the host fill", got.len());
-        Ok(())
-    }
 }

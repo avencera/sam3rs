@@ -4,10 +4,7 @@
 use eyre::{Result, ensure};
 
 use crate::metal::gpu::{DType, Gpu, Tensor};
-use crate::metal::vision::GRID;
-
-/// Side of the low-resolution mask logits
-pub const LOW_RES: usize = 4 * GRID;
+use crate::model::point::LOW_RES;
 
 /// Most output pixels per launch, so the kernel's 32-bit thread index can't overflow; a
 /// mask at the largest image size is 2^28 pixels, so a launch holds at least one

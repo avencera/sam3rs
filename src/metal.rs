@@ -15,17 +15,16 @@ pub(crate) mod vision;
 #[cfg(test)]
 mod kernel_tests;
 #[cfg(test)]
-mod stage_tests;
+mod probes;
 #[cfg(test)]
-mod video_tests;
+mod test_hooks;
 
 use eyre::Result;
 
 use crate::weights::Weights;
 use gpu::{DType, Gpu, Tensor};
 
-pub use pipeline::{Embedding, Sam3};
-pub use video::VideoTracker;
+pub(crate) use pipeline::Metal;
 
 impl Weights {
     /// One FP32 tensor uploaded to the GPU

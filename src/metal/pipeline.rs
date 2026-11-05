@@ -1,122 +1,130 @@
-//! End-to-end SAM 3 image inference on Metal: encode an image once, then answer text,
-//! box and point prompts against the cached features
+//! The Metal backend's model: every stage's layers on the Mac's GPU, and the [`Backend`]
+//! steps the public API runs them through
 
-use std::cell::{Cell, OnceCell};
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use eyre::{Result, ensure, eyre};
 
-use eyre::{Result, ensure};
-
+use crate::backend::{Backend, DetectionScores, ObjectPass};
+use crate::host::argmax;
 use crate::image::RgbImage;
-use crate::masks::{MaskBuffer, MaskPool};
-use crate::metal::detector::{Detector, DetectorImage, QUERIES};
-use crate::metal::gpu::{Gpu, Tensor};
+use crate::masks::MaskSink;
+use crate::metal::detector::{Detector, DetectorImage, DetectorOutput};
+use crate::metal::gpu::{DType, Gpu, Tensor};
 use crate::metal::image::preprocess;
 use crate::metal::masks::upsample_masks;
 use crate::metal::ops::gather_rows;
-use crate::metal::point::{PointDecoder, PointImage, argmax, best_masks, fill_holes};
+use crate::metal::point::{Decoded, PointDecoder, PointImage, best_masks, fill_holes, row};
 use crate::metal::text::{TextEncoder, TextFeatures};
-use crate::metal::video::Tracker;
+use crate::metal::video::{FrameAttention, FrameFeatures, FrameMemory, Tracker, copy, mask_for_mem, upsample};
 use crate::metal::vision::{Backbone, Neck, Trunk};
-use crate::output::{
-    Detection, Detections, HOLE_AREA, POINT_BATCH, PointMask, PointMasks, SCORE_THRESHOLD, VISUAL_PROMPT,
-};
+use crate::model::point::{LOW_RES, MASK_TOKEN_ROW};
+use crate::model::tracker::NO_OBJ_SCORE;
+use crate::model::vision::IMAGE_SIZE;
+use crate::output::HOLE_AREA;
 use crate::precision::Precision;
 use crate::prompt::{BoxPrompt, PointPrompt};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::CONTEXT;
+use crate::tracker::Selection;
 use crate::weights::Weights;
 
-/// Tells models apart, so an embedding is only used with the model that made it
-static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(0);
+/// The loaded model on the Mac's GPU
+pub(crate) struct Metal {
+    pub(crate) backbone: Backbone,
+    pub(crate) neck: Neck,
+    pub(crate) tracker_neck: Neck,
+    text: TextEncoder,
+    pub(crate) detector: Detector,
+    pub(crate) point: PointDecoder,
+    /// Memory attention, memory encoder and pointer heads of the video tracker
+    pub(crate) tracker: Tracker,
+    // last, so the layers free their weights before the GPU handles go
+    pub(crate) gpu: Gpu,
+}
 
-/// Features of one encoded image, kept on the GPU of the model that encoded it
-pub struct Embedding {
-    model: u64,
-    width: usize,
-    height: usize,
+/// Features of one encoded image
+pub(crate) struct Image {
     /// The detector neck's levels and what the detector derives from them
     detector: DetectorImage,
     /// The point decoder's features, from the tracker neck's levels
     pub(crate) point: PointImage,
 }
 
-impl Embedding {
-    /// Width of the encoded image in pixels
-    pub fn width(&self) -> usize {
-        self.width
+/// Both point decoder passes over a batch, launched without waiting: the best
+/// second-pass mask of each prompt `[K, 288^2]`, before hole filling, and the second
+/// pass's IoUs `[K, 4]`, whose candidate argmax picked it
+pub(crate) struct PointPass {
+    best: Tensor,
+    iou: Tensor,
+}
+
+impl Metal {
+    /// Both decoder passes over prompts with equal click counts
+    pub(crate) fn decode_point_batch(
+        &self,
+        img: &PointImage,
+        prompts: &[&[PointPrompt]],
+        size: (usize, usize),
+    ) -> Result<PointPass> {
+        let gpu = &self.gpu;
+        let first = self.point.decode_batch(gpu, &img.embed, img, prompts, size, None, 1)?;
+        let mask_input = best_masks(gpu, &first.low_res, &first.iou, true)?;
+        let second = self.point.decode_batch(gpu, &img.embed, img, prompts, size, Some(&mask_input), 1)?;
+        Ok(PointPass { best: best_masks(gpu, &second.low_res, &second.iou, false)?, iou: second.iou })
     }
 
-    /// Height of the encoded image in pixels
-    pub fn height(&self) -> usize {
-        self.height
+    /// The hole-filled best masks of a pass at full size into `sink`, and their
+    /// predicted IoUs
+    pub(crate) fn point_batch_masks(
+        &self,
+        pass: PointPass,
+        (w, h): (usize, usize),
+        sink: &mut MaskSink,
+    ) -> Result<Vec<f32>> {
+        let gpu = &self.gpu;
+        let PointPass { best, iou } = pass;
+        let n = iou.rows();
+        fill_holes(gpu, &best, HOLE_AREA)?;
+        let full = upsample_masks(gpu, &best, 0, n, w, h)?;
+        // taken after the launches, so a buffer still faulting in overlaps the GPU work
+        sink.ready()?;
+        // the click's one wait: the scores, after every launch
+        let iou = gpu.download(&iou)?;
+        ensure!(iou.len() == 4 * n, "{} IoUs for {n} prompts", iou.len());
+        let scores = iou.chunks(4).map(|c| c[1 + argmax(&c[1..])]).collect();
+        // consecutive prompts download together
+        sink.write(0..n, |offset, dst| gpu.read(&full.buf, offset, dst))?;
+        Ok(scores)
     }
 }
 
-/// The loaded model on the Mac's GPU
-///
-/// Calls run one at a time on the model's command queue. The model is `Send`, so it can
-/// move to another thread, but not `Sync`
-pub struct Sam3 {
-    id: u64,
-    tokenizer: Tokenizer,
-    pub(crate) backbone: Backbone,
-    neck: Neck,
-    pub(crate) tracker_neck: Neck,
-    text: TextEncoder,
-    detector: Detector,
-    pub(crate) point: PointDecoder,
-    /// Memory attention, memory encoder and pointer heads of the video tracker
-    pub(crate) tracker: Tracker,
-    /// Text features of [`VISUAL_PROMPT`], encoded on first use: every box-only prompt
-    /// would otherwise run the 24-layer text encoder on the same string
-    visual: OnceCell<TextFeatures>,
-    /// Detections the last `detect` call kept, the guess for how many masks of host
-    /// memory to set aside ahead of the next
-    last_kept: Cell<usize>,
-    /// Host memory of dropped results, reused for later masks
-    masks: MaskPool,
-    // last, so the layers free their weights before the GPU handles go
-    pub(crate) gpu: Gpu,
-}
+impl Backend for Metal {
+    type Device = Gpu;
+    type Image = Image;
+    type Text = TextFeatures;
+    type Detected = DetectorOutput;
+    type PointPass = PointPass;
+    type Pixels = Tensor;
+    type Frame = FrameFeatures;
+    type Logits = Tensor;
+    type Decoded = Decoded;
+    type Embed = Tensor;
+    type Pointer = Tensor;
+    type Memory = Tensor;
+    type FrameMemory = FrameMemory;
+    type Attention = FrameAttention;
 
-impl Sam3 {
-    /// Loads `model.safetensors`, `vocab.json` and `merges.txt` from `dir` onto the Metal
-    /// GPU; `device` must be 0, the Mac's one GPU
-    ///
-    /// Fails without a Metal 4 GPU (Apple silicon on macOS 26.1 or later), with
-    /// [`Precision::Tf32`], which has no Metal equivalent, and when the checkpoint
-    /// doesn't match the SAM 3 weight schema
-    pub fn load(dir: &Path, device: usize, precision: Precision) -> Result<Self> {
-        Self::load_onto(Gpu::new(device, precision)?, dir)
+    fn open(device: usize, precision: Precision) -> Result<Gpu> {
+        Gpu::new(device, precision)
     }
 
-    /// Downloads the weights from Hugging Face (see [`crate::download_model`]), then
-    /// loads it like [`Sam3::load`]
-    ///
-    /// Opens the GPU first, so a machine that can't run the model fails before the
-    /// 3.4 GB download
-    #[cfg(feature = "online")]
-    pub fn from_pretrained(device: usize, precision: Precision) -> Result<Self> {
-        let gpu = Gpu::new(device, precision)?;
-        Self::load_onto(gpu, &crate::download_model()?)
-    }
-
-    fn load_onto(gpu: Gpu, dir: &Path) -> Result<Self> {
-        let tokenizer = Tokenizer::open(dir)?;
-        let wts = Weights::open(&dir.join("model.safetensors"))?;
+    fn load(gpu: Gpu, wts: &Weights) -> Result<Self> {
         let model = Self {
-            id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
-            tokenizer,
-            backbone: Backbone::load(&gpu, &wts)?,
-            neck: Neck::load(&gpu, &wts, "detector_model.vision_encoder.neck")?,
-            tracker_neck: Neck::load(&gpu, &wts, "tracker_neck")?,
-            text: TextEncoder::load(&gpu, &wts)?,
-            detector: Detector::load(&gpu, &wts)?,
-            point: PointDecoder::load(&gpu, &wts)?,
-            tracker: Tracker::load(&gpu, &wts)?,
-            visual: OnceCell::new(),
-            last_kept: Cell::new(0),
-            masks: MaskPool::default(),
+            backbone: Backbone::load(&gpu, wts)?,
+            neck: Neck::load(&gpu, wts, "detector_model.vision_encoder.neck")?,
+            tracker_neck: Neck::load(&gpu, wts, "tracker_neck")?,
+            text: TextEncoder::load(&gpu, wts)?,
+            detector: Detector::load(&gpu, wts)?,
+            point: PointDecoder::load(&gpu, wts)?,
+            tracker: Tracker::load(&gpu, wts)?,
             gpu,
         };
         // a load that dispatched nothing still surfaces a kernel compile error here
@@ -125,18 +133,16 @@ impl Sam3 {
         Ok(model)
     }
 
-    /// Numeric mode the model was loaded with
-    pub fn precision(&self) -> Precision {
+    fn precision(&self) -> Precision {
         self.gpu.precision()
     }
 
-    fn check(&self, emb: &Embedding) -> Result<()> {
-        ensure!(emb.model == self.id, "the embedding was encoded by a different Sam3 model");
+    /// Nothing to do: a Metal queue isn't bound to a thread
+    fn bind(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Runs the vision backbone and both necks; the result serves any number of prompts
-    pub fn encode(&self, img: &RgbImage) -> Result<Embedding> {
+    fn encode(&self, img: &RgbImage) -> Result<Image> {
         let gpu = &self.gpu;
         let pixels = preprocess(gpu, img)?;
         let trunk = self.backbone.forward(gpu, &pixels)?;
@@ -145,268 +151,162 @@ impl Sam3 {
         let point = self.point.prepare_image(gpu, &self.tracker_neck.forward(gpu, &trunk)?)?;
         let detector = self.detector.prepare_image(gpu, self.neck.forward(gpu, &trunk)?)?;
         gpu.synchronize()?;
-        Ok(Embedding { model: self.id, width: img.width(), height: img.height(), detector, point })
+        Ok(Image { detector, point })
     }
 
-    /// Detects every instance matching `text` and the box prompts (pass [`VISUAL_PROMPT`]
-    /// for boxes alone), keeping those scoring above [`SCORE_THRESHOLD`] in query order.
-    /// Each call runs the text encoder on `text`, except for [`VISUAL_PROMPT`], whose
-    /// features are encoded on the first call and reused
-    pub fn detect(&self, emb: &Embedding, text: &str, boxes: &[BoxPrompt]) -> Result<Detections> {
-        self.check(emb)?;
+    fn encode_text(&self, tokens: &[u32; CONTEXT]) -> Result<TextFeatures> {
+        self.text.forward(&self.gpu, tokens)
+    }
+
+    fn detect(&self, img: &Image, text: &TextFeatures, boxes: &[BoxPrompt]) -> Result<DetectorOutput> {
+        self.detector.forward(&self.gpu, &img.detector, text, boxes)
+    }
+
+    fn detection_scores(&self, out: &DetectorOutput) -> Result<DetectionScores> {
         let gpu = &self.gpu;
-        let (w, h) = (emb.width, emb.height);
-        // one mask more than last time, since a box being dragged out tends to gain them
-        let reserved = self.masks.reserve((self.last_kept.get() + 1) * w * h);
-        let encode = || self.text.forward(gpu, &self.tokenizer.tokenize(text)?);
-        let encoded;
-        let feats = if text == VISUAL_PROMPT {
-            match self.visual.get() {
-                Some(feats) => feats,
-                None => {
-                    let feats = encode()?;
-                    self.visual.get_or_init(|| feats)
-                }
-            }
-        } else {
-            encoded = encode()?;
-            &encoded
-        };
-        let out = self.detector.forward(gpu, &emb.detector, feats, boxes)?;
         let presence = gpu.download(&out.presence)?[0];
-        let logits = gpu.download(&out.logits)?;
-        let boxes = gpu.download(&out.boxes)?;
-        ensure!(
-            logits.len() == QUERIES && boxes.len() == QUERIES * 4,
-            "{} logits and {} box values",
-            logits.len(),
-            boxes.len()
-        );
+        Ok(DetectionScores { presence, logits: gpu.download(&out.logits)?, boxes: gpu.download(&out.boxes)? })
+    }
 
-        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-        let presence = sigmoid(presence);
-        let kept: Vec<(usize, f32)> =
-            (0..QUERIES).map(|i| (i, sigmoid(logits[i]) * presence)).filter(|(_, p)| *p > SCORE_THRESHOLD).collect();
-        self.last_kept.set(kept.len());
-        if kept.is_empty() {
-            self.masks.release(reserved);
-            return Ok(Detections::default());
-        }
-
-        let idx: Vec<i32> = kept.iter().map(|(i, _)| *i as i32).collect();
+    fn detection_masks(
+        &self,
+        out: &DetectorOutput,
+        kept: &[usize],
+        (w, h): (usize, usize),
+        sink: &mut MaskSink,
+    ) -> Result<()> {
+        let gpu = &self.gpu;
+        let idx: Vec<i32> = kept.iter().map(|&i| i as i32).collect();
         let picked = gather_rows(gpu, &out.masks, &idx)?;
         let mask = upsample_masks(gpu, &picked, 0, kept.len(), w, h)?;
+        // the buffer comes out of the pool after the launches are committed, so one still
+        // faulting in overlaps the GPU work
         gpu.flush()?;
-        // taken after the launches are committed, so a buffer still faulting in overlaps
-        // the GPU work
-        let mut masks = self.masks.take(reserved, kept.len() * h * w)?;
-        gpu.read(&mask.buf, 0, &mut masks)?;
-
-        let instances = kept
-            .iter()
-            .map(|&(i, score)| {
-                let [cx, cy, bw, bh] = [boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2], boxes[i * 4 + 3]];
-                let (wf, hf) = (w as f32, h as f32);
-                Detection {
-                    score,
-                    bbox: [(cx - bw / 2.0) * wf, (cy - bh / 2.0) * hf, (cx + bw / 2.0) * wf, (cy + bh / 2.0) * hf],
-                    query: i,
-                }
-            })
-            .collect();
-        Ok(Detections { instances, masks })
+        sink.write(0..kept.len(), |offset, dst| gpu.read(&mask.buf, offset, dst))
     }
 
-    /// Segments the object under the clicks: a first pass without a mask, then a second
-    /// with the first pass's best mask as the mask prompt, returning the second pass's
-    /// best mask after hole filling
-    pub fn segment_points(&self, emb: &Embedding, points: &[PointPrompt]) -> Result<PointMask> {
-        ensure!(!points.is_empty(), "segment_points needs at least one point");
-        let (mut scores, mask) = self.segment_points_batch(emb, &[points])?.into_parts();
-        Ok(PointMask { score: scores.remove(0), mask })
+    fn decode_points(&self, img: &Image, prompts: &[&[PointPrompt]], size: (usize, usize)) -> Result<PointPass> {
+        self.decode_point_batch(&img.point, prompts, size)
     }
 
-    /// [`Self::segment_points`] for several independent objects at once: prompt `i`'s
-    /// clicks give object `i`, with the score and mask `segment_points` would give it
-    /// alone, as upstream `predict_inst` does with a batch of prompts
-    ///
-    /// Prompts with the same number of clicks run through each decoder pass together, up
-    /// to [`POINT_BATCH`] at a time, so the decoder's per-call costs are paid once per
-    /// batch rather than once per object. Each prompt needs at least one click; no prompts
-    /// give an empty result. Every mask is `height * width` bytes of host memory, so a
-    /// large image times many prompts takes a lot of it: 50 MB a mask at 8160x6144
-    pub fn segment_points_batch(&self, emb: &Embedding, prompts: &[&[PointPrompt]]) -> Result<PointMasks> {
-        ensure!(prompts.iter().all(|p| !p.is_empty()), "every point prompt needs at least one point");
-        self.check(emb)?;
-        if prompts.is_empty() {
-            return Ok(PointMasks::default());
-        }
+    fn point_masks(&self, pass: PointPass, size: (usize, usize), sink: &mut MaskSink) -> Result<Vec<f32>> {
+        self.point_batch_masks(pass, size, sink)
+    }
+
+    fn preprocess(&self, frame: &RgbImage) -> Result<Tensor> {
+        preprocess(&self.gpu, frame)
+    }
+
+    fn video_frame(&self, pixels: &Tensor) -> Result<FrameFeatures> {
+        self.video_features(pixels)
+    }
+
+    fn frame_logits(&self, objects: usize) -> Result<Tensor> {
+        self.gpu.empty(&[objects, LOW_RES * LOW_RES], DType::F32)
+    }
+
+    fn decode_object(
+        &self,
+        frame: &FrameFeatures,
+        embed: Option<&Tensor>,
+        points: &[PointPrompt],
+        size: (usize, usize),
+        first: usize,
+    ) -> Result<ObjectPass<Decoded>> {
         let gpu = &self.gpu;
-        let (w, h) = (emb.width, emb.height);
+        let embed = embed.unwrap_or(&frame.point.embed);
+        let decoded = self.point.decode(gpu, embed, &frame.point, points, size, None, first)?;
+        let score = gpu.download(&self.point.obj_score(gpu, &decoded)?)?[0];
+        let ious = gpu.download(&decoded.iou)?;
+        Ok(ObjectPass { decoded, score, ious })
+    }
+
+    fn first_mask(&self, dec: &Decoded) -> Result<Vec<f32>> {
+        self.gpu.download(&row(&self.gpu, &dec.low_res, 0)?)
+    }
+
+    fn keep_mask(&self, dec: &Decoded, index: usize, present: bool, low_res: &Tensor, b: usize) -> Result<()> {
+        let gpu = &self.gpu;
+        let side = LOW_RES * LOW_RES;
+        let first = 4 - dec.low_res.rows();
+        ensure!(index >= first, "mask {index} of a pass that kept masks {first}..4");
+        copy(gpu, low_res, b * side, &dec.low_res, (index - first) * side, side)?;
+        if !present {
+            let args = [low_res.at(b * side), NO_OBJ_SCORE.into(), NO_OBJ_SCORE.into()];
+            gpu.dispatch_1d("clamp_f32", side, &args)?;
+        }
+        Ok(())
+    }
+
+    fn pointer(&self, dec: &Decoded, token: usize, present: bool) -> Result<Tensor> {
+        let gpu = &self.gpu;
+        self.tracker.pointer(gpu, &row(gpu, &dec.tokens, MASK_TOKEN_ROW + token)?, present)
+    }
+
+    fn prompt_memories(&self, frame: &FrameFeatures, low_res: &Tensor, present: &[bool]) -> Result<Vec<Tensor>> {
+        let gpu = &self.gpu;
+        let objects = present.len();
+        let high = upsample(gpu, low_res, 0, objects, IMAGE_SIZE, IMAGE_SIZE)?;
+        let n = IMAGE_SIZE * IMAGE_SIZE;
+        let high = if objects > 1 {
+            let out = gpu.empty(high.shape(), DType::F32)?;
+            gpu.dispatch_1d("nonoverlap", out.len(), &[out.arg(), high.arg(), objects.into(), n.into()])?;
+            out
+        } else {
+            high
+        };
+        let input = mask_for_mem(gpu, &high, true)?;
+        let mut mem = Vec::with_capacity(objects);
+        for (b, &present) in present.iter().enumerate() {
+            let mask = gpu.empty(&[n], DType::F32)?;
+            copy(gpu, &mask, 0, &input, b * n, n)?;
+            mem.push(self.tracker.memory(gpu, &frame.coarse, &mask, present)?);
+        }
+        Ok(mem)
+    }
+
+    fn object_memory(&self, frame: &FrameFeatures, low_res: &Tensor, b: usize, present: bool) -> Result<Tensor> {
+        let gpu = &self.gpu;
+        let high = upsample(gpu, low_res, b, 1, IMAGE_SIZE, IMAGE_SIZE)?;
+        let input = mask_for_mem(gpu, &high, false)?;
+        self.tracker.memory(gpu, &frame.coarse, &input, present)
+    }
+
+    fn frame_memory(&self, mem: Vec<Tensor>, ptr: Vec<Tensor>) -> Result<FrameMemory> {
+        Ok(FrameMemory { mem, ptr })
+    }
+
+    /// Every object's assembled memory, and the frame's features through the first
+    /// layer's self-attention, which sees no memory
+    fn attention(&self, frame: &FrameFeatures, sel: &Selection<'_, FrameMemory>) -> Result<FrameAttention> {
+        let inputs = self.memory_inputs(sel)?;
+        let prepared = self.tracker.mem_attn.prepare(&self.gpu, &frame.coarse)?;
+        Ok(FrameAttention { inputs: inputs.into_iter(), prepared })
+    }
+
+    fn attend(
+        &self,
+        _frame: &FrameFeatures,
+        attention: &mut FrameAttention,
+        sel: &Selection<'_, FrameMemory>,
+        b: usize,
+    ) -> Result<Tensor> {
+        let (memory, memory_pos) = attention.inputs.next().ok_or_else(|| eyre!("no memory for object {b}"))?;
+        self.tracker.mem_attn.forward(&self.gpu, &attention.prepared, &memory, &memory_pos, sel.ptr_tokens())
+    }
+
+    fn frame_masks(&self, low_res: &Tensor, (w, h): (usize, usize), out: &mut [Vec<u8>]) -> Result<()> {
+        let gpu = &self.gpu;
         let plane = w * h;
-        let reserved = self.masks.reserve(prompts.len() * plane);
-
-        // runs of equal click counts, in input order within each run, so the common case
-        // of one count is one run of consecutive masks
-        let mut order: Vec<usize> = (0..prompts.len()).collect();
-        order.sort_by_key(|&i| prompts[i].len());
-        let mut scores = vec![f32::NAN; prompts.len()];
-        let mut reserved = Some(reserved);
-        let mut masks = MaskBuffer::default();
-        for batch in
-            order.chunk_by(|&a, &b| prompts[a].len() == prompts[b].len()).flat_map(|run| run.chunks(POINT_BATCH))
-        {
-            let points: Vec<&[PointPrompt]> = batch.iter().map(|&i| prompts[i]).collect();
-            let (best, iou) = self.decode_points(emb, &points)?;
-            fill_holes(gpu, &best, HOLE_AREA)?;
-            let full = upsample_masks(gpu, &best, 0, batch.len(), w, h)?;
-            if let Some(reserved) = reserved.take() {
-                // taken after the launches, so a buffer still faulting in overlaps the
-                // GPU work
-                masks = self.masks.take(reserved, prompts.len() * plane)?;
-            }
-            // the click's one wait: the scores, after every launch
-            let iou = gpu.download(&iou)?;
-            ensure!(iou.len() == 4 * batch.len(), "{} IoUs for {} prompts", iou.len(), batch.len());
-            for (&i, c) in batch.iter().zip(iou.chunks(4)) {
-                scores[i] = c[1 + argmax(&c[1..])];
-            }
-            // consecutive prompts download together
-            let mut j = 0;
-            for run in batch.chunk_by(|&a, &b| b == a + 1) {
-                gpu.read(&full.buf, j * plane, &mut masks[run[0] * plane..][..run.len() * plane])?;
-                j += run.len();
-            }
-        }
-        Ok(PointMasks { scores, masks })
-    }
-
-    /// Both decoder passes over prompts with equal click counts, launched without waiting:
-    /// the best second-pass mask of each `[K, 288^2]`, before hole filling, and the
-    /// second pass's IoUs `[K, 4]`, whose candidate argmax picked it
-    fn decode_points(&self, emb: &Embedding, prompts: &[&[PointPrompt]]) -> Result<(Tensor, Tensor)> {
-        let gpu = &self.gpu;
-        let size = (emb.width, emb.height);
-        let img = &emb.point;
-        let first = self.point.decode_batch(gpu, &img.embed, img, prompts, size, None, 1)?;
-        let mask_input = best_masks(gpu, &first.low_res, &first.iou, true)?;
-        let second = self.point.decode_batch(gpu, &img.embed, img, prompts, size, Some(&mask_input), 1)?;
-        Ok((best_masks(gpu, &second.low_res, &second.iou, false)?, second.iou))
-    }
-}
-
-/// Timing probes, ignored by default: where a click's wall time goes and per-kernel GPU
-/// time of tracked video frames
-#[cfg(test)]
-mod probe {
-    use std::time::Instant;
-
-    use eyre::Result;
-
-    use super::Sam3;
-    use crate::image::RgbImage;
-    use crate::precision::Precision;
-    use crate::prompt::PointPrompt;
-
-    fn median(mut v: Vec<f64>) -> f64 {
-        v.sort_by(f64::total_cmp);
-        v[v.len() / 2] * 1e3
-    }
-
-    /// Where a click's wall time goes: the whole click, one decoder pass with its wait,
-    /// passes queued back to back, and the host encoding of a pass alone
-    #[test]
-    #[ignore = "needs a Metal 4 GPU and the weights; timing only"]
-    fn click_breakdown() -> Result<()> {
-        let m = Sam3::load("models/sam3".as_ref(), 0, Precision::Bf16)?;
-        let img = RgbImage::open("models/images/dogs.jpg".as_ref())?;
-        let emb = m.encode(&img)?;
-        let pts = [PointPrompt::new(1439.0, 504.0, true)?];
-        let gpu = &m.gpu;
-        let size = (emb.width, emb.height);
-        let pass = || m.point.decode_batch(gpu, &emb.point.embed, &emb.point, &[&pts[..]], size, None, 1);
-        let (mut full, mut one, mut encode, mut queued) = (vec![], vec![], vec![], vec![]);
-        for i in 0..23 {
-            let t0 = Instant::now();
-            m.segment_points(&emb, &pts)?;
-            let t_full = t0.elapsed().as_secs_f64();
-            let t0 = Instant::now();
-            let d = pass()?;
-            let t_enc = t0.elapsed().as_secs_f64();
-            gpu.download(&d.iou)?;
-            let t_one = t0.elapsed().as_secs_f64();
-            let t0 = Instant::now();
-            for _ in 0..10 {
-                pass()?;
-            }
-            gpu.synchronize()?;
-            let t_q = t0.elapsed().as_secs_f64() / 10.0;
-            if i >= 3 {
-                full.push(t_full);
-                one.push(t_one);
-                encode.push(t_enc);
-                queued.push(t_q);
-            }
-        }
-        println!(
-            "click {:.2} ms; one pass {:.2} ms (host encode {:.2} ms); queued passes {:.2} ms each",
-            median(full),
-            median(one),
-            median(encode),
-            median(queued)
-        );
-        Ok(())
-    }
-
-    /// Per-kernel GPU time of tracked horses frames (3 objects), after 8 warm frames;
-    /// set `SAM3RS_METAL_PROFILE`
-    #[test]
-    #[ignore = "needs a Metal 4 GPU, the weights and the horses frames; timing only"]
-    fn video_profile() -> Result<()> {
-        let m = Sam3::load("models/sam3".as_ref(), 0, Precision::Bf16)?;
-        let mut paths: Vec<_> = std::fs::read_dir("models/video-frames/horses-720p-64")?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<Result<_, _>>()?;
-        paths.sort();
-        let frames: Vec<RgbImage> = paths.iter().take(14).map(|p| RgbImage::open(p)).collect::<Result<_>>()?;
-        let (w, h) = (frames[0].width() as f32, frames[0].height() as f32);
-        let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("tests/video_prompts.json")?)?;
-        let clip = prompts.as_array().unwrap().iter().find(|c| c["clip"] == "horses").unwrap();
-        let clicks = clip["objects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .take(3)
-            .map(|o| {
-                let (x, y) = (o["point"][0].as_f64().unwrap() as f32, o["point"][1].as_f64().unwrap() as f32);
-                Ok(vec![PointPrompt::new(x * w, y * h, true)?])
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let (mut tracker, _) = m.track(&frames[0], &clicks, frames.len())?;
-        for f in &frames[1..9] {
-            tracker.next(f)?;
-        }
-        m.gpu.take_profile();
-        let measured = &frames[9..];
-        let t0 = Instant::now();
-        for f in measured {
-            tracker.next(f)?;
-        }
-        let wall = t0.elapsed().as_secs_f64() / measured.len() as f64;
-        let mut rows = m.gpu.take_profile();
-        rows.sort_by(|a, b| b.2.total_cmp(&a.2));
-        let total: f64 = rows.iter().map(|r| r.2).sum();
-        let per = 1e3 / measured.len() as f64;
-        println!("frame wall {:.1} ms (profiled), GPU {:.1} ms", wall * 1e3, total * per);
-        for (name, count, t) in rows {
-            println!(
-                "  {name:>28} {:>7.1} {:>9.2} ms {:>5.1}%",
-                count as f64 / measured.len() as f64,
-                t * per,
-                100.0 * t / total
-            );
+        ensure!(out.iter().all(|m| m.len() == plane), "mask buffers for a {w}x{h} frame");
+        let full = upsample_masks(gpu, low_res, 0, out.len(), w, h)?;
+        for (b, dst) in out.iter_mut().enumerate() {
+            gpu.read(&full.buf, b * plane, dst)?;
         }
         Ok(())
+    }
+
+    fn download_logits(&self, low_res: &Tensor) -> Result<Vec<f32>> {
+        self.gpu.download(low_res)
     }
 }

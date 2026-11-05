@@ -7,7 +7,7 @@
 //! mapped
 
 use std::fmt;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::JoinHandle;
 
@@ -149,6 +149,62 @@ impl MaskPool {
 pub(crate) enum Reserved {
     Ready(Vec<u8>),
     Faulting(JoinHandle<Vec<u8>>),
+}
+
+/// Where a backend writes one batch of a call's full-size masks: mask `j` of the batch
+/// goes to slot `slots[j]` of the call's buffer, `plane` bytes a slot
+///
+/// The buffer comes out of the pool only when the backend calls [`MaskSink::ready`] or
+/// first writes, after it has queued its GPU work, so memory still faulting in on the
+/// pool's thread overlaps that work
+pub(crate) struct MaskSink<'a> {
+    pool: &'a MaskPool,
+    /// Taken by the first batch that writes
+    reserved: &'a mut Option<Reserved>,
+    masks: &'a mut MaskBuffer,
+    /// Bytes of the whole buffer
+    len: usize,
+    plane: usize,
+    slots: &'a [usize],
+}
+
+impl<'a> MaskSink<'a> {
+    pub(crate) fn new(
+        pool: &'a MaskPool,
+        reserved: &'a mut Option<Reserved>,
+        masks: &'a mut MaskBuffer,
+        len: usize,
+        plane: usize,
+        slots: &'a [usize],
+    ) -> Self {
+        Self { pool, reserved, masks, len, plane, slots }
+    }
+
+    /// Takes the host buffer out of the pool, if no batch has yet
+    pub(crate) fn ready(&mut self) -> Result<()> {
+        if let Some(reserved) = self.reserved.take() {
+            *self.masks = self.pool.take(reserved, self.len)?;
+        }
+        Ok(())
+    }
+
+    /// Writes masks `batch` of the batch, which sit one after another in a device buffer:
+    /// `read(offset, dst)` fills `dst` from byte `offset` of that buffer, once per run of
+    /// masks whose slots are consecutive, so such a run downloads in one copy
+    pub(crate) fn write(
+        &mut self,
+        batch: Range<usize>,
+        mut read: impl FnMut(usize, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.ready()?;
+        let (plane, slots) = (self.plane, self.slots);
+        let mut offset = 0;
+        for run in slots[batch].chunk_by(|&a, &b| b == a + 1) {
+            read(offset, &mut self.masks[run[0] * plane..][..run.len() * plane])?;
+            offset += run.len() * plane;
+        }
+        Ok(())
+    }
 }
 
 /// Makes a zeroed host buffer of `len` bytes with every page already faulted in, on

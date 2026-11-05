@@ -101,12 +101,14 @@
 //!   checks.
 //!
 //! [`Precision`](https://docs.rs/sam3rs/latest/sam3rs/enum.Precision.html) lists which
-//! stages keep which types in each mode.
+//! stages keep which types in each mode, on each backend.
 //!
 //! # Apple silicon
 //!
-//! On macOS, sam3rs builds a Metal backend in place of the CUDA one, with the same API,
-//! prompts and video tracker. GEMMs and attention run on Metal 4 tensor ops (`matmul2d`
+//! On macOS, sam3rs builds a Metal backend in place of the CUDA one. The API, its input
+//! checks, prompt handling and the video tracker's memory selection are one
+//! implementation shared by both backends; only the model's stages and kernels are each
+//! backend's own. GEMMs and attention run on Metal 4 tensor ops (`matmul2d`
 //! from Metal Performance Primitives), and every other kernel is Metal Shading Language
 //! compiled while the weights load, so nothing beyond macOS needs installing.
 //!
@@ -399,23 +401,33 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod backend;
 #[cfg(not(target_os = "macos"))]
 mod cuda;
+mod host;
 #[cfg(feature = "online")]
 mod hub;
 mod image;
 mod masks;
 #[cfg(target_os = "macos")]
 mod metal;
+mod model;
+mod nvtx;
 mod output;
 mod posenc;
 mod precision;
 mod prompt;
+mod sam3;
+#[cfg(test)]
+mod stage_tests;
+#[cfg(test)]
+mod test_support;
 mod tokenizer;
+mod tracker;
+#[cfg(test)]
+mod video_tests;
 mod weights;
 
-#[cfg(not(target_os = "macos"))]
-pub use cuda::{Embedding, Sam3, VideoTracker};
 #[cfg(feature = "online")]
 #[cfg_attr(docsrs, doc(cfg(feature = "online")))]
 pub use hf_fetch::{HubError, default_hub_cache_dir};
@@ -424,11 +436,11 @@ pub use hf_fetch::{HubError, default_hub_cache_dir};
 pub use hub::{MODEL_FILES, MODEL_REPO, MODEL_REVISION, ModelManager, download_model};
 pub use image::{MAX_IMAGE_SIDE, RgbImage};
 pub use masks::MaskBuffer;
-#[cfg(target_os = "macos")]
-pub use metal::{Embedding, Sam3, VideoTracker};
 pub use output::{
     Detection, Detections, POINT_BATCH, PointMask, PointMasks, SCORE_THRESHOLD, TrackedFrame, TrackedObject,
     VISUAL_PROMPT,
 };
 pub use precision::Precision;
 pub use prompt::{BoxPrompt, PointPrompt};
+pub use sam3::{Embedding, Sam3};
+pub use tracker::VideoTracker;

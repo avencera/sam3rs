@@ -5,11 +5,9 @@ use eyre::{Result, ensure};
 
 use crate::metal::gpu::{DType, Gpu, Tensor};
 use crate::metal::ops::{Act, LayerNorm, Linear, Mask, View, mha};
+use crate::model::text::{HEADS, WIDTH};
 use crate::tokenizer::CONTEXT;
 use crate::weights::Weights;
-
-const WIDTH: usize = 1024;
-const HEADS: usize = 16;
 
 struct Layer {
     ln1: LayerNorm,

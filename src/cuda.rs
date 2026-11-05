@@ -6,7 +6,6 @@ mod cublas;
 pub(crate) mod detector;
 pub(crate) mod gpu;
 pub(crate) mod image;
-pub(crate) mod nvtx;
 pub(crate) mod ops;
 pub(crate) mod pipeline;
 pub(crate) mod point;
@@ -15,17 +14,16 @@ pub(crate) mod video;
 pub(crate) mod vision;
 
 #[cfg(test)]
-mod stage_tests;
+mod kernel_tests;
 #[cfg(test)]
-mod video_tests;
+mod test_hooks;
 
 use eyre::Result;
 
 use crate::weights::Weights;
 use gpu::{Gpu, Tensor};
 
-pub use pipeline::{Embedding, Sam3};
-pub use video::VideoTracker;
+pub(crate) use pipeline::Cuda;
 
 impl Weights {
     /// One tensor uploaded to the GPU

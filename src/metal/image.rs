@@ -5,7 +5,7 @@ use eyre::Result;
 
 use crate::image::{RgbImage, Taps, aa_taps};
 use crate::metal::gpu::{DType, Gpu, Tensor};
-use crate::metal::vision::IMAGE_SIZE;
+use crate::model::vision::IMAGE_SIZE;
 
 /// One axis's filter taps on the GPU, and the most taps any output reads
 struct AxisTaps {

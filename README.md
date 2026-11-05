@@ -110,12 +110,14 @@ change.
   checks.
 
 [`Precision`](https://docs.rs/sam3rs/latest/sam3rs/enum.Precision.html) lists which
-stages keep which types in each mode.
+stages keep which types in each mode, on each backend.
 
 ## Apple silicon
 
-On macOS, sam3rs builds a Metal backend in place of the CUDA one, with the same API,
-prompts and video tracker. GEMMs and attention run on Metal 4 tensor ops (`matmul2d`
+On macOS, sam3rs builds a Metal backend in place of the CUDA one. The API, its input
+checks, prompt handling and the video tracker's memory selection are one
+implementation shared by both backends; only the model's stages and kernels are each
+backend's own. GEMMs and attention run on Metal 4 tensor ops (`matmul2d`
 from Metal Performance Primitives), and every other kernel is Metal Shading Language
 compiled while the weights load, so nothing beyond macOS needs installing.
 

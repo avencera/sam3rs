@@ -6,21 +6,19 @@
 
 use eyre::{Result, ensure, eyre};
 
+use crate::host::BoxInputs;
 use crate::metal::gpu::{DType, Gpu, Tensor, groups};
 use crate::metal::ops::{
     Act, Attention, BoxRpb, Conv3x3, LayerNorm, Linear, Mask, Mlp, add_assign, bias_act, concat_rows, gather_rows,
 };
 use crate::metal::text::TextFeatures;
-use crate::metal::vision::{Fpn, GRID};
-use crate::posenc::{box_encoding, sine_2d};
+use crate::metal::vision::Fpn;
+use crate::model::detector::{D, HEADS, QUERIES, ROI};
+use crate::model::vision::GRID;
+use crate::posenc::sine_2d;
 use crate::prompt::BoxPrompt;
 use crate::weights::Weights;
 
-const D: usize = 256;
-const HEADS: usize = 8;
-/// Object queries of the DETR decoder, one score, box and mask each
-pub const QUERIES: usize = 200;
-const ROI: usize = 7;
 /// Groups of the pixel decoder's GroupNorm
 const NORM_GROUPS: usize = 8;
 /// Pixels per partial-sum threadgroup of the group norm statistics
@@ -337,31 +335,21 @@ impl Detector {
         let embeds = if n == 0 {
             copy(gpu, &g.cls)?
         } else {
-            let raw: Vec<f32> = boxes.iter().flat_map(BoxPrompt::cxcywh).collect();
-            let raw = gpu.upload_f32(&raw, &[n, 4])?;
+            let inputs = BoxInputs::new(boxes);
+            let raw = gpu.upload_f32(&inputs.cxcywh, &[n, 4])?;
             let x = g.direct.forward(gpu, &raw, Act::None)?;
 
-            let side = GRID as f32;
-            let xyxy: Vec<f32> = boxes
-                .iter()
-                .flat_map(|b| {
-                    let [cx, cy, w, h] = b.cxcywh();
-                    [(cx - 0.5 * w) * side, (cy - 0.5 * h) * side, (cx + 0.5 * w) * side, (cy + 0.5 * h) * side]
-                })
-                .collect();
-            let xyxy = gpu.upload_f32(&xyxy, &[n, 4])?;
+            let xyxy = gpu.upload_f32(&inputs.grid_xyxy, &[n, 4])?;
             let pooled = gpu.empty(&[n, D * ROI * ROI], DType::F32)?;
             let args =
                 [pooled.arg(), img.coarse_normed.arg(), xyxy.arg(), GRID.into(), GRID.into(), D.into(), ROI.into()];
             gpu.dispatch_1d("roi_align", pooled.len(), &args)?;
             g.pool.forward_residual(gpu, &pooled, &x)?;
 
-            let enc: Vec<f32> = boxes.iter().flat_map(|b| box_encoding(b.cxcywh())).collect();
-            let enc = gpu.upload_f32(&enc, &[n, 258])?;
+            let enc = gpu.upload_f32(&inputs.encoding, &[n, 258])?;
             g.pos.forward_residual(gpu, &enc, &x)?;
 
-            let labels: Vec<i32> = boxes.iter().map(|b| i32::from(b.positive())).collect();
-            let label = gather_rows(gpu, &g.label, &labels)?;
+            let label = gather_rows(gpu, &g.label, &inputs.labels)?;
             add_assign(gpu, &x, &label)?;
             concat_rows(gpu, &x, &g.cls)?
         };
