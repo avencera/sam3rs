@@ -163,9 +163,12 @@
 //! The driver (`libcuda.so.1`, or `nvcuda.dll` on Windows) and cuBLAS load at run time,
 //! so a missing driver, GPU or cuBLAS makes `Sam3::load` return an error instead of
 //! panicking. A cuBLAS already loaded in the process, such as the pip wheel the Python
-//! package loads, is reused; otherwise the dynamic loader finds one (on Linux
-//! `LD_LIBRARY_PATH`, then the ldconfig cache; on Windows the executable's directory,
-//! the system directories, the current directory, then `PATH`).
+//! package loads, is reused. Otherwise, on Linux the dynamic loader finds one
+//! (`LD_LIBRARY_PATH`, then the ldconfig cache). On Windows sam3rs looks in the
+//! executable's directory, System32, then each absolute `PATH` entry, and never in the
+//! current directory, where a planted DLL could run its code; relative `PATH` entries
+//! are skipped for the same reason. The driver is opened by cudarc, whose Windows search
+//! still includes the current directory, so on Windows run sam3rs from folders you trust.
 //!
 //! Cargo features:
 //!
