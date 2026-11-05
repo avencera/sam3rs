@@ -1,5 +1,9 @@
 # sam3rs
 
+<p align="center">
+  <img src="docs/images/demo.webp" width="100%" alt="sam3rs on the left and the official PyTorch SAM 3 on the right, on one RTX 5090. Hovering over a 36 MP photo, the sam3rs mask follows the cursor while PyTorch's lags. Then both segment everything in a 50 MP photo from 256 point prompts: sam3rs finishes in 1.6 s, PyTorch in 105 s, 66x faster">
+</p>
+
 <!-- generated from the crate docs in src/lib.rs by cargo-rdme: edit those, then run `cargo rdme` -->
 <!-- cargo-rdme start -->
 
