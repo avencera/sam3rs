@@ -1,0 +1,4 @@
+# LF in every checkout, Windows included: the PTX and Metal kernels and the tokenizer
+# fixtures are embedded or compared byte for byte, so CRLF would change what a build ships
+* text=auto eol=lf
+*.png binary

@@ -113,8 +113,8 @@ jobs:
             exit 1
           fi
 
-  # one abi3 wheel per backend. Linux builds without a GPU or CUDA toolkit because CUDA
-  # is loaded at run time; macOS needs no Xcode Metal toolchain because the OS compiles
+  # one abi3 wheel per backend and OS. Linux and Windows build without a GPU or CUDA
+  # toolkit because CUDA is loaded at run time; macOS needs no Xcode Metal toolchain because the OS compiles
   # the kernels when a model loads. There is no CPU backend to build for
   python-wheel:
     name: Python wheel (${{ matrix.name }})
@@ -131,10 +131,14 @@ jobs:
             os: macos-26
             target: aarch64-apple-darwin
             manylinux: ""
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: ""
     env:
       # the Metal backend needs macOS 26.1, but the wheel keeps the arm64 floor so pip
       # installs it on any Apple silicon Mac, where an older macOS gets the runtime's
-      # error naming the version instead of a failed sdist build; Linux ignores this
+      # error naming the version instead of a failed sdist build; other OSes ignore this
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v6
@@ -225,13 +229,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-26]
+        os: [ubuntu-24.04, macos-26, windows-2025]
         python: ["3.11", "3.14"]
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: macos-26
             target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
 
@@ -252,8 +258,14 @@ jobs:
           uv pip install --python .venv-wheel dist/*.whl pytest
 
       - name: Run tests
+        shell: bash
         working-directory: crates/sam3rs-python
-        run: ../../.venv-wheel/bin/python -m pytest -rA
+        run: |
+          set -euo pipefail
+          # Windows venvs keep the interpreter in Scripts, not bin
+          python=../../.venv-wheel/bin/python
+          if [ "$RUNNER_OS" = Windows ]; then python=../../.venv-wheel/Scripts/python.exe; fi
+          "$python" -m pytest -rA
 
   # a v* tag publishes to TestPyPI, installs that release, then publishes to crates.io
   # and only then to PyPI, so a failed crate publish never leaves a PyPI-only release;
@@ -293,8 +305,8 @@ jobs:
             exit 1
           fi
           ls -la dist
-          # the Linux and macOS wheels and the sdist
-          test "$(find dist -type f | wc -l)" -eq 3
+          # the Linux, macOS and Windows wheels and the sdist
+          test "$(find dist -type f | wc -l)" -eq 4
           for file in dist/*; do
             case "$(basename "$file")" in
               "sam3rs-${version}"-*.whl | "sam3rs-${version}.tar.gz") ;;

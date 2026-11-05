@@ -20,7 +20,7 @@ use cudarc::driver::{CudaContext, CudaStream, result as cur};
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 
 use crate::cuda::blaslt::{BlasLt, Epilogue, Operands};
-use crate::cuda::cublas::Cublas;
+use crate::cuda::cublas::{BLAS_SONAME, Cublas, LT_SONAME};
 
 /// Kernels from the cuda-oxide crate `crates/sam3rs-kernels` as PTX for compute
 /// capability 8.0, the first with the BF16 `mma.sync` the attention kernel uses. The
@@ -35,6 +35,16 @@ static PTX_SM120: &str = concat!(include_str!("../../kernels/ptx/sam3.sm120.ptx"
 /// Oldest driver API cuBLAS 13 runs on, as `cuDriverGetVersion` reports it. The PTX (ISA 8.7
 /// at most) needs no newer one
 const MIN_DRIVER: i32 = 13000;
+#[cfg(not(windows))]
+const DRIVER_LIB: &str = "libcuda.so.1";
+#[cfg(windows)]
+const DRIVER_LIB: &str = "nvcuda.dll";
+// where the dynamic loader looks for cuBLAS, so the error can say where to put it
+#[cfg(not(windows))]
+const LIBRARY_PATH: &str = "LD_LIBRARY_PATH";
+// CUDA 13 on Windows keeps its DLLs in bin\x64, which a toolkit install may leave off PATH
+#[cfg(windows)]
+const LIBRARY_PATH: &str = "PATH (for the toolkit, %CUDA_PATH%\\bin\\x64)";
 
 /// Host bytes of in-flight uploads kept alive before the stream is drained, so loading
 /// 3.4 GB of weights doesn't hold a second host copy of all of them
@@ -767,7 +777,7 @@ fn create_pool(ctx: &CudaContext) -> Result<CUmemoryPool> {
 fn check_libraries() -> Result<&'static Cublas> {
     unsafe {
         if !cu::is_culib_present() {
-            bail!("no NVIDIA driver found (libcuda.so.1); sam3rs needs an NVIDIA GPU with driver r580 or newer");
+            bail!("no NVIDIA driver found ({DRIVER_LIB}); sam3rs needs an NVIDIA GPU with driver r580 or newer");
         }
         let mut version = 0;
         cu::cuDriverGetVersion(&mut version).result()?;
@@ -780,9 +790,12 @@ fn check_libraries() -> Result<&'static Cublas> {
         }
     }
 
-    let hint =
-        "install the CUDA 13 toolkit or `pip install nvidia-cublas`, and put its lib directory on LD_LIBRARY_PATH";
-    Cublas::get().map_err(|e| eyre!("cuBLAS 13 not found (libcublas.so.13, libcublasLt.so.13): {e:#}; {hint}"))
+    Cublas::get().map_err(|e| {
+        eyre!(
+            "cuBLAS 13 not found ({BLAS_SONAME}, {LT_SONAME}): {e:#}; install the CUDA 13 toolkit or \
+             `pip install nvidia-cublas`, and put the directory holding them on {LIBRARY_PATH}"
+        )
+    })
 }
 
 fn check_blas(status: blas::cublasStatus_t) -> Result<()> {

@@ -40,8 +40,14 @@ jobs:
         run: cargo deny --workspace --all-features check
 
   rust:
+    name: rust (${{ matrix.os }})
     timeout-minutes: 30
-    runs-on: ubuntu-24.04
+    # Windows runs the CUDA backend's code too, so it builds and tests there as on Linux
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
     env:
       # openai/clip-vit-base-patch32 ships SAM 3's tokenizer vocab and merges (only the
       # merges header comment differs) without a gate, so the tokenizer test runs here
@@ -69,6 +75,7 @@ jobs:
         run: cargo clippy -p sam3rs --lib --no-default-features --locked -- -D warnings
 
       - name: Build docs as docs.rs does
+        if: runner.os == 'Linux'
         env:
           DOCS_RS: "1"
           RUSTDOCFLAGS: -D warnings
@@ -79,18 +86,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$SAM3RS_TOKENIZER_DIR"
+          # relative names, since the Windows workspace path has backslashes
+          cd "$SAM3RS_TOKENIZER_DIR"
           base="https://huggingface.co/openai/clip-vit-base-patch32/resolve/$CLIP_REV"
           for file in vocab.json merges.txt; do
-            curl --retry 3 --retry-delay 5 -LfsS "$base/$file" -o "$SAM3RS_TOKENIZER_DIR/$file"
+            curl --retry 3 --retry-delay 5 -LfsS "$base/$file" -o "$file"
           done
           sha256sum --check <<EOF
-          5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363  $SAM3RS_TOKENIZER_DIR/vocab.json
-          f526393189112391ce6f9795d4695f704121ce452c3aad1f5335cc41337eba85  $SAM3RS_TOKENIZER_DIR/merges.txt
+          5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363  vocab.json
+          f526393189112391ce6f9795d4695f704121ce452c3aad1f5335cc41337eba85  merges.txt
           EOF
 
       # the parity and stage tests need a GPU and the 3.4 GB weights, so they run locally
       - name: Unit tests
-        run: cargo test --workspace --lib --locked
+        # the Python extension has no Rust tests, and a test binary of it would need
+        # libpython at run time
+        run: cargo test --workspace --exclude sam3rs-python --lib --locked
 
       - name: Doc tests
         run: cargo test -p sam3rs --doc --locked

@@ -36,13 +36,15 @@ arrive as numpy bool arrays without a copy. Methods and the full tables are in t
 pip install "sam3rs[cuda]"
 ```
 
-On Linux x86_64 you need:
+On Linux x86_64 or Windows x86_64 you need:
 
 - an NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell)
 - NVIDIA driver r580 or newer
 - cuBLAS 13, which the `cuda` extra installs from the `nvidia-cublas` wheel. Any 13.x
-  release works; it is tested with releases from 13.0.0 to 13.8.2. Leave the extra out
-  if a CUDA 13 toolkit is already on the library path.
+  release works; it is tested on Linux with releases from 13.0.0 to 13.8.2. Leave the
+  extra out if a CUDA 13 toolkit is already on the library path (`PATH` on Windows).
+
+The Windows wheel passes CI but hasn't been run on a GPU yet.
 
 On macOS you need Apple silicon (M1 or newer) with macOS 26.1 or newer. The same command
 works there: the `cuda` extra installs nothing on a Mac, so `pip install sam3rs` is

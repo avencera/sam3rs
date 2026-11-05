@@ -6,6 +6,19 @@ All notable changes to sam3rs are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-04
+
+### Added
+
+- Windows x86_64 support on the CUDA backend. The runtime opens `nvcuda.dll`,
+  `cublas64_13.dll` and `cublasLt64_13.dll`, the release adds
+  `sam3rs-<tag>-x86_64-pc-windows-msvc.zip`, and PyPI gets a Windows wheel whose `cuda`
+  extra installs the Windows `nvidia-cublas` wheel. CI builds and tests it, but it
+  hasn't been run on a GPU yet. cuBLAS is looked up in the executable's directory,
+  System32 and absolute `PATH` entries, and not in the current directory unless it is
+  one of those.
+- The `nvtx` feature builds on Windows, finding the toolkit through `CUDA_PATH`.
+
 ## [0.3.0] - 2026-11-04
 
 ### Added
@@ -81,7 +94,8 @@ First release.
 - The `sam3rs` Python package on PyPI, with numpy in and out, the same command, and
   cuBLAS from the `cuda` extra.
 
-[Unreleased]: https://github.com/avencera/sam3rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/avencera/sam3rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/avencera/sam3rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/avencera/sam3rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/avencera/sam3rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/avencera/sam3rs/compare/v0.1.0...v0.1.1

@@ -178,7 +178,7 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 target=$(target_triple) \
-    || err "no release binary for $(uname -s)/$(uname -m); the release covers Linux x86_64 and Apple silicon. Elsewhere, build with: cargo install sam3rs --features cli"
+    || err "no release binary for $(uname -s)/$(uname -m); the release covers Linux x86_64 and Apple silicon, plus a Windows x86_64 zip this script doesn't install. Elsewhere, build with: cargo install sam3rs --features cli"
 
 if [ -z "$dest" ]; then
     dest=$HOME/.local/bin
