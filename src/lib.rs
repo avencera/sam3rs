@@ -165,9 +165,9 @@
 //! panicking. A cuBLAS already loaded in the process, such as the pip wheel the Python
 //! package loads, is reused. Otherwise, on Linux the dynamic loader finds one
 //! (`LD_LIBRARY_PATH`, then the ldconfig cache). On Windows sam3rs looks in the
-//! executable's directory, System32, then each absolute `PATH` entry, and never in the
-//! current directory, where a planted DLL could run its code; relative `PATH` entries
-//! are skipped for the same reason. The driver is opened by cudarc, whose Windows search
+//! executable's directory, System32, then each absolute `PATH` entry, and not in the
+//! current directory, where a planted DLL could run its code, unless it is also one of
+//! those; relative `PATH` entries are skipped for the same reason. The driver is opened by cudarc, whose Windows search
 //! still includes the current directory, so on Windows run sam3rs from folders you trust.
 //!
 //! Cargo features:

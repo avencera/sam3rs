@@ -15,7 +15,8 @@ All notable changes to sam3rs are documented here. The format follows
   `sam3rs-<tag>-x86_64-pc-windows-msvc.zip`, and PyPI gets a Windows wheel whose `cuda`
   extra installs the Windows `nvidia-cublas` wheel. CI builds and tests it, but it
   hasn't been run on a GPU yet. cuBLAS is looked up in the executable's directory,
-  System32 and absolute `PATH` entries, never in the current directory.
+  System32 and absolute `PATH` entries, and not in the current directory unless it is
+  one of those.
 - The `nvtx` feature builds on Windows, finding the toolkit through `CUDA_PATH`.
 
 ## [0.3.0] - 2026-11-04

@@ -21,7 +21,8 @@
 //! name, so opening Lt first pins both to one install there too. Windows' default search
 //! also looks in the current directory before `PATH`, where a DLL planted in a folder
 //! sam3rs runs from would load and run its code, so [`open_library`] searches itself
-//! there and never looks in the current directory
+//! and never looks in the current directory unless it is also the executable's directory
+//! or an absolute `PATH` entry
 
 use std::ffi::c_int;
 use std::sync::OnceLock;
@@ -194,8 +195,9 @@ fn open_library(soname: &str) -> Result<Library> {
     unsafe { Library::new(soname) }.wrap_err_with(|| format!("open {soname}"))
 }
 
-/// Opens a DLL from wherever Windows already has it or from `PATH`, never from the
-/// current directory
+/// Opens a DLL from wherever Windows already has it or from `PATH`, and never from the
+/// current directory unless that is also the executable's directory or an absolute `PATH`
+/// entry
 ///
 /// The bare name with `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` returns a module already loaded
 /// under that name, such as the Python wheel's copy, and otherwise searches only the
