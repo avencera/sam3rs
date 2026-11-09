@@ -22,11 +22,11 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 crate="$root/crates/sam3rs-kernels"
 toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$crate/rust-toolchain.toml")"
-source="$(sed -n 's|^source = "git+\(https://github.com/[^/]*/cuda-rust.git\)?branch=[^#]*#\([0-9a-f]*\)"$|\1 \2|p' "$crate/Cargo.lock" | sort -u)"
+source="$(sed -n 's|^source = "git+\(https://github.com/[^/]*/cuda-rust.git\)?rev=[^#]*#\([0-9a-f]*\)"$|\1 \2|p' "$crate/Cargo.lock" | sort -u)"
 repo="${source% *}"
 rev="${source#* }"
 if [[ ! "$rev" =~ ^[0-9a-f]{40}$ || "$repo" == "$source" ]]; then
-  echo "expected one cuda-rust repository and commit in $crate/Cargo.lock, found: $source" >&2
+  echo "expected one cuda-rust repository pinned by rev in $crate/Cargo.lock, found: $source" >&2
   exit 1
 fi
 
